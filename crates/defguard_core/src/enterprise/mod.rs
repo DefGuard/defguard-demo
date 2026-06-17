@@ -12,8 +12,6 @@ pub mod snat;
 mod utils;
 
 use defguard_common::config::server_config;
-use license::{get_cached_license, validate_license};
-use limits::get_counts;
 use std::time::Duration;
 
 use self::{

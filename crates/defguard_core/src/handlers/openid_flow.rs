@@ -448,6 +448,11 @@ pub async fn authorization(
     cookies: CookieJar,
     private_cookies: PrivateCookieJar,
 ) -> Result<(StatusCode, HeaderMap, PrivateCookieJar), WebError> {
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "OpenID Connect is disabled in demo mode",
+        ));
+    }
     let error;
     let mut is_redirect_allowed = false;
     if let Some(oauth2client) =
@@ -625,6 +630,11 @@ pub async fn secure_authorization(
     Query(data): Query<AuthenticationRequest>,
     private_cookies: PrivateCookieJar,
 ) -> Result<(StatusCode, HeaderMap, PrivateCookieJar), WebError> {
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "OpenID Connect is disabled in demo mode",
+        ));
+    }
     let error;
     let mut is_redirect_allowed = false;
     if let Some(oauth2client) =
@@ -876,6 +886,11 @@ pub async fn token(
     OAuth2ClientExtractor(oauth2client): OAuth2ClientExtractor,
     Form(form): Form<TokenRequest>,
 ) -> ApiResult {
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "OpenID Connect is disabled in demo mode",
+        ));
+    }
     // TODO: cleanup branches
     match form.grant_type {
         CoreGrantType::AuthorizationCode => {

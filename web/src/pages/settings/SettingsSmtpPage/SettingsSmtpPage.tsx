@@ -167,6 +167,50 @@ const Content = ({ settings }: { settings: Settings }) => {
     smtp_oauth_refresh_token: null,
     smtp_oauth_tenant_id: null,
   });
+  const smtpConfigured = useApp((s) => s.appInfo.smtp_enabled);
+  const demoMode = useApp((s) => s.appInfo.demo_mode);
+  const formSchema = useMemo(
+    () =>
+      z.object({
+        smtp_server: z
+          .string()
+          .trim()
+          .min(1, m.form_error_required())
+          .refine((val) =>
+            !val
+              ? true
+              : Validate.any(
+                  val,
+                  [Validate.IPv4, Validate.IPv6, Validate.Domain, Validate.Hostname],
+                  false,
+                ),
+          ),
+        smtp_port: z.number(m.form_error_required()).max(65535, m.form_error_port_max()),
+        smtp_password: z.string().trim().nullable(),
+        smtp_user: z.string().trim().nullable(),
+        smtp_sender: z
+          .string()
+          .trim()
+          .min(1, m.form_error_required())
+          .regex(patternValidEmail, m.form_error_email()),
+        smtp_encryption: z.enum(SmtpEncryption),
+      }),
+    [],
+  );
+
+  type FormFields = z.infer<typeof formSchema>;
+
+  const emptyValues = useMemo(
+    (): FormFields => ({
+      smtp_encryption: SmtpEncryption.StartTls,
+      smtp_password: null,
+      smtp_port: 587,
+      smtp_sender: '',
+      smtp_server: '',
+      smtp_user: null,
+    }),
+    [],
+  );
 
   const defaultValues = useMemo(
     (): FormFields => ({
@@ -209,7 +253,14 @@ const Content = ({ settings }: { settings: Settings }) => {
     validators: {
       onChange: formSchema,
     },
-    onSubmit: async () => {},
+    onSubmit: async ({ value }) => {
+      if (demoMode) {
+        Snackbar.error(m.demo_mode_feature_disabled());
+        return;
+      }
+      await editSettings(value);
+      form.reset(value);
+    },
   });
 
   const openConfigModal = (variant: SmtpAuthCardVariant) => {
@@ -258,122 +309,138 @@ const Content = ({ settings }: { settings: Settings }) => {
   };
 
   return (
-    <form.AppForm>
-      <form.Subscribe
-        selector={(s) => ({
-          authentication: s.values.smtp_authentication,
-          issuerUrl: s.values.smtp_oauth_issuer_url,
-          smtpServer: s.values.smtp_server,
-        })}
-      >
-        {({ authentication, issuerUrl, smtpServer }) => {
-          const activeCard = detectActiveCard(authentication, issuerUrl, smtpServer);
-          const otherCards = AUTH_CARDS.filter((v) => v !== activeCard);
-          const renderCard = (variant: SmtpAuthCardVariant) => (
-            <SmtpAuthMethodCard
-              key={variant}
-              variant={variant}
-              active={activeCard === variant}
-              locked={oauthLocked && (variant === 'google' || variant === 'microsoft')}
-              onConfigure={() => openConfigModalGated(variant)}
-              onEdit={() => openConfigModalGated(variant)}
-              onSendTestEmail={() => openModal(ModalName.SendTestMail)}
-              onDelete={handleDelete}
-            />
-          );
-          if (!activeCard) {
-            return (
-              <div className="smtp-auth-method-cards">{AUTH_CARDS.map(renderCard)}</div>
-            );
-          }
-          return (
-            <>
-              <p className="smtp-cards-section-label">
-                {m.settings_smtp_active_config_label()}
-              </p>
-              {renderCard(activeCard)}
-              <SizedBox height={ThemeSpacing.Xl2} />
-              <p className="smtp-cards-section-label">
-                {m.settings_smtp_other_methods_label()}
-              </p>
-              <div className="smtp-auth-method-cards">{otherCards.map(renderCard)}</div>
-            </>
-          );
-        }}
-      </form.Subscribe>
-      <SmtpAuthConfigModal
-        isOpen={modalVariant !== null}
-        variant={modalVariant}
-        initialValues={modalInitialValuesRef.current}
-        onApply={async (result: SmtpAuthApplyResult) => {
-          const cur = form.state.values;
-          const merged: FormFields = {
-            smtp_authentication: result.authentication,
-            smtp_sender: result.smtp_sender,
-            smtp_server: result.smtp_server ?? cur.smtp_server,
-            smtp_port: result.smtp_port ?? cur.smtp_port,
-            smtp_encryption: result.smtp_encryption ?? cur.smtp_encryption,
-            smtp_user: result.smtp_user !== undefined ? result.smtp_user : cur.smtp_user,
-            smtp_password:
-              result.smtp_password !== undefined
-                ? result.smtp_password
-                : cur.smtp_password,
-            smtp_oauth_issuer_url:
-              result.smtp_oauth_issuer_url !== undefined
-                ? result.smtp_oauth_issuer_url
-                : cur.smtp_oauth_issuer_url,
-            smtp_oauth_client_id:
-              result.smtp_oauth_client_id !== undefined
-                ? result.smtp_oauth_client_id
-                : cur.smtp_oauth_client_id,
-            smtp_oauth_client_secret:
-              result.smtp_oauth_client_secret !== undefined
-                ? result.smtp_oauth_client_secret
-                : cur.smtp_oauth_client_secret,
-            smtp_oauth_refresh_token:
-              result.smtp_oauth_refresh_token !== undefined
-                ? result.smtp_oauth_refresh_token
-                : cur.smtp_oauth_refresh_token,
-            smtp_oauth_tenant_id:
-              result.smtp_oauth_tenant_id !== undefined
-                ? result.smtp_oauth_tenant_id
-                : cur.smtp_oauth_tenant_id,
-          };
-          if (merged.smtp_authentication !== SmtpAuthentication.Login) {
-            merged.smtp_user = null;
-            merged.smtp_password = null;
-          }
-          if (merged.smtp_authentication !== SmtpAuthentication.XOAuth2) {
-            merged.smtp_oauth_issuer_url = null;
-            merged.smtp_oauth_client_id = null;
-            merged.smtp_oauth_client_secret = null;
-            merged.smtp_oauth_refresh_token = null;
-            merged.smtp_oauth_tenant_id = null;
-          }
-          const currentActiveCard = detectActiveCard(
-            cur.smtp_authentication,
-            cur.smtp_oauth_issuer_url,
-            cur.smtp_server,
-          );
-          if (currentActiveCard !== null && modalVariant !== currentActiveCard) {
-            openModal(ModalName.ConfirmAction, {
-              title: m.settings_smtp_activate_confirm_title(),
-              contentMd: m.settings_smtp_activate_confirm_body(),
-              actionPromise: () => editSettings(merged),
-              submitProps: { text: m.controls_continue() },
-              onSuccess: () => {
-                form.reset(merged);
-                setModalVariant(null);
-              },
-            });
-            return;
-          }
-          await editSettings(merged);
-          form.reset(merged);
-          setModalVariant(null);
-        }}
-        onClose={() => setModalVariant(null)}
-      />
-    </form.AppForm>
+    <form
+      onSubmit={(e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        form.handleSubmit();
+      }}
+    >
+      <form.AppForm>
+        <EvenSplit>
+          <form.AppField name="smtp_server">
+            {(field) => (
+              <field.FormInput
+                required
+                label={m.settings_smtp_label_server_address()}
+                helper={m.settings_smtp_helper_server_address()}
+              />
+            )}
+          </form.AppField>
+          <form.AppField name="smtp_port">
+            {(field) => (
+              <field.FormInput
+                required
+                label={m.settings_smtp_label_server_port()}
+                helper={m.settings_smtp_helper_server_port()}
+                type="number"
+              />
+            )}
+          </form.AppField>
+        </EvenSplit>
+        <SizedBox height={ThemeSpacing.Xl} />
+        <EvenSplit>
+          <form.AppField name="smtp_user">
+            {(field) => (
+              <field.FormInput
+                label={m.settings_smtp_label_server_username()}
+                helper={m.settings_smtp_helper_server_username()}
+              />
+            )}
+          </form.AppField>
+          <form.AppField name="smtp_password">
+            {(field) => (
+              <field.FormInput
+                label={m.settings_smtp_label_server_password()}
+                helper={m.settings_smtp_helper_server_password()}
+                type="password"
+              />
+            )}
+          </form.AppField>
+        </EvenSplit>
+        <SizedBox height={ThemeSpacing.Xl} />
+        <EvenSplit>
+          <form.AppField name="smtp_sender">
+            {(field) => (
+              <field.FormInput
+                required
+                label={m.settings_smtp_label_sender_email_address()}
+                helper={m.settings_smtp_helper_sender_email_address()}
+              />
+            )}
+          </form.AppField>
+          <form.AppField name="smtp_encryption">
+            {(field) => (
+              <field.FormSelect
+                options={encryptionSelectOptions}
+                label={m.settings_smtp_label_encryption()}
+                helper={m.settings_smtp_helper_encryption()}
+                required
+              />
+            )}
+          </form.AppField>
+        </EvenSplit>
+        <form.Subscribe
+          selector={(s) => ({
+            isDefaultValue: s.isDefaultValue || s.isPristine,
+            isSubmitting: s.isSubmitting,
+          })}
+        >
+          {({ isDefaultValue, isSubmitting }) => (
+            <Controls>
+              {smtpConfigured && (
+                <Button
+                  variant="critical"
+                  text={m.settings_smtp_button_reset_settings()}
+                  onClick={() => {
+                    if (demoMode) {
+                      Snackbar.error(m.demo_mode_feature_disabled());
+                      return;
+                    }
+                    openModal(ModalName.ConfirmAction, {
+                      title: m.settings_smtp_reset_confirm_title(),
+                      contentMd: m.settings_smtp_reset_confirm_body(),
+                      actionPromise: () => api.settings.patchSettings(emptyValues),
+                      invalidateKeys: [['settings'], ['info']],
+                      submitProps: { text: m.controls_reset(), variant: 'critical' },
+                      onSuccess: () => {
+                        form.reset(emptyValues);
+                        Snackbar.default(m.settings_smtp_reset_success());
+                      },
+                      onError: () => Snackbar.error(m.settings_smtp_reset_failed()),
+                    });
+                  }}
+                />
+              )}
+              <div className="right">
+                {smtpConfigured && (
+                  <Button
+                    variant="outlined"
+                    iconLeft="mail"
+                    text={m.settings_smtp_button_send_test_email()}
+                    onClick={() => {
+                      if (demoMode) {
+                        Snackbar.error(m.demo_mode_feature_disabled());
+                        return;
+                      }
+                      openModal(ModalName.SendTestMail);
+                    }}
+                  />
+                )}
+                <Button
+                  testId="save-changes"
+                  text={m.controls_save_changes()}
+                  disabled={isDefaultValue}
+                  loading={isSubmitting}
+                  onClick={() => {
+                    form.handleSubmit();
+                  }}
+                />
+              </div>
+            </Controls>
+          )}
+        </form.Subscribe>
+      </form.AppForm>
+    </form>
   );
 };

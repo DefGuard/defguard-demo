@@ -504,6 +504,7 @@ export interface ApplicationInfo {
   smtp_enabled: boolean;
   external_openid_enabled: boolean;
   ldap_info: LdapInfo;
+  demo_mode: boolean;
 }
 
 export interface VersionResponse {

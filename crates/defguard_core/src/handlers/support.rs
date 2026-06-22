@@ -16,6 +16,12 @@ pub(crate) async fn configuration(
 ) -> ApiResult {
     debug!("User {} dumping app configuration", session.user.username);
 
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "Configuration export is disabled in demo mode",
+        ));
+    }
+
     let mut conn = appstate.pool.begin().await?;
     Ok(match dump_config(&mut conn).await {
         Ok(config) => {
@@ -34,6 +40,9 @@ pub(crate) async fn configuration(
 
 pub(crate) async fn logs(_admin: AdminRole, session: SessionInfo) -> Result<String, WebError> {
     debug!("User {} dumping app logs", session.user.username);
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden("Log export is disabled in demo mode"));
+    }
     if let Some(ref log_file) = server_config().log_file {
         match tokio::fs::read_to_string(log_file).await {
             Ok(logs) => {

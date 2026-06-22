@@ -37,6 +37,14 @@ pub async fn get_settings(_admin: AdminRole, State(appstate): State<AppState>) -
         if settings.main_logo_url.is_empty() {
             settings.main_logo_url = DEFAULT_MAIN_LOGO_URL.into();
         }
+        if server_config().is_demo_mode {
+            settings.secret_key = None;
+            settings.license = None;
+            settings.smtp.password = None;
+            settings.smtp.oauth_client_secret = None;
+            settings.smtp.oauth_refresh_token = None;
+            settings.ldap_bind_password = None;
+        }
         return Ok(ApiResponse::json(settings, StatusCode::OK));
     }
     debug!("Retrieved settings");
@@ -184,6 +192,9 @@ pub async fn patch_settings(
 
 pub(crate) async fn test_ldap_settings(_admin: AdminRole, _license: LicenseInfo) -> ApiResult {
     debug!("Testing LDAP connection");
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden("LDAP is disabled in demo mode"));
+    }
     match LDAPConnection::create().await {
         Ok(_) => {
             debug!("LDAP connected successfully");

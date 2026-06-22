@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
 };
 use chrono::Utc;
-use defguard_common::{db::models::user::User, random::gen_alphanumeric};
+use defguard_common::{config::server_config, db::models::user::User, random::gen_alphanumeric};
 use serde_json::json;
 
 use super::LicenseInfo;
@@ -34,6 +34,12 @@ pub async fn add_api_token(
     Json(data): Json<AddApiTokenData>,
 ) -> ApiResult {
     debug!("Adding API token {:?} for user {username}", data.name);
+
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "Creating API tokens is disabled in demo mode",
+        ));
+    }
 
     // authorize request
     let user = user_for_admin_or_self(&appstate.pool, &session, &username).await?;

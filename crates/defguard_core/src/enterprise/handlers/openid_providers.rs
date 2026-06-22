@@ -541,6 +541,12 @@ pub(crate) async fn test_dirsync_connection(
         session.user.username
     );
 
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "Directory sync is disabled in demo mode",
+        ));
+    }
+
     if let Err(err) = test_directory_sync_connection(&appstate.pool).await {
         error!(
             "User {} tested directory sync connection, the connection failed: {err}",

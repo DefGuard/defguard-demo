@@ -287,6 +287,7 @@ const api = {
   },
   auth: {
     login: (data: LoginRequest) => client.post<LoginResponse>(`/auth`, data),
+    demoLogin: () => client.post(`/auth/demo`),
     logout: () => client.post('/auth/logout'),
     mfa: {
       enable: () => client.put('/auth/mfa'),

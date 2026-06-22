@@ -126,10 +126,10 @@ use crate::{
     handlers::{
         app_info::get_app_info,
         auth::{
-            authenticate, email_mfa_code, email_mfa_disable, email_mfa_enable, email_mfa_init,
-            logout, mfa_disable, mfa_enable, recovery_code, request_email_mfa_code, totp_code,
-            totp_disable, totp_enable, totp_secret, webauthn_end, webauthn_finish, webauthn_init,
-            webauthn_start,
+            authenticate, demo_login, email_mfa_code, email_mfa_disable, email_mfa_enable,
+            email_mfa_init, logout, mfa_disable, mfa_enable, recovery_code, request_email_mfa_code,
+            totp_code, totp_disable, totp_enable, totp_secret, webauthn_end, webauthn_finish,
+            webauthn_init, webauthn_start,
         },
         component_setup::{adopt_gateway, setup_gateway_tls_stream},
         core_certs::{get_ca, get_certs, set_external_url_settings, set_internal_url_settings},
@@ -286,6 +286,7 @@ pub fn build_webapp(
             .route("/updates", get(check_new_version))
             // /auth
             .route("/auth", post(authenticate))
+            .route("/auth/demo", post(demo_login))
             .route("/auth/logout", post(logout))
             .route("/auth/mfa", put(mfa_enable).delete(mfa_disable))
             .route("/auth/webauthn/init", post(webauthn_init))

@@ -1,11 +1,10 @@
 import { createFileRoute, redirect } from '@tanstack/react-router';
 import { LoginLoadingPage } from '../../pages/auth/LoginLoading/LoginLoadingPage';
-import { getSessionInfoQueryOptions } from '../../shared/query';
+import { ensureSessionInfo } from '../../shared/query';
 
 export const Route = createFileRoute('/auth/')({
   beforeLoad: async ({ context }) => {
-    const sessionInfo = (await context.queryClient.fetchQuery(getSessionInfoQueryOptions))
-      .data;
+    const sessionInfo = await ensureSessionInfo(context.queryClient);
 
     if (sessionInfo.authorized) {
       if (sessionInfo.is_admin) {

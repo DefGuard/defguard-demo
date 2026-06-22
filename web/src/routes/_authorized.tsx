@@ -10,13 +10,12 @@ import { UpgradeEnterpriseModal } from '../shared/components/modals/license/Upgr
 import { SelectionModal } from '../shared/components/modals/SelectionModal/SelectionModal';
 import { AppInfoProvider } from '../shared/providers/AppInfoProvider';
 import { AppUserProvider } from '../shared/providers/AppUserProvider';
-import { getSessionInfoQueryOptions, getUserMeQueryOptions } from '../shared/query';
+import { ensureSessionInfo, getUserMeQueryOptions } from '../shared/query';
 
 export const Route = createFileRoute('/_authorized')({
   component: RouteComponent,
   beforeLoad: async ({ context }) => {
-    const sessionInfo = (await context.queryClient.fetchQuery(getSessionInfoQueryOptions))
-      .data;
+    const sessionInfo = await ensureSessionInfo(context.queryClient);
     if (!sessionInfo.authorized) {
       throw redirect({ to: '/auth/login', replace: true });
     }

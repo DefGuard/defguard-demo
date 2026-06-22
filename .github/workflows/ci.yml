@@ -25,19 +25,15 @@ permissions:
 jobs:
   lint:
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-      - instance-size:large
-
+      - self-hosted
+      - Linux
+      - X64
     container: public.ecr.aws/docker/library/rust:1
 
     env:
       CARGO_TERM_COLOR: always
       SQLX_OFFLINE: true
       RUSTC_WRAPPER: sccache
-      SCCACHE_BUCKET: defguard-gh-build-cache
-      SCCACHE_REGION: eu-central-1
-      AWS_ACCESS_KEY_ID: ${{ secrets.S3_CACHE_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_CACHE_SECRET_KEY }}
 
     steps:
       - name: Checkout
@@ -103,8 +99,9 @@ jobs:
 
   build:
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-      - instance-size:2xlarge
+      - self-hosted
+      - Linux
+      - X64
 
     container: public.ecr.aws/docker/library/rust:1
 
@@ -112,10 +109,6 @@ jobs:
       CARGO_TERM_COLOR: always
       SQLX_OFFLINE: true
       RUSTC_WRAPPER: sccache
-      SCCACHE_BUCKET: defguard-gh-build-cache
-      SCCACHE_REGION: eu-central-1
-      AWS_ACCESS_KEY_ID: ${{ secrets.S3_CACHE_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_CACHE_SECRET_KEY }}
 
     steps:
       - name: Checkout
@@ -171,10 +164,10 @@ jobs:
 
   test:
     needs: build
-
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-      - instance-size:large
+      - self-hosted
+      - Linux
+      - X64
 
     container: public.ecr.aws/docker/library/rust:1
 
@@ -233,10 +226,10 @@ jobs:
 
   test-ldap:
     needs: build
-
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-      - instance-size:large
+      - self-hosted
+      - Linux
+      - X64
 
     steps:
       - name: Checkout

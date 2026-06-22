@@ -18,27 +18,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-current:
-    uses: ./.github/workflows/build-docker.yml
-    with:
-      tags: |
-        type=ref,event=branch
-        type=sha
-      trivy-exit-code: "0"
-
   trigger-e2e:
-    needs: build-current
     uses: ./.github/workflows/e2e.yml
-    secrets: inherit
-
-  trigger-dev-deploy:
-    needs: build-current
-    if: ${{ github.event_name != 'pull_request' && (github.ref_name == 'dev' || startsWith(github.ref_name, 'release/'))}}
-    uses: ./.github/workflows/dev-deployment.yml
-    secrets: inherit
-
-  trigger-staging-deploy:
-    needs: build-current
-    if: ${{ github.event_name != 'pull_request' && startsWith(github.ref_name, 'release/') }}
-    uses: ./.github/workflows/staging-deployment.yml
     secrets: inherit

@@ -11,10 +11,12 @@ import {
 import { Modal } from '../../../../../shared/defguard-ui/components/Modal/Modal';
 import { ModalControls } from '../../../../../shared/defguard-ui/components/ModalControls/ModalControls';
 import { SizedBox } from '../../../../../shared/defguard-ui/components/SizedBox/SizedBox';
+import { Snackbar } from '../../../../../shared/defguard-ui/providers/snackbar/snackbar';
 import { ThemeSpacing } from '../../../../../shared/defguard-ui/types';
 import { isPresent } from '../../../../../shared/defguard-ui/utils/isPresent';
 import { useAppForm } from '../../../../../shared/form';
 import { formChangeLogic } from '../../../../../shared/formLogic';
+import { useApp } from '../../../../../shared/hooks/useApp';
 import {
   subscribeCloseModal,
   subscribeOpenModal,
@@ -72,6 +74,7 @@ type ModalContentProps = {
 };
 
 const ModalContent = ({ modalData, setOpen }: ModalContentProps) => {
+  const demoMode = useApp((s) => s.appInfo.demo_mode);
   const { mutateAsync: updateStream } = useMutation({
     mutationFn: ({ id, data }: { id: number; data: CreateActivityLogStreamRequest }) =>
       api.activityLogStream.updateStream(id, data),
@@ -115,6 +118,10 @@ const ModalContent = ({ modalData, setOpen }: ModalContentProps) => {
       onChange: formSchema,
     },
     onSubmit: async ({ value }) => {
+      if (demoMode) {
+        Snackbar.error(m.demo_mode_feature_disabled());
+        return;
+      }
       const certificateContent = await processCertificateFile(value.certificate);
 
       const requestData: CreateActivityLogStreamRequest = {

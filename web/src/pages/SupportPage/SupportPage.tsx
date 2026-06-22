@@ -22,7 +22,9 @@ import { MarkedSection } from '../../shared/defguard-ui/components/MarkedSection
 import { MarkedSectionHeader } from '../../shared/defguard-ui/components/MarkedSectionHeader/MarkedSectionHeader';
 import docIllustration from '../../shared/defguard-ui/components/SectionSelect/assets/manual-user.png';
 import { SizedBox } from '../../shared/defguard-ui/components/SizedBox/SizedBox';
+import { Snackbar } from '../../shared/defguard-ui/providers/snackbar/snackbar';
 import { TextStyle, ThemeSpacing, ThemeVariable } from '../../shared/defguard-ui/types';
+import { useApp } from '../../shared/hooks/useApp';
 import { getLicenseInfoQueryOptions } from '../../shared/query';
 import { downloadFile } from '../../shared/utils/download';
 
@@ -48,6 +50,7 @@ export const SupportPage = () => {
 
 const PageContent = () => {
   const { data: licenseInfo } = useSuspenseQuery(getLicenseInfoQueryOptions);
+  const demoMode = useApp((s) => s.appInfo.demo_mode);
 
   const supportType = useMemo(
     () => licenseInfo?.support_type_narrow ?? 'Free',
@@ -112,6 +115,10 @@ const PageContent = () => {
                   {
                     text: m.support_page_bug_btn_download_support_data(),
                     onClick: async () => {
+                      if (demoMode) {
+                        Snackbar.error(m.demo_mode_feature_disabled());
+                        return;
+                      }
                       const res = await api.support.getSupportData();
                       const blob = new Blob([JSON.stringify(res.data, null, 2)], {
                         type: 'application/json',

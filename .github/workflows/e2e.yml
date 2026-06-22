@@ -11,8 +11,9 @@ permissions:
 jobs:
   test:
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-        instance-size:medium
+      - self-hosted
+      - Linux
+      - X64
     strategy:
       fail-fast: false
       matrix:
@@ -115,8 +116,9 @@ jobs:
 
   test-migration-wizard:
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-        instance-size:medium
+      - self-hosted
+      - Linux
+      - X64
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -211,8 +213,9 @@ jobs:
 
   test-auto-adoption-wizard:
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-        instance-size:medium
+      - self-hosted
+      - Linux
+      - X64
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

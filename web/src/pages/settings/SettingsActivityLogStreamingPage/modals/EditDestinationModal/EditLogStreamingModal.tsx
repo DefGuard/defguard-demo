@@ -16,12 +16,12 @@ import { ThemeSpacing } from '../../../../../shared/defguard-ui/types';
 import { isPresent } from '../../../../../shared/defguard-ui/utils/isPresent';
 import { useAppForm } from '../../../../../shared/form';
 import { formChangeLogic } from '../../../../../shared/formLogic';
-import { useApp } from '../../../../../shared/hooks/useApp';
 import {
   subscribeCloseModal,
   subscribeOpenModal,
 } from '../../../../../shared/hooks/modalControls/modalsSubjects';
 import { ModalName } from '../../../../../shared/hooks/modalControls/modalTypes';
+import { useApp } from '../../../../../shared/hooks/useApp';
 import { processCertificateFile } from '../../../../../shared/utils/processCertificateFile';
 
 const modalNameValue = ModalName.EditLogStreaming;

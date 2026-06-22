@@ -28,6 +28,7 @@ jobs:
         with:
           draft: true
           generate_release_notes: true
+          tag_name: v2.0.2
 
   build-binaries:
     needs:

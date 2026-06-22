@@ -118,67 +118,6 @@ pub async fn create_session(
     }
 }
 
-pub async fn demo_login(
-    cookies: CookieJar,
-    user_agent: TypedHeader<UserAgent>,
-    ClientIpAddr(ip_addr): ClientIpAddr,
-    State(appstate): State<AppState>,
-) -> Result<(CookieJar, ApiResponse), WebError> {
-    if !server_config().is_demo_mode {
-        return Err(WebError::Forbidden("Demo mode is disabled"));
-    }
-
-    let settings = Settings::get_current_settings();
-    let default_admin_id = settings
-        .default_admin_id
-        .ok_or_else(|| WebError::Forbidden("Default admin user not set"))?;
-
-    let user = User::find_by_id(&appstate.pool, default_admin_id)
-        .await?
-        .ok_or(WebError::Authentication)?;
-
-    if !user.is_active {
-        return Err(WebError::Authentication);
-    }
-
-    let agent = USER_AGENT_PARSER.parse(user_agent.as_str());
-    let device_info = get_user_agent_device(&agent);
-
-    Session::delete_expired(&appstate.pool).await?;
-    let session = Session::new(
-        user.id,
-        SessionState::PasswordVerified,
-        ip_addr.to_string(),
-        Some(device_info),
-    );
-    session.save(&appstate.pool).await?;
-
-    let timeout = settings.authentication_timeout();
-    let max_age = Duration::try_from(timeout).map_err(|err| {
-        error!("Failed to convert authentication timeout for cookie max-age: {err}");
-        WebError::Http(StatusCode::INTERNAL_SERVER_ERROR)
-    })?;
-    let config = server_config();
-    let mut auth_cookie = Cookie::build((SESSION_COOKIE_NAME, session.id.clone()))
-        .path("/")
-        .http_only(true)
-        .secure(
-            config
-                .cookie_insecure
-                .map_or(settings.cookie_secure()?, |insecure| !insecure),
-        )
-        .same_site(SameSite::Lax)
-        .max_age(max_age);
-    if let Some(cookie_domain) = cookie_domain() {
-        auth_cookie = auth_cookie.domain(cookie_domain);
-    }
-    let cookies = cookies.add(auth_cookie);
-
-    let user_info = UserInfo::from_user(&appstate.pool, user).await?;
-
-    Ok((cookies, ApiResponse::json(user_info, StatusCode::OK)))
-}
-
 /// Authenticate a user.
 ///
 /// # For successful login, returns:

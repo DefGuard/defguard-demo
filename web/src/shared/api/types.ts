@@ -47,7 +47,6 @@ export interface SessionInfo {
   // if it's not null then wizard is in progress / complete = false
   active_wizard: ActiveWizardValue | null;
   username: string | null;
-  demo_mode: boolean;
 }
 
 export interface GatewayTokenResponse {

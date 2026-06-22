@@ -1,4 +1,4 @@
-import { type QueryClient, queryOptions } from '@tanstack/react-query';
+import { queryOptions } from '@tanstack/react-query';
 import api from './api/api';
 import { AclDeploymentState, type UserProfile } from './api/types';
 import { updateServiceApi, updateServiceClient } from './api/update-service';
@@ -292,20 +292,6 @@ export const getSessionInfoQueryOptions = queryOptions({
   refetchOnReconnect: true,
   refetchOnWindowFocus: false,
 });
-
-export const ensureSessionInfo = async (queryClient: QueryClient) => {
-  let sessionInfo = (await queryClient.fetchQuery(getSessionInfoQueryOptions)).data;
-  if (!sessionInfo.authorized && sessionInfo.demo_mode) {
-    try {
-      await api.auth.demoLogin();
-      await queryClient.invalidateQueries({ queryKey: ['session-info'] });
-      sessionInfo = (await queryClient.fetchQuery(getSessionInfoQueryOptions)).data;
-    } catch (e) {
-      console.error('Demo auto-login failed', e);
-    }
-  }
-  return sessionInfo;
-};
 
 export const getVersionQueryOptions = queryOptions({
   queryFn: api.app.version,

@@ -23,7 +23,7 @@ const HANDSHAKE_INTERVAL: Duration = Duration::minutes(2);
 
 #[derive(Debug)]
 pub struct VpnSessionGeneratorConfig {
-    pub location_id: Id,
+    pub location_id: Option<Id>,
     pub num_users: usize,
     pub devices_per_user: u8,
     pub sessions_per_device: u8,
@@ -36,7 +36,6 @@ pub async fn generate_vpn_session_stats(
     config: VpnSessionGeneratorConfig,
 ) -> Result<()> {
     info!("Running VPN stats generator with config: {config:#?}");
-    let mut rng = rand::thread_rng();
 
     // clear sessions & stats tables unless disabled
     if !config.no_truncate {
@@ -44,17 +43,43 @@ pub async fn generate_vpn_session_stats(
         truncate_with_restart(&pool).await?;
     }
 
-    // fetch specified location
-    let location = WireguardNetwork::find_by_id(&pool, config.location_id)
-        .await?
-        .expect("Location not found");
+    let locations = match config.location_id {
+        Some(location_id) => {
+            let location = WireguardNetwork::find_by_id(&pool, location_id)
+                .await?
+                .expect("Location not found");
+            vec![location]
+        }
+        None => WireguardNetwork::all(&pool).await?,
+    };
+
+    info!("Generating stats for {} VPN location(s)", locations.len());
+
+    for location in locations {
+        generate_stats_for_location(&pool, &config, location).await?;
+    }
+
+    Ok(())
+}
+
+async fn generate_stats_for_location(
+    pool: &PgPool,
+    config: &VpnSessionGeneratorConfig,
+    location: WireguardNetwork<Id>,
+) -> Result<()> {
+    let mut rng = rand::thread_rng();
+
+    info!(
+        "Generating VPN stats for location {} ({})",
+        location.name, location.id
+    );
 
     // prepare a gateway
-    let gateway = prepare_gateway(&pool, location.id).await?;
+    let gateway = prepare_gateway(pool, location.id).await?;
 
     // prepare requested number of users
     let user_count = config.num_users;
-    let users = prepare_users(&pool, &mut rng, user_count).await?;
+    let users = prepare_users(pool, &mut rng, user_count).await?;
 
     // generate sessions for each user
     for (i, user) in users.into_iter().enumerate() {
@@ -68,7 +93,7 @@ pub async fn generate_vpn_session_stats(
 
         // prepare requested number of devices
         let devices =
-            prepare_user_devices(&pool, &mut rng, &user, config.devices_per_user as usize).await?;
+            prepare_user_devices(pool, &mut rng, &user, config.devices_per_user as usize).await?;
 
         let mut used_ips = location.all_used_ips_for_network(&mut transaction).await?;
         // assign devices to the network if not already assigned

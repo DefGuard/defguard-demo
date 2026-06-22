@@ -307,20 +307,3 @@ jobs:
           path: |
             ./e2e/playwright-report
           retention-days: 7
-
-  trigger-dev-deploy:
-    needs: [test, test-migration-wizard, test-auto-adoption-wizard]
-    if: ${{ github.event_name != 'pull_request' && github.ref_name == 'dev' && needs.test.result == 'success' && needs.test-migration-wizard.result == 'success' && needs.test-auto-adoption-wizard.result == 'success' }}
-    uses: ./.github/workflows/dev-deployment.yml
-    secrets: inherit
-
-  trigger-staging-deploy:
-    needs: [test, test-migration-wizard, test-auto-adoption-wizard]
-    if: |
-      github.event_name != 'pull_request' &&
-      startsWith(github.ref_name, 'release/') &&
-      needs.test.result == 'success' &&
-      needs.test-migration-wizard.result == 'success' &&
-      needs.test-auto-adoption-wizard.result == 'success'
-    uses: ./.github/workflows/staging-deployment.yml
-    secrets: inherit

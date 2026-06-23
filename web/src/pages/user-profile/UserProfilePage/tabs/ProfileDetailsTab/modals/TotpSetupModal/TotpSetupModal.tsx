@@ -15,6 +15,7 @@ import { Divider } from '../../../../../../../shared/defguard-ui/components/Divi
 import { ModalControls } from '../../../../../../../shared/defguard-ui/components/ModalControls/ModalControls';
 import { QrCard } from '../../../../../../../shared/defguard-ui/components/QrCard/QrCard';
 import { SizedBox } from '../../../../../../../shared/defguard-ui/components/SizedBox/SizedBox';
+import { Snackbar } from '../../../../../../../shared/defguard-ui/providers/snackbar/snackbar';
 import { ThemeSpacing } from '../../../../../../../shared/defguard-ui/types';
 import { isPresent } from '../../../../../../../shared/defguard-ui/utils/isPresent';
 import { createZodIssue } from '../../../../../../../shared/defguard-ui/utils/zod';
@@ -26,6 +27,7 @@ import {
   subscribeCloseModal,
   subscribeOpenModal,
 } from '../../../../../../../shared/hooks/modalControls/modalsSubjects';
+import { useApp } from '../../../../../../../shared/hooks/useApp';
 import { totpCodeFormSchema } from '../../../../../../../shared/schema/totpCode';
 import { useUserProfile } from '../../../../hooks/useUserProfilePage';
 
@@ -68,6 +70,7 @@ const defaultValues: FormFields = {
 
 const ModalContent = () => {
   const username = useUserProfile((s) => s.user.username);
+  const demoMode = useApp((s) => s.appInfo.demo_mode);
   const { mutateAsync: enableTotp } = useMutation({
     mutationFn: api.auth.mfa.totp.enable,
     meta: {
@@ -104,6 +107,10 @@ const ModalContent = () => {
       onSubmit: formSchema,
     },
     onSubmit: async ({ value, formApi }) => {
+      if (demoMode) {
+        Snackbar.error(m.demo_mode_feature_disabled());
+        return;
+      }
       await enableTotp(value.code).catch((e: AxiosError<ApiError>) => {
         if (e.response?.data.msg === 'Invalid TOTP code' || e.code === '404') {
           formApi.setErrorMap({

@@ -169,7 +169,7 @@ const PageContent = () => {
           </MarkedSection>
         </>
       )}
-      {supportType === 'Direct' && (
+      {supportType === 'Direct' && !demoMode && (
         <>
           <Divider spacing={ThemeSpacing.Xl2} />
           <MarkedSection icon="chat">

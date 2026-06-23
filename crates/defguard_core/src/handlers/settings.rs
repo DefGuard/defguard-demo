@@ -43,7 +43,6 @@ pub async fn get_settings(_admin: AdminRole, State(appstate): State<AppState>) -
             settings.smtp.password = None;
             settings.smtp.oauth_client_secret = None;
             settings.smtp.oauth_refresh_token = None;
-            settings.ldap_bind_password = None;
         }
         return Ok(ApiResponse::json(settings, StatusCode::OK));
     }
@@ -71,6 +70,10 @@ pub(crate) async fn update_settings(
         return Err(WebError::Forbidden(
             "This setting is read-only in demo mode",
         ));
+    }
+
+    if server_config().is_demo_mode {
+        data.ldap_bind_password = data.ldap_bind_password.map(|_| "SECRET".parse().unwrap());
     }
 
     // clone for event
@@ -174,6 +177,10 @@ pub async fn patch_settings(
         ));
     }
 
+    if server_config().is_demo_mode {
+        settings.ldap_bind_password = settings.ldap_bind_password.map(|_| "SECRET".parse().unwrap());
+    }
+
     // clone for event
     let after = settings.clone();
     update_current_settings(&appstate.pool, settings).await?;
@@ -193,7 +200,7 @@ pub async fn patch_settings(
 pub(crate) async fn test_ldap_settings(_admin: AdminRole, _license: LicenseInfo) -> ApiResult {
     debug!("Testing LDAP connection");
     if server_config().is_demo_mode {
-        return Err(WebError::Forbidden("LDAP is disabled in demo mode"));
+        return Ok(ApiResponse::with_status(StatusCode::OK));
     }
     match LDAPConnection::create().await {
         Ok(_) => {

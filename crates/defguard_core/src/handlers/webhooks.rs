@@ -2,7 +2,7 @@ use axum::{
     extract::{Json, Path, State},
     http::StatusCode,
 };
-use defguard_common::db::Id;
+use defguard_common::{config::server_config, db::Id};
 
 use super::{ApiResponse, ApiResult, WebHookData};
 use crate::{
@@ -21,7 +21,10 @@ pub async fn add_webhook(
 ) -> ApiResult {
     let url = webhookdata.url.clone();
     debug!("User {} adding webhook {url}", session.user.username);
-    let webhook: WebHook = webhookdata.into();
+    let mut webhook: WebHook = webhookdata.into();
+    if server_config().is_demo_mode {
+        webhook.token = "SECRET".to_string();
+    }
     let status = match webhook.save(&appstate.pool).await {
         Ok(webhook) => {
             info!("User {} added webhook {url}", session.user.username);
@@ -70,7 +73,11 @@ pub async fn change_webhook(
             let before = webhook.clone();
             webhook.url = data.url;
             webhook.description = data.description;
-            webhook.token = data.token;
+            webhook.token = if server_config().is_demo_mode {
+                "SECRET".to_string()
+            } else {
+                data.token
+            };
             webhook.enabled = data.enabled;
             webhook.on_user_created = data.on_user_created;
             webhook.on_user_deleted = data.on_user_deleted;

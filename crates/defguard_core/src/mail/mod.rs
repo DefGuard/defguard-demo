@@ -216,12 +216,13 @@ impl Mail {
     /// Sends email message using SMTP.
     pub async fn send(self) -> Result<(), MailError> {
         let (to, subject) = (self.to.clone(), self.subject.clone());
-        debug!("Sending mail to: {to}, subject: {subject}");
 
         if server_config().is_demo_mode {
             debug!("Demo mode enabled; skipping outbound mail to: {to}");
             return Ok(());
         }
+
+        debug!("Sending mail to: {to}, subject: {subject}");
 
         // SMTP settings
         let smtp_settings = Settings::get_current_settings().smtp;

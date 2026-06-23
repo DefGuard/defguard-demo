@@ -40,7 +40,8 @@ pub(crate) async fn test_mail(
     );
 
     if server_config().is_demo_mode {
-        return Err(WebError::Forbidden("Sending mail is disabled in demo mode"));
+        debug!("Demo mode enabled; skipping test mail to {}", data.to);
+        return Ok(ApiResponse::with_status(StatusCode::OK));
     }
 
     let mut conn = appstate.pool.begin().await?;

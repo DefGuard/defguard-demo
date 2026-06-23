@@ -128,7 +128,6 @@ type FormFields = z.infer<typeof formSchema>;
 const PageForm = () => {
   const isAppLdapEnabled = useApp((s) => s.appInfo.ldap_info.enabled);
   const smtpEnabled = useApp((s) => s.appInfo.smtp_enabled);
-  const demoMode = useApp((s) => s.appInfo.demo_mode);
   const { data: licenseInfo } = useSuspenseQuery(getLicenseInfoQueryOptions);
   const { data: settings } = useSuspenseQuery(getSettingsQueryOptions);
 
@@ -201,11 +200,6 @@ const PageForm = () => {
       onChange: formSchema,
     },
     onSubmit: async ({ value, formApi }) => {
-      if (demoMode) {
-        Snackbar.error(m.demo_mode_feature_disabled());
-        return;
-      }
-
       const licenseCheckRes = canUseBusinessFeature(licenseInfo);
       if (!licenseCheckRes.result) {
         openModal(ModalName.UpgradeBusiness);
@@ -633,10 +627,6 @@ const PageForm = () => {
                           }
                           loading={testInProgress}
                           onClick={() => {
-                            if (demoMode) {
-                              Snackbar.error(m.demo_mode_feature_disabled());
-                              return;
-                            }
                             handleLdapTest();
                           }}
                         />

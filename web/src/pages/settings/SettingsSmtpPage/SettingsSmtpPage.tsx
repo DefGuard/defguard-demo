@@ -189,7 +189,6 @@ const Content = ({ settings }: { settings: Settings }) => {
   const { data: licenseInfo } = useQuery(getLicenseInfoQueryOptions);
   const oauthLocked =
     licenseInfo !== undefined && !canUseBusinessFeature(licenseInfo).result;
-  const demoMode = useApp((s) => s.appInfo.demo_mode);
   const { mutateAsync: editSettings } = useMutation({
     mutationFn: api.settings.patchSettings,
     meta: {
@@ -210,10 +209,6 @@ const Content = ({ settings }: { settings: Settings }) => {
       onChange: formSchema,
     },
     onSubmit: async ({ value }) => {
-      if (demoMode) {
-        Snackbar.error(m.demo_mode_feature_disabled());
-        return;
-      }
       await editSettings(value);
       form.reset(value);
     },

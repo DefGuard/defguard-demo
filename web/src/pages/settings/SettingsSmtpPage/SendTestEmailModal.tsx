@@ -21,7 +21,6 @@ import {
   subscribeOpenModal,
 } from '../../../shared/hooks/modalControls/modalsSubjects';
 import { ModalName } from '../../../shared/hooks/modalControls/modalTypes';
-import { useApp } from '../../../shared/hooks/useApp';
 
 const modalNameValue = ModalName.SendTestMail;
 
@@ -62,7 +61,6 @@ const defaultValues: FormFields = {
 };
 
 const ModalContent = () => {
-  const demoMode = useApp((s) => s.appInfo.demo_mode);
   const { mutateAsync: sendTestEmail, isPending } = useMutation({
     mutationFn: api.mail.sendTestEmail,
     onSuccess: () => {
@@ -82,10 +80,6 @@ const ModalContent = () => {
       onChange: formSchema,
     },
     onSubmit: async ({ value }) => {
-      if (demoMode) {
-        Snackbar.error(m.demo_mode_feature_disabled());
-        return;
-      }
       await sendTestEmail({
         to: value.email,
       });

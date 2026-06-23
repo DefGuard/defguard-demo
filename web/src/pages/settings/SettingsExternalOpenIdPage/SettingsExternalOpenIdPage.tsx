@@ -19,10 +19,8 @@ import { Breadcrumbs } from '../../../shared/components/Breadcrumbs/Breadcrumbs'
 import { Page } from '../../../shared/components/Page/Page';
 import { InfoBanner } from '../../../shared/defguard-ui/components/InfoBanner/InfoBanner';
 import { SizedBox } from '../../../shared/defguard-ui/components/SizedBox/SizedBox';
-import { Snackbar } from '../../../shared/defguard-ui/providers/snackbar/snackbar';
 import { ThemeSpacing } from '../../../shared/defguard-ui/types';
 import { isPresent } from '../../../shared/defguard-ui/utils/isPresent';
-import { useApp } from '../../../shared/hooks/useApp';
 import { getLicenseInfoQueryOptions } from '../../../shared/query';
 import { canUseBusinessFeature, licenseActionCheck } from '../../../shared/utils/license';
 import { useAddExternalOpenIdStore } from '../../AddExternalOpenIdWizardPage/useAddExternalOpenIdStore';
@@ -44,7 +42,6 @@ const breadcrumbsLinks = [
 
 export const SettingsExternalOpenIdPage = () => {
   const navigate = useNavigate();
-  const demoMode = useApp((s) => s.appInfo.demo_mode);
 
   const { data: activeProvider } = useQuery({
     queryFn: api.openIdProvider.getOpenIdProvider,
@@ -68,10 +65,6 @@ export const SettingsExternalOpenIdPage = () => {
 
   const handleAddProvider = useCallback(
     (provider: OpenIdProviderKindValue) => {
-      if (demoMode) {
-        Snackbar.error(m.demo_mode_feature_disabled());
-        return;
-      }
       if (licenseInfo === undefined) return;
 
       licenseActionCheck(canUseBusinessFeature(licenseInfo), () => {
@@ -82,20 +75,16 @@ export const SettingsExternalOpenIdPage = () => {
         });
       });
     },
-    [demoMode, licenseInfo, navigate],
+    [licenseInfo, navigate],
   );
 
   const handleEditProvider = useCallback(() => {
-    if (demoMode) {
-      Snackbar.error(m.demo_mode_feature_disabled());
-      return;
-    }
     if (licenseInfo === undefined || !isPresent(activeProvider)) return;
 
     licenseActionCheck(canUseBusinessFeature(licenseInfo), () => {
       navigate({ to: '/settings/edit-openid' });
     });
-  }, [demoMode, licenseInfo, activeProvider, navigate]);
+  }, [licenseInfo, activeProvider, navigate]);
 
   return (
     <Page title={m.settings_page_title()}>

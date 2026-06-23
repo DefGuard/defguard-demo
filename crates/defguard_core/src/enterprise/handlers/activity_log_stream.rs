@@ -2,10 +2,7 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use defguard_common::{
-    config::server_config,
-    db::{Id, NoId},
-};
+use defguard_common::db::{Id, NoId};
 use reqwest::StatusCode;
 
 use super::LicenseInfo;
@@ -54,11 +51,6 @@ pub async fn create_activity_log_stream(
 ) -> ApiResult {
     let session_username = &session.user.username;
     debug!("User {session_username} creates activity log stream");
-    if server_config().is_demo_mode {
-        return Err(crate::error::WebError::Forbidden(
-            "Activity log streaming is disabled in demo mode",
-        ));
-    }
     // validate config
     let _ = ActivityLogStreamConfig::from_serde_value(&data.stream_type, &data.stream_config)?;
     let stream_model = ActivityLogStream {
@@ -88,11 +80,6 @@ pub async fn modify_activity_log_stream(
 ) -> ApiResult {
     let session_username = &session.user.username;
     debug!("User {session_username} modifies activity log stream ");
-    if server_config().is_demo_mode {
-        return Err(crate::error::WebError::Forbidden(
-            "Activity log streaming is disabled in demo mode",
-        ));
-    }
     if let Some(mut stream) = ActivityLogStream::find_by_id(&appstate.pool, id).await? {
         // store stream before modifications
         let before = stream.clone();

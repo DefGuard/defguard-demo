@@ -4,9 +4,12 @@ use std::{
     time::Duration,
 };
 
-use defguard_common::db::{
-    Id,
-    models::{Settings, group::Group, user::User},
+use defguard_common::{
+    config::server_config,
+    db::{
+        Id,
+        models::{Settings, group::Group, user::User},
+    },
 };
 use paste::paste;
 use reqwest::header::AUTHORIZATION;
@@ -404,6 +407,11 @@ pub(crate) async fn test_directory_sync_connection(
         return Ok(());
     }
 
+    if server_config().is_demo_mode {
+        debug!("Demo mode is enabled, skipping testing directory sync connection");
+        return Ok(());
+    }
+
     match DirectorySyncClient::build(pool).await {
         Ok(mut dir_sync) => {
             dir_sync.prepare().await?;
@@ -426,6 +434,11 @@ pub async fn sync_user_groups_if_configured(
     #[cfg(not(test))]
     if !is_business_license_active() {
         debug!("Enterprise is not enabled, skipping syncing user groups");
+        return Ok(());
+    }
+
+    if server_config().is_demo_mode {
+        debug!("Demo mode is enabled, skipping testing directory sync connection");
         return Ok(());
     }
 
@@ -1041,6 +1054,11 @@ pub(crate) async fn do_directory_sync(
     #[cfg(not(test))]
     if !is_business_license_active() {
         debug!("Enterprise is not enabled, skipping performing directory sync");
+        return Ok(());
+    }
+
+    if server_config().is_demo_mode {
+        debug!("Demo mode is enabled, skipping performing directory sync");
         return Ok(());
     }
 

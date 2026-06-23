@@ -19,9 +19,7 @@ use crate::{VERSION, db::models::Settings};
 pub static SERVER_CONFIG: OnceLock<DefGuardConfig> = OnceLock::new();
 
 pub fn server_config() -> &'static DefGuardConfig {
-    SERVER_CONFIG
-        .get()
-        .expect("Server configuration not set yet")
+    SERVER_CONFIG.get_or_init(DefGuardConfig::new_test_config)
 }
 
 #[derive(Clone, Debug, Parser, Serialize)]

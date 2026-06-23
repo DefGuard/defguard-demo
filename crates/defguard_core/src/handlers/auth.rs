@@ -441,6 +441,11 @@ pub async fn webauthn_finish(
     State(appstate): State<AppState>,
     Json(webauth_reg): Json<WebAuthnRegistration>,
 ) -> ApiResult {
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "Configuring MFA is disabled in demo mode",
+        ));
+    }
     info!(
         "Finishing WebAuthn registration for user {}",
         session.user.username
@@ -641,6 +646,11 @@ pub async fn totp_enable(
     State(appstate): State<AppState>,
     Json(data): Json<AuthCode>,
 ) -> ApiResult {
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "Configuring MFA is disabled in demo mode",
+        ));
+    }
     let mut user = session.user;
     debug!("Enabling TOTP for user {}", user.username);
     if user.verify_totp_code(&data.code) {
@@ -822,6 +832,11 @@ pub async fn email_mfa_enable(
     State(appstate): State<AppState>,
     Json(data): Json<AuthCode>,
 ) -> ApiResult {
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "Configuring MFA is disabled in demo mode",
+        ));
+    }
     let mut user = session.user;
     debug!("Enabling email MFA for user {}", user.username);
     if user.verify_email_mfa_code(&data.code) {

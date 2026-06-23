@@ -91,6 +91,7 @@ impl GatewayInfo {
         if server_config().is_demo_mode {
             let now = Utc::now().naive_utc();
             for gateway in &mut gateways {
+                gateway.enabled = true;
                 gateway.connected = true;
                 gateway.connected_at = Some(now);
                 gateway.disconnected_at = None;

@@ -50,6 +50,7 @@ pub async fn proxy_list(
     if server_config().is_demo_mode {
         let now = Utc::now().naive_utc();
         for proxy in &mut proxies {
+            proxy.enabled = true;
             proxy.connected_at = Some(now);
             proxy.disconnected_at = None;
         }
@@ -88,6 +89,7 @@ pub(crate) async fn proxy_details(
     let response = match proxy {
         Some(mut proxy) => {
             if server_config().is_demo_mode {
+                proxy.enabled = true;
                 proxy.connected_at = Some(Utc::now().naive_utc());
                 proxy.disconnected_at = None;
             }

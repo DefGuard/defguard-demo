@@ -3,8 +3,8 @@ on:
   push:
     tags:
       - v*.*.*
-    # branches:
-    #   - defguard-demo-mode
+    branches:
+      - defguard-demo-mode
 
 permissions:
   contents: write
@@ -49,7 +49,8 @@ jobs:
       # Store the version, stripping any v-prefix
       - name: Write release version
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          # VERSION=${GITHUB_REF_NAME#v}
+          VERSION=2.0.2
           echo Version: $VERSION
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
@@ -307,7 +308,8 @@ jobs:
 
       - name: Write release version
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          # VERSION=${GITHUB_REF_NAME#v}
+          VERSION=2.0.2
           echo Version: $VERSION
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 

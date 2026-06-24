@@ -178,7 +178,9 @@ pub async fn patch_settings(
     }
 
     if server_config().is_demo_mode {
-        settings.ldap_bind_password = settings.ldap_bind_password.map(|_| "SECRET".parse().unwrap());
+        settings.ldap_bind_password = settings
+            .ldap_bind_password
+            .map(|_| "SECRET".parse().unwrap());
     }
 
     // clone for event

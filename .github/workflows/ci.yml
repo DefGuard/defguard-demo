@@ -142,6 +142,9 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Build and archive tests
         run: |
           cargo nextest archive \

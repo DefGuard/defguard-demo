@@ -12,7 +12,7 @@ use defguard_common::db::{
         vpn_session_stats::VpnSessionStats,
     },
 };
-use rand::{Rng, rngs::ThreadRng};
+use rand::{Rng, rngs::ThreadRng, seq::SliceRandom};
 use sqlx::{PgConnection, PgPool, QueryBuilder, query};
 use tracing::{debug, info};
 
@@ -69,6 +69,8 @@ async fn generate_stats_for_location(
 ) -> Result<()> {
     let mut rng = rand::thread_rng();
 
+    let location_seed = rng.gen_range(0.0..1_000.0);
+
     info!(
         "Generating VPN stats for location {} ({})",
         location.name, location.id
@@ -78,8 +80,10 @@ async fn generate_stats_for_location(
     let gateway = prepare_gateway(pool, location.id).await?;
 
     // prepare requested number of users
-    let user_count = config.num_users;
-    let users = prepare_users(pool, &mut rng, user_count).await?;
+    let mut users = prepare_users(pool, &mut rng, config.num_users).await?;
+    users.shuffle(&mut rng);
+    let user_count = rng.gen_range((config.num_users / 2).max(1)..=config.num_users.max(1));
+    users.truncate(user_count);
 
     // generate sessions for each user
     for (i, user) in users.into_iter().enumerate() {
@@ -92,8 +96,8 @@ async fn generate_stats_for_location(
         let mut transaction = pool.begin().await?;
 
         // prepare requested number of devices
-        let devices =
-            prepare_user_devices(pool, &mut rng, &user, config.devices_per_user as usize).await?;
+        let device_count = rng.gen_range(1..=config.devices_per_user.max(1)) as usize;
+        let devices = prepare_user_devices(pool, &mut rng, &user, device_count).await?;
 
         let mut used_ips = location.all_used_ips_for_network(&mut transaction).await?;
         // assign devices to the network if not already assigned
@@ -126,8 +130,9 @@ async fn generate_stats_for_location(
 
             // start with the active session
             let mut session_end = Utc::now().naive_utc();
+            let session_count = rng.gen_range(1..=config.sessions_per_device.max(1));
 
-            for i in 0..config.sessions_per_device {
+            for i in 0..session_count {
                 let session_duration = Duration::minutes(rng.gen_range(10..120));
                 let session_start = session_end - session_duration;
 
@@ -157,6 +162,7 @@ async fn generate_stats_for_location(
                     session_start,
                     session_end,
                     config.stats_batch_size,
+                    location_seed,
                 )
                 .await?;
 
@@ -195,7 +201,7 @@ async fn prepare_gateway(pool: &PgPool, location_id: Id) -> Result<Gateway<Id>> 
         }
     }
 }
-
+#[allow(clippy::too_many_arguments)]
 async fn generate_mock_session_stats(
     transaction: &mut PgConnection,
     rng: &mut ThreadRng,
@@ -204,6 +210,7 @@ async fn generate_mock_session_stats(
     session_start: NaiveDateTime,
     session_end: NaiveDateTime,
     batch_size: u16,
+    location_seed: f64,
 ) -> Result<()> {
     let mut latest_handshake = session_start;
     let mut next_handshake = latest_handshake + HANDSHAKE_INTERVAL;
@@ -214,14 +221,23 @@ async fn generate_mock_session_stats(
     // assume the IP remains static within a single session
     let endpoint = random_socket_addr(rng).to_string();
 
+    let upload_scale = rng.gen_range(20_000.0..400_000.0);
+    let download_scale = rng.gen_range(20_000.0..400_000.0);
+
     // Vector to accumulate stats before batch insertion
     let mut stats_batch: Vec<VpnSessionStats> = Vec::new();
 
     while collected_at <= session_end {
+        let minutes = collected_at.and_utc().timestamp() as f64 / 60.0;
+        let activity = |phase: f64| {
+            (0.5 + 0.35 * (minutes * 0.5 + phase + location_seed).sin()).clamp(0.05, 1.0)
+        };
+
         // generate traffic
-        let upload_diff = rng.gen_range(100..100_000);
+        let upload_diff = (upload_scale * activity(0.0) * rng.gen_range(0.2..1.8)).max(1.0) as i64;
         total_upload += upload_diff;
-        let download_diff = rng.gen_range(100..100_000);
+        let download_diff =
+            (download_scale * activity(2.0) * rng.gen_range(0.2..1.8)).max(1.0) as i64;
         total_download += download_diff;
 
         let stats = VpnSessionStats::new(

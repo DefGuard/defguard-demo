@@ -1,50 +1,39 @@
-Air Conditioner
-Air Fryer
-Air Purifier
-AirPods
-Apple TV
-Apple Watch
-Bed
-Blender
-Ceiling Fan
-Chair
-Coffee Maker
-Dehumidifier
-Desk
-Dishwasher
-Dryer
-Electric Toothbrush
-Floor Lamp
-Food Processor
-Freezer
-Fridge
-Hair Dryer
-Heater
-HomePod
-Humidifier
-iPad
-iPad Air
-iPad Pro
-iPad mini
+Acer Swift
+Apple iMac
+Apple Mac mini
+Apple Mac Pro
+Apple Mac Studio
+Apple MacBook Air
+Apple MacBook Pro
+Asus ROG Zephyrus
+Asus ZenBook
+Chromebook
+Dell Alienware
+Dell Inspiron
+Dell Latitude
+Dell OptiPlex
+Dell Precision
+Dell XPS
+Google Pixel
+Google Pixel Pro
+HP EliteBook
+HP Envy
+HP Pavilion
+HP ProDesk
+HP Spectre
 iPhone
-iPod touch
-Iron
-Ironing Board
-Kettle
-Kitchen Table
-Microwave
-Mixer
-Oven
-Range Hood
-Robot Vacuum
-Smart Scale
-Smart Speaker
-Smart Thermostat
-Sofa
-Soundbar
-Table Lamp
-Toaster
-TV
-Vacuum Cleaner
-Wardrobe
-Washing Machine
+iPhone Pro
+iPhone Pro Max
+Lenovo IdeaPad
+Lenovo Legion
+Lenovo ThinkCentre
+Lenovo ThinkPad
+Microsoft Surface Laptop
+Microsoft Surface Studio
+Motorola Edge
+OnePlus
+Samsung Galaxy A
+Samsung Galaxy S
+Samsung Galaxy Z Flip
+Samsung Galaxy Z Fold
+Sony Xperia

@@ -42,6 +42,7 @@ pub async fn prepare_users(
         user.first_name = first_name.to_string();
         user.last_name = last_name.to_string();
         user.email = format!("{}@defguard.net", user.username);
+        user.phone = Some("123454321".to_string());
         let user = user.save(pool).await?;
         all_users.push(user);
     }

@@ -3,8 +3,8 @@ on:
   push:
     tags:
       - v*.*.*
-    # branches:
-    #   - defguard-demo-mode
+    branches:
+      - defguard-demo-mode
 
 permissions:
   contents: write

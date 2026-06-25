@@ -222,6 +222,16 @@ pub enum Command {
     InitVpnLocation(InitVpnLocationArgs),
     #[command(about = "Output the gateway gRPC configuration payload for a VPN location by ID.")]
     GatewayConfig(GatewayConfigArgs),
+    #[command(about = "Change a user's password.")]
+    ChangePassword(ChangePasswordArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ChangePasswordArgs {
+    #[arg(long)]
+    pub username: String,
+    #[arg(long)]
+    pub password: String,
 }
 
 #[derive(Args, Debug, Clone)]

@@ -3,7 +3,7 @@ name: Weekly upstream sync
 on:
   pull_request:
   schedule:
-    - cron: "0 8 * * 1" # Poniedziałek 08:00 UTC
+    - cron: "0 8 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -13,39 +13,25 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout fork
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
+          ref: stable/2.x
           fetch-depth: 0
 
-      - name: Add upstream
+      - name: Pull in upstream stable/2.x (keep our own workflows)
         run: |
           git remote add upstream https://github.com/defguard/defguard.git
-          git fetch upstream
-
-      - name: Create sync branch
-        run: |
-          git checkout -B sync/upstream-stable-2.x upstream/stable/2.x
-
-      - name: Remove GitHub workflows from sync branch
-        run: |
-          git restore --source=HEAD --staged --worktree .github/workflows
+          git fetch upstream stable/2.x
+          git reset --hard upstream/stable/2.x
           rm -rf .github/workflows
-          git rm -r --ignore-unmatch .github/workflows
-          git commit -m "Remove GitHub workflows from upstream sync" || true
+          git checkout origin/stable/2.x -- .github/workflows
 
-      - name: Push sync branch
-        run: |
-          git push origin sync/upstream-stable-2.x --force
-
-      - name: Create Pull Request
+      - name: Create or update pull request
         uses: peter-evans/create-pull-request@v8
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
           branch: sync/upstream-stable-2.x
           base: stable/2.x
-          title: "Weekly sync from upstream stable/2.x"
-          body: |
-            Automated weekly sync from upstream.
+          title: "Weekly upstream sync: stable/2.x"
+          body: "Automated weekly sync from upstream defguard/defguard stable/2.x (workflows excluded). Review and merge manually."

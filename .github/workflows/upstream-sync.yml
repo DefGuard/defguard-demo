@@ -1,0 +1,43 @@
+name: Weekly upstream sync
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Poniedziałek 08:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream
+        run: |
+          git remote add upstream https://github.com/defguard/defguard.git
+          git fetch upstream
+
+      - name: Create sync branch
+        run: |
+          git checkout -B sync/upstream-stable-2.x upstream/stable/2.x
+
+      - name: Push sync branch
+        run: |
+          git push origin sync/upstream-stable-2.x --force
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: sync/upstream-stable-2.x
+          base: stable/2.x
+          title: "Weekly sync from upstream stable/2.x"
+          body: |
+            Automated weekly sync from upstream.

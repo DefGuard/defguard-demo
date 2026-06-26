@@ -1,6 +1,7 @@
 name: Weekly upstream sync
 
 on:
+  pull_request:
   schedule:
     - cron: "0 8 * * 1" # Poniedziałek 08:00 UTC
   workflow_dispatch:

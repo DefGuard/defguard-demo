@@ -202,11 +202,7 @@ pub struct DefGuardConfig {
     pub rate_limit_burst: u32,
 
     /// Run the instance in demo mode
-    #[arg(
-        long = "demo-mode",
-        env = "DEFGUARD_DEMO_MODE",
-        default_value = "false"
-    )]
+    #[arg(long = "demo-mode", env = "DEFGUARD_DEMO_MODE", default_value = "true")]
     pub is_demo_mode: bool,
 }
 

@@ -29,6 +29,13 @@ jobs:
         run: |
           git checkout -B sync/upstream-stable-2.x upstream/stable/2.x
 
+      - name: Remove GitHub workflows from sync branch
+        run: |
+          git restore --source=HEAD --staged --worktree .github/workflows
+          rm -rf .github/workflows
+          git rm -r --ignore-unmatch .github/workflows
+          git commit -m "Remove GitHub workflows from upstream sync" || true
+
       - name: Push sync branch
         run: |
           git push origin sync/upstream-stable-2.x --force

@@ -109,6 +109,13 @@ export const LoginMainPage = () => {
             text={m.login_main_demo_info()}
             icon="info-outlined"
           />
+          <SizedBox height={ThemeSize.Sm} />
+
+          <InfoBanner
+            variant="warning"
+            text={m.login_main_demo_reset_info()}
+            icon="info-outlined"
+          />
           <SizedBox height={ThemeSpacing.Xl2} />
         </>
       )}

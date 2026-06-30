@@ -165,6 +165,7 @@ pub(crate) async fn gateway_details(
             if server_config().is_demo_mode {
                 gateway.connected_at = Some(Utc::now().naive_utc());
                 gateway.disconnected_at = None;
+                gateway.enabled = true;
             }
             ApiResponse::json(gateway, StatusCode::OK)
         }

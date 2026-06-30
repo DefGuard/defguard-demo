@@ -208,10 +208,7 @@ const Content = ({ settings }: { settings: Settings }) => {
     validators: {
       onChange: formSchema,
     },
-    onSubmit: async ({ value }) => {
-      await editSettings(value);
-      form.reset(value);
-    },
+    onSubmit: async () => {},
   });
 
   const openConfigModal = (variant: SmtpAuthCardVariant) => {

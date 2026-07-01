@@ -3,8 +3,7 @@ on:
   push:
     tags:
       - v*.*.*
-    branches:
-      - defguard-demo-mode
+
 permissions:
   contents: write
   packages: write
@@ -27,7 +26,7 @@ jobs:
         with:
           draft: true
           generate_release_notes: true
-          tag_name: v2.0.2
+
   build-binaries:
     needs:
       - create-release
@@ -47,8 +46,7 @@ jobs:
       # Store the version, stripping any v-prefix
       - name: Write release version
         run: |
-          # VERSION=${GITHUB_REF_NAME#v}
-          VERSION=2.0.2
+          VERSION=${GITHUB_REF_NAME#v}
           echo Version: $VERSION
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 

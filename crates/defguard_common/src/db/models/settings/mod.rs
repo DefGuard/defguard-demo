@@ -767,6 +767,25 @@ impl Settings {
         Ok(())
     }
 
+    /// Check if all required SMTP options are configured.
+    #[must_use]
+    pub fn smtp_configured(&self) -> bool {
+        self.smtp.server.is_some()
+            && self.smtp.port.is_some()
+            && self.smtp.sender.is_some()
+            && self.smtp.server != Some(String::new())
+            && self.smtp.sender != Some(String::new())
+    }
+
+    #[must_use]
+    pub fn demo_locked_fields_differ(&self, other: &Self) -> bool {
+        self.demo_locked_fields() != other.demo_locked_fields()
+    }
+
+    fn demo_locked_fields(&self) -> impl PartialEq + '_ {
+        (&self.license, &self.defguard_url, &self.public_proxy_url)
+    }
+
     /// Check if all required LDAP options are configured.
     ///
     /// Meant to be used to check if LDAP integration can be enabled.

@@ -4,7 +4,10 @@ use std::{
     time::Duration,
 };
 
-use defguard_common::db::models::{Settings, User};
+use defguard_common::{
+    config::server_config,
+    db::models::{Settings, User},
+};
 use ldap3::{
     LdapConnAsync, LdapConnSettings, Mod, Scope, SearchEntry,
     adapters::{Adapter, EntriesOnly, PagedResults},
@@ -18,6 +21,9 @@ const STREAMING_PAGE_SIZE: i32 = 500;
 
 impl LDAPConnection {
     pub async fn create() -> Result<Self, LdapError> {
+        if server_config().is_demo_mode {
+            return Err(LdapError::Ldap("LDAP is disabled in demo mode".to_string()));
+        }
         let settings = Settings::get_current_settings();
         let config = LDAPConfig::try_from(settings.clone())?;
         let url = settings.ldap_url.ok_or(LdapError::MissingSettings(

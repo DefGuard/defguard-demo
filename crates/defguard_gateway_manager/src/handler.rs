@@ -14,6 +14,7 @@ use std::{
 use chrono::{DateTime, TimeDelta};
 use defguard_common::{
     VERSION,
+    config::server_config,
     db::{
         Id,
         models::{
@@ -537,6 +538,13 @@ impl GatewayHandler {
         clients: Arc<Mutex<HashMap<Id, Client>>>,
         reconnect_delay: Duration,
     ) -> Result<(), GatewayError> {
+        if server_config().is_demo_mode {
+            debug!(
+                "Demo mode enabled; not connecting to Gateway id={}",
+                self.gateway.id
+            );
+            std::future::pending::<()>().await;
+        }
         loop {
             if let Err(err) = self
                 .handle_connection_iteration(Arc::clone(&clients), true)

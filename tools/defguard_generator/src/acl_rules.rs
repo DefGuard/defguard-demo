@@ -7,7 +7,8 @@ pub async fn generate_acl_rules(pool: PgPool, num_rules: u32) -> Result<()> {
 
     for index in 0..num_rules {
         let mut acl_rule = AclRule::default();
-        acl_rule.name = format!("Generated {index}");
+        let name = format!("Generated {index}");
+        acl_rule.name = name;
         acl_rule.state = RuleState::Applied;
         acl_rule.all_locations = true;
         acl_rule.allow_all_users = true;

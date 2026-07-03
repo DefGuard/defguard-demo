@@ -189,7 +189,6 @@ const Content = ({ settings }: { settings: Settings }) => {
   const { data: licenseInfo } = useQuery(getLicenseInfoQueryOptions);
   const oauthLocked =
     licenseInfo !== undefined && !canUseBusinessFeature(licenseInfo).result;
-
   const { mutateAsync: editSettings } = useMutation({
     mutationFn: api.settings.patchSettings,
     meta: {

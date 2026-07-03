@@ -16,7 +16,9 @@ import { useStore } from '@tanstack/react-form';
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 import api from '../../../../../../../shared/api/api';
+import { Snackbar } from '../../../../../../../shared/defguard-ui/providers/snackbar/snackbar';
 import { isPresent } from '../../../../../../../shared/defguard-ui/utils/isPresent';
+import { useApp } from '../../../../../../../shared/hooks/useApp';
 import { useUserProfile } from '../../../../hooks/useUserProfilePage';
 
 const modalNameKey = ModalName.WebauthnSetup;
@@ -68,6 +70,7 @@ const defaultValues: FormFields = {
 
 const ModalContent = () => {
   const user = useUserProfile((s) => s.user);
+  const demoMode = useApp((s) => s.appInfo.demo_mode);
   const queryClient = useQueryClient();
 
   const form = useAppForm({
@@ -78,6 +81,10 @@ const ModalContent = () => {
       onChange: formSchema,
     },
     onSubmit: async ({ value }) => {
+      if (demoMode) {
+        Snackbar.error(m.demo_mode_feature_disabled());
+        return;
+      }
       const { data: backendData } = await api.auth.mfa.webauthn.register.start(
         value.name,
       );

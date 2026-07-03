@@ -22,7 +22,9 @@ use defguard_certs::CertificateAuthority;
 use defguard_common::{
     VERSION,
     auth::claims::{Claims, ClaimsType},
-    config::{DefGuardConfig, GatewayConfigArgs, InitVpnLocationArgs, server_config},
+    config::{
+        ChangePasswordArgs, DefGuardConfig, GatewayConfigArgs, InitVpnLocationArgs, server_config,
+    },
     db::{
         init_db,
         models::{
@@ -1180,6 +1182,18 @@ pub async fn gateway_config(
     config.private_key = "REDACTED".into();
 
     Ok(config)
+}
+
+pub async fn change_user_password(
+    pool: &PgPool,
+    args: &ChangePasswordArgs,
+) -> Result<(), anyhow::Error> {
+    let mut user = User::find_by_username(pool, &args.username)
+        .await?
+        .ok_or_else(|| anyhow!("User {} not found", args.username))?;
+    user.set_password(&args.password);
+    user.save(pool).await?;
+    Ok(())
 }
 
 pub fn is_valid_phone_number(number: &str) -> bool {

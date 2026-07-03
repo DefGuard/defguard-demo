@@ -3,11 +3,14 @@ use axum::{
     extract::{Json, Path, State},
     http::StatusCode,
 };
-use defguard_common::db::{
-    Id,
-    models::{
-        Settings, SettingsEssentials,
-        settings::{LdapSyncStatus, SettingsPatch, update_current_settings},
+use defguard_common::{
+    config::server_config,
+    db::{
+        Id,
+        models::{
+            Settings, SettingsEssentials,
+            settings::{LdapSyncStatus, SettingsPatch, update_current_settings},
+        },
     },
 };
 use sqlx::PgPool;
@@ -34,6 +37,13 @@ pub async fn get_settings(_admin: AdminRole, State(appstate): State<AppState>) -
         if settings.main_logo_url.is_empty() {
             settings.main_logo_url = DEFAULT_MAIN_LOGO_URL.into();
         }
+        if server_config().is_demo_mode {
+            settings.secret_key = None;
+            settings.license = None;
+            settings.smtp.password = None;
+            settings.smtp.oauth_client_secret = None;
+            settings.smtp.oauth_refresh_token = None;
+        }
         return Ok(ApiResponse::json(settings, StatusCode::OK));
     }
     debug!("Retrieved settings");
@@ -55,6 +65,17 @@ pub(crate) async fn update_settings(
 
     data.uuid = before.uuid;
     data.validate()?;
+
+    if server_config().is_demo_mode && data.demo_locked_fields_differ(&before) {
+        return Err(WebError::Forbidden(
+            "This setting is read-only in demo mode",
+        ));
+    }
+
+    if server_config().is_demo_mode {
+        data.ldap_bind_password = data.ldap_bind_password.map(|_| "SECRET".parse().unwrap());
+    }
+
     // clone for event
     let after = data.clone();
 
@@ -150,6 +171,18 @@ pub async fn patch_settings(
     settings.apply(data);
     settings.validate()?;
 
+    if server_config().is_demo_mode && settings.demo_locked_fields_differ(&before) {
+        return Err(WebError::Forbidden(
+            "This setting is read-only in demo mode",
+        ));
+    }
+
+    if server_config().is_demo_mode {
+        settings.ldap_bind_password = settings
+            .ldap_bind_password
+            .map(|_| "SECRET".parse().unwrap());
+    }
+
     // clone for event
     let after = settings.clone();
     update_current_settings(&appstate.pool, settings).await?;
@@ -168,6 +201,9 @@ pub async fn patch_settings(
 
 pub(crate) async fn test_ldap_settings(_admin: AdminRole, _license: LicenseInfo) -> ApiResult {
     debug!("Testing LDAP connection");
+    if server_config().is_demo_mode {
+        return Ok(ApiResponse::with_status(StatusCode::OK));
+    }
     match LDAPConnection::create().await {
         Ok(_) => {
             debug!("LDAP connected successfully");

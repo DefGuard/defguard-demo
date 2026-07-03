@@ -40,6 +40,7 @@ pub async fn prepare_user_devices(
         let base_name = device_names[rng.gen_range(0..device_names.len())];
         device.name = unique_device_name(base_name, &mut taken_names);
         device.user_id = user.id;
+        device.device_type = DeviceType::User;
         device.description = None;
         let device = device.save(pool).await?;
         user_devices.push(device);

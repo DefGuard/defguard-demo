@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 use defguard_common::db::{
     Id,
-    models::{Device, User},
+    models::{Device, DeviceType, User},
 };
 use rand::{Rng, rngs::ThreadRng};
 use sqlx::PgPool;

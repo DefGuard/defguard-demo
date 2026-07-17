@@ -27,13 +27,11 @@ cargo run -p defguard_generator -- vpn-session-stats \
 
 ### Activity log generation
 
-The `vpn-session-stats` command also generates random fake activity log events
-(logins, MFA logins, logouts, VPN connect/disconnect, etc.) by default, so the
-Activity Log view gets populated without any extra arguments. Event timestamps
-are spread over the last minute so they appear as recent activity, and the
-activity log table is never truncated, so running the generator repeatedly
-(e.g. once per minute) keeps adding fresh events. VPN events are only generated
-when at least one VPN location exists.
+As part of the same run `vpn-session-stats` also generates random fake activity log
+events (logins, MFA logins, logouts, VPN connect/disconnect etc.) attributed to the
+same users. Their timestamps are spread over the last minute and the activity log
+table is never truncated, so the generator can be run repeatedly to keep adding fresh
+events. Use `--activity-log-events <N>` to control how many are created (defaults to 20).
 
 ### Session generation logic
 

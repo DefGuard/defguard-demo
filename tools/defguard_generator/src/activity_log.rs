@@ -26,7 +26,6 @@ use crate::{user_devices::prepare_user_devices, users::prepare_users};
 
 pub const DEFAULT_NUM_EVENTS: usize = 20;
 pub const DEFAULT_TIME_SPAN_MINUTES: i64 = 1;
-pub const DEFAULT_NUM_USERS: usize = 10;
 
 const USER_AGENTS: &[&str] = &[
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
@@ -45,16 +44,6 @@ pub struct ActivityLogGeneratorConfig {
     pub num_events: usize,
     pub time_span_minutes: i64,
     pub num_users: usize,
-}
-
-impl Default for ActivityLogGeneratorConfig {
-    fn default() -> Self {
-        Self {
-            num_events: DEFAULT_NUM_EVENTS,
-            time_span_minutes: DEFAULT_TIME_SPAN_MINUTES,
-            num_users: DEFAULT_NUM_USERS,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]

@@ -785,8 +785,6 @@ fn build_vpn_event(
     }
 }
 
-/// Build an in-memory security key snapshot. The passkey bytes are never serialized into
-/// metadata (only id/user_id/name are), so an empty passkey is enough to carry the event.
 fn fabricate_security_key(rng: &mut ThreadRng, user_id: Id) -> WebAuthn<Id> {
     WebAuthn {
         id: rng.gen_range(1_000..1_000_000),
@@ -799,8 +797,6 @@ fn fabricate_security_key(rng: &mut ThreadRng, user_id: Id) -> WebAuthn<Id> {
     }
 }
 
-/// Build an in-memory network device snapshot (not persisted, as the activity log only
-/// stores a metadata snapshot of it).
 fn fabricate_network_device(rng: &mut ThreadRng, user_id: Id) -> Device<Id> {
     let mut device: Device = rng.r#gen();
     device.name = NETWORK_DEVICE_NAMES

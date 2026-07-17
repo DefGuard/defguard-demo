@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use defguard_common::db::{
     Id, NoId,
-    models::{Device, MFAMethod, User, WireguardNetwork},
+    models::{Device, MFAMethod, Settings, User, WireguardNetwork},
 };
 use defguard_core::{
     db::models::activity_log::{
@@ -84,6 +84,17 @@ pub async fn generate_activity_log(
     let mut rng = rand::thread_rng();
 
     let mut users = prepare_users(pool, &mut rng, config.num_users.max(1)).await?;
+
+    let default_admin_id = Settings::get(pool)
+        .await?
+        .and_then(|settings| settings.default_admin_id);
+    users.retain(|user| Some(user.id) != default_admin_id && user.username != "admin");
+
+    if users.is_empty() {
+        info!("No non-admin users available, skipping activity log generation");
+        return Ok(());
+    }
+
     users.shuffle(&mut rng);
 
     let mut user_devices: Vec<(User<Id>, Device<Id>)> = Vec::with_capacity(users.len());
@@ -219,7 +230,10 @@ fn build_event(
             )
         }
         EventKind::LoginFailed => {
-            let message = format!("Authentication for {} failed: invalid password", user.username);
+            let message = format!(
+                "Authentication for {} failed: invalid password",
+                user.username
+            );
             defguard(
                 EventType::UserLoginFailed,
                 serde_json::to_value(LoginFailedMetadata {

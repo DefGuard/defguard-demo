@@ -2,21 +2,28 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use defguard_common::db::{
     Id, NoId,
-    models::{Device, MFAMethod, Settings, User, WireguardNetwork},
+    models::{
+        Device, DeviceType, MFAMethod, Settings, User, WebAuthn, WireguardNetwork, group::Group,
+    },
 };
 use defguard_core::{
     db::models::activity_log::{
         ActivityLogEvent, ActivityLogModule, EventType,
         metadata::{
-            LoginFailedMetadata, MfaLoginFailedMetadata, MfaLoginMetadata, VpnClientMetadata,
-            VpnClientMfaMetadata,
+            DeviceMetadata, EnrollmentDeviceAddedMetadata, EnrollmentTokenMetadata,
+            GroupAssignedMetadata, GroupsBulkAssignedMetadata, LoginFailedMetadata,
+            MfaLoginFailedMetadata, MfaLoginMetadata, MfaSecurityKeyMetadata, NetworkDeviceMetadata,
+            PasswordChangedByAdminMetadata, PasswordResetMetadata, UserMetadata,
+            UserMfaDisabledMetadata, VpnClientMetadata, VpnClientMfaMetadata,
         },
     },
     events::ClientMFAMethod,
 };
 use defguard_event_logger::{
-    description::{get_defguard_event_description, get_vpn_event_description},
-    message::{DefguardEvent, VpnEvent},
+    description::{
+        get_defguard_event_description, get_enrollment_event_description, get_vpn_event_description,
+    },
+    message::{DefguardEvent, EnrollmentEvent, VpnEvent},
 };
 use rand::{Rng, rngs::ThreadRng, seq::SliceRandom};
 use sqlx::PgPool;
@@ -39,6 +46,22 @@ const USER_AGENTS: &[&str] = &[
      Chrome/126.0.0.0 Mobile Safari/537.36",
 ];
 
+const SECURITY_KEY_NAMES: &[&str] = &[
+    "YubiKey 5 NFC",
+    "YubiKey 5C",
+    "Titan Security Key",
+    "Passkey",
+    "TouchID",
+];
+
+const NETWORK_DEVICE_NAMES: &[&str] = &[
+    "Office Router",
+    "Firewall",
+    "NAS",
+    "Print Server",
+    "Backup Server",
+];
+
 #[derive(Debug)]
 pub struct ActivityLogGeneratorConfig {
     pub num_events: usize,
@@ -48,22 +71,60 @@ pub struct ActivityLogGeneratorConfig {
 
 #[derive(Clone, Copy)]
 enum EventKind {
+    // authentication
     Login,
     Logout,
     MfaLogin,
     LoginFailed,
     MfaLoginFailed,
     RecoveryCodeUsed,
+    RecoveryCodeLoginFailed,
     PasswordChanged,
+    // MFA management
+    MfaDisabled,
+    UserMfaDisabled,
     MfaTotpEnabled,
     MfaTotpDisabled,
     MfaEmailEnabled,
     MfaEmailDisabled,
+    MfaSecurityKeyAdded,
+    MfaSecurityKeyRemoved,
+    // user management
+    UserAdded,
+    UserRemoved,
+    PasswordChangedByAdmin,
+    PasswordReset,
+    // device management
+    DeviceAdded,
+    DeviceRemoved,
+    NetworkDeviceAdded,
+    NetworkDeviceRemoved,
+    // group management
+    GroupMemberAdded,
+    GroupMemberRemoved,
+    GroupsBulkAssigned,
+    // enrollment
+    EnrollmentStarted,
+    EnrollmentDeviceAdded,
+    EnrollmentCompleted,
+    EnrollmentTokenAdded,
+    PasswordResetRequested,
+    PasswordResetStarted,
+    PasswordResetCompleted,
+    // VPN
     VpnConnected,
     VpnDisconnected,
     VpnMfaConnected,
     VpnMfaDisconnected,
     VpnMfaSuccess,
+}
+
+struct BuildContext<'a> {
+    user: &'a User<Id>,
+    device: &'a Device<Id>,
+    locations: &'a [WireguardNetwork<Id>],
+    groups: &'a [Group<Id>],
+    users: &'a [User<Id>],
 }
 
 struct GeneratedEvent {
@@ -98,22 +159,28 @@ pub async fn generate_activity_log(
     users.shuffle(&mut rng);
 
     let mut user_devices: Vec<(User<Id>, Device<Id>)> = Vec::with_capacity(users.len());
-    for user in users {
-        let device = prepare_user_devices(pool, &mut rng, &user, 1)
+    for user in &users {
+        let device = prepare_user_devices(pool, &mut rng, user, 1)
             .await?
             .into_iter()
             .next()
             .expect("prepare_user_devices always returns at least one device");
-        user_devices.push((user, device));
+        user_devices.push((user.clone(), device));
     }
 
     let locations = WireguardNetwork::all(pool).await?;
-    let vpn_available = !locations.is_empty();
-    if !vpn_available {
-        info!("No VPN locations found, skipping VPN-related events");
+    let locations_available = !locations.is_empty();
+    if !locations_available {
+        info!("No VPN locations found, skipping VPN and network device events");
     }
 
-    let kind_pool = build_kind_pool(vpn_available);
+    let groups = Group::all(pool).await?;
+    let groups_available = !groups.is_empty();
+    if !groups_available {
+        info!("No groups found, skipping group membership events");
+    }
+
+    let kind_pool = build_kind_pool(locations_available, groups_available);
 
     let now = Utc::now().naive_utc();
     let span_seconds = Duration::minutes(config.time_span_minutes.max(1))
@@ -130,7 +197,14 @@ pub async fn generate_activity_log(
 
         let timestamp = now - Duration::seconds(rng.gen_range(0..span_seconds));
 
-        let generated = build_event(&mut rng, user, device, &locations, kind);
+        let ctx = BuildContext {
+            user,
+            device,
+            locations: &locations,
+            groups: &groups,
+            users: &users,
+        };
+        let generated = build_event(&mut rng, &ctx, kind);
 
         let event = ActivityLogEvent {
             id: NoId,
@@ -154,7 +228,7 @@ pub async fn generate_activity_log(
     Ok(())
 }
 
-fn build_kind_pool(vpn_available: bool) -> Vec<EventKind> {
+fn build_kind_pool(locations_available: bool, groups_available: bool) -> Vec<EventKind> {
     use EventKind::*;
 
     let mut weighted: Vec<(EventKind, u8)> = vec![
@@ -164,20 +238,48 @@ fn build_kind_pool(vpn_available: bool) -> Vec<EventKind> {
         (LoginFailed, 3),
         (MfaLoginFailed, 2),
         (RecoveryCodeUsed, 1),
-        (PasswordChanged, 1),
+        (RecoveryCodeLoginFailed, 1),
+        (PasswordChanged, 2),
+        (MfaDisabled, 1),
+        (UserMfaDisabled, 1),
         (MfaTotpEnabled, 1),
         (MfaTotpDisabled, 1),
         (MfaEmailEnabled, 1),
         (MfaEmailDisabled, 1),
+        (MfaSecurityKeyAdded, 1),
+        (MfaSecurityKeyRemoved, 1),
+        (UserAdded, 2),
+        (UserRemoved, 1),
+        (PasswordChangedByAdmin, 1),
+        (PasswordReset, 1),
+        (DeviceAdded, 3),
+        (DeviceRemoved, 2),
+        (EnrollmentStarted, 2),
+        (EnrollmentDeviceAdded, 2),
+        (EnrollmentCompleted, 2),
+        (EnrollmentTokenAdded, 1),
+        (PasswordResetRequested, 1),
+        (PasswordResetStarted, 1),
+        (PasswordResetCompleted, 1),
     ];
 
-    if vpn_available {
+    if locations_available {
         weighted.extend([
             (VpnConnected, 8),
             (VpnDisconnected, 8),
             (VpnMfaConnected, 4),
             (VpnMfaDisconnected, 4),
             (VpnMfaSuccess, 3),
+            (NetworkDeviceAdded, 1),
+            (NetworkDeviceRemoved, 1),
+        ]);
+    }
+
+    if groups_available {
+        weighted.extend([
+            (GroupMemberAdded, 2),
+            (GroupMemberRemoved, 1),
+            (GroupsBulkAssigned, 1),
         ]);
     }
 
@@ -187,13 +289,7 @@ fn build_kind_pool(vpn_available: bool) -> Vec<EventKind> {
         .collect()
 }
 
-fn build_event(
-    rng: &mut ThreadRng,
-    user: &User<Id>,
-    device: &Device<Id>,
-    locations: &[WireguardNetwork<Id>],
-    kind: EventKind,
-) -> GeneratedEvent {
+fn build_event(rng: &mut ThreadRng, ctx: &BuildContext, kind: EventKind) -> GeneratedEvent {
     let user_agent = random_user_agent(rng).to_string();
 
     let defguard = |event_type: EventType,
@@ -202,6 +298,20 @@ fn build_event(
      -> GeneratedEvent {
         GeneratedEvent {
             module: ActivityLogModule::Defguard,
+            event_type,
+            description,
+            metadata,
+            location: None,
+            device: user_agent.clone(),
+        }
+    };
+
+    let enrollment = |event_type: EventType,
+                      metadata: Option<serde_json::Value>,
+                      description: Option<String>|
+     -> GeneratedEvent {
+        GeneratedEvent {
+            module: ActivityLogModule::Enrollment,
             event_type,
             description,
             metadata,
@@ -232,7 +342,7 @@ fn build_event(
         EventKind::LoginFailed => {
             let message = format!(
                 "Authentication for {} failed: invalid password",
-                user.username
+                ctx.user.username
             );
             defguard(
                 EventType::UserLoginFailed,
@@ -273,10 +383,33 @@ fn build_event(
             None,
             get_defguard_event_description(&DefguardEvent::RecoveryCodeUsed),
         ),
+        EventKind::RecoveryCodeLoginFailed => defguard(
+            EventType::UserMfaLoginFailed,
+            serde_json::to_value(LoginFailedMetadata {
+                message: "Recovery code verification failed".to_string(),
+            })
+            .ok(),
+            get_defguard_event_description(&DefguardEvent::RecoveryCodeLoginFailed),
+        ),
         EventKind::PasswordChanged => defguard(
             EventType::PasswordChanged,
             None,
             get_defguard_event_description(&DefguardEvent::PasswordChanged),
+        ),
+        EventKind::MfaDisabled => defguard(
+            EventType::MfaDisabled,
+            None,
+            get_defguard_event_description(&DefguardEvent::MfaDisabled),
+        ),
+        EventKind::UserMfaDisabled => defguard(
+            EventType::UserMfaDisabled,
+            serde_json::to_value(UserMfaDisabledMetadata {
+                user: ctx.user.clone().into(),
+            })
+            .ok(),
+            get_defguard_event_description(&DefguardEvent::UserMfaDisabled {
+                user: ctx.user.clone(),
+            }),
         ),
         EventKind::MfaTotpEnabled => defguard(
             EventType::MfaTotpEnabled,
@@ -298,21 +431,275 @@ fn build_event(
             None,
             get_defguard_event_description(&DefguardEvent::MfaEmailDisabled),
         ),
+        EventKind::MfaSecurityKeyAdded => {
+            let key = fabricate_security_key(rng, ctx.user.id);
+            defguard(
+                EventType::MfaSecurityKeyAdded,
+                serde_json::to_value(MfaSecurityKeyMetadata {
+                    key: key.clone().into(),
+                })
+                .ok(),
+                get_defguard_event_description(&DefguardEvent::MfaSecurityKeyAdded { key }),
+            )
+        }
+        EventKind::MfaSecurityKeyRemoved => {
+            let key = fabricate_security_key(rng, ctx.user.id);
+            defguard(
+                EventType::MfaSecurityKeyRemoved,
+                serde_json::to_value(MfaSecurityKeyMetadata {
+                    key: key.clone().into(),
+                })
+                .ok(),
+                get_defguard_event_description(&DefguardEvent::MfaSecurityKeyRemoved { key }),
+            )
+        }
+        EventKind::UserAdded => defguard(
+            EventType::UserAdded,
+            serde_json::to_value(UserMetadata {
+                user: ctx.user.clone().into(),
+            })
+            .ok(),
+            get_defguard_event_description(&DefguardEvent::UserAdded {
+                user: ctx.user.clone(),
+            }),
+        ),
+        EventKind::UserRemoved => defguard(
+            EventType::UserRemoved,
+            serde_json::to_value(UserMetadata {
+                user: ctx.user.clone().into(),
+            })
+            .ok(),
+            get_defguard_event_description(&DefguardEvent::UserRemoved {
+                user: ctx.user.clone(),
+            }),
+        ),
+        EventKind::PasswordChangedByAdmin => defguard(
+            EventType::PasswordChangedByAdmin,
+            serde_json::to_value(PasswordChangedByAdminMetadata {
+                user: ctx.user.clone().into(),
+            })
+            .ok(),
+            get_defguard_event_description(&DefguardEvent::PasswordChangedByAdmin {
+                user: ctx.user.clone(),
+            }),
+        ),
+        EventKind::PasswordReset => defguard(
+            EventType::PasswordReset,
+            serde_json::to_value(PasswordResetMetadata {
+                user: ctx.user.clone().into(),
+            })
+            .ok(),
+            get_defguard_event_description(&DefguardEvent::PasswordReset {
+                user: ctx.user.clone(),
+            }),
+        ),
+        EventKind::DeviceAdded => defguard(
+            EventType::DeviceAdded,
+            serde_json::to_value(DeviceMetadata {
+                owner: ctx.user.clone().into(),
+                device: ctx.device.clone(),
+            })
+            .ok(),
+            get_defguard_event_description(&DefguardEvent::UserDeviceAdded {
+                owner: ctx.user.clone(),
+                device: ctx.device.clone(),
+            }),
+        ),
+        EventKind::DeviceRemoved => defguard(
+            EventType::DeviceRemoved,
+            serde_json::to_value(DeviceMetadata {
+                owner: ctx.user.clone().into(),
+                device: ctx.device.clone(),
+            })
+            .ok(),
+            get_defguard_event_description(&DefguardEvent::UserDeviceRemoved {
+                owner: ctx.user.clone(),
+                device: ctx.device.clone(),
+            }),
+        ),
+        EventKind::NetworkDeviceAdded => {
+            build_network_device_event(rng, ctx, &user_agent, EventType::NetworkDeviceAdded)
+        }
+        EventKind::NetworkDeviceRemoved => {
+            build_network_device_event(rng, ctx, &user_agent, EventType::NetworkDeviceRemoved)
+        }
+        EventKind::GroupMemberAdded => {
+            let group = ctx.groups.choose(rng).expect("groups is non-empty").clone();
+            defguard(
+                EventType::GroupMemberAdded,
+                serde_json::to_value(GroupAssignedMetadata {
+                    group: group.clone(),
+                    user: ctx.user.clone().into(),
+                })
+                .ok(),
+                get_defguard_event_description(&DefguardEvent::GroupMemberAdded {
+                    group,
+                    user: ctx.user.clone(),
+                }),
+            )
+        }
+        EventKind::GroupMemberRemoved => {
+            let group = ctx.groups.choose(rng).expect("groups is non-empty").clone();
+            defguard(
+                EventType::GroupMemberRemoved,
+                serde_json::to_value(GroupAssignedMetadata {
+                    group: group.clone(),
+                    user: ctx.user.clone().into(),
+                })
+                .ok(),
+                get_defguard_event_description(&DefguardEvent::GroupMemberRemoved {
+                    group,
+                    user: ctx.user.clone(),
+                }),
+            )
+        }
+        EventKind::GroupsBulkAssigned => {
+            let group_count = rng.gen_range(1..=ctx.groups.len().min(2));
+            let groups: Vec<Group<Id>> = ctx
+                .groups
+                .choose_multiple(rng, group_count)
+                .cloned()
+                .collect();
+            let user_count = rng.gen_range(1..=ctx.users.len().min(5));
+            let users: Vec<User<Id>> = ctx
+                .users
+                .choose_multiple(rng, user_count)
+                .cloned()
+                .collect();
+            defguard(
+                EventType::GroupsBulkAssigned,
+                serde_json::to_value(GroupsBulkAssignedMetadata {
+                    users: users.iter().cloned().map(Into::into).collect(),
+                    groups: groups.clone(),
+                })
+                .ok(),
+                get_defguard_event_description(&DefguardEvent::GroupsBulkAssigned {
+                    users,
+                    groups,
+                }),
+            )
+        }
+        EventKind::EnrollmentStarted => enrollment(
+            EventType::EnrollmentStarted,
+            None,
+            get_enrollment_event_description(&EnrollmentEvent::EnrollmentStarted),
+        ),
+        EventKind::EnrollmentDeviceAdded => {
+            let device = ctx.device.clone();
+            enrollment(
+                EventType::EnrollmentDeviceAdded,
+                serde_json::to_value(EnrollmentDeviceAddedMetadata {
+                    device: device.clone(),
+                })
+                .ok(),
+                get_enrollment_event_description(&EnrollmentEvent::EnrollmentDeviceAdded {
+                    device,
+                }),
+            )
+        }
+        EventKind::EnrollmentCompleted => enrollment(
+            EventType::EnrollmentCompleted,
+            None,
+            get_enrollment_event_description(&EnrollmentEvent::EnrollmentCompleted),
+        ),
+        EventKind::EnrollmentTokenAdded => enrollment(
+            EventType::EnrollmentTokenAdded,
+            serde_json::to_value(EnrollmentTokenMetadata {
+                user: ctx.user.clone().into(),
+            })
+            .ok(),
+            get_enrollment_event_description(&EnrollmentEvent::TokenAdded {
+                user: ctx.user.clone(),
+            }),
+        ),
+        EventKind::PasswordResetRequested => enrollment(
+            EventType::PasswordResetRequested,
+            None,
+            get_enrollment_event_description(&EnrollmentEvent::PasswordResetRequested),
+        ),
+        EventKind::PasswordResetStarted => enrollment(
+            EventType::PasswordResetStarted,
+            None,
+            get_enrollment_event_description(&EnrollmentEvent::PasswordResetStarted),
+        ),
+        EventKind::PasswordResetCompleted => enrollment(
+            EventType::PasswordResetCompleted,
+            None,
+            get_enrollment_event_description(&EnrollmentEvent::PasswordResetCompleted),
+        ),
         EventKind::VpnConnected => {
-            build_vpn_event(rng, device, locations, EventType::VpnClientConnected)
+            build_vpn_event(rng, ctx.device, ctx.locations, EventType::VpnClientConnected)
         }
-        EventKind::VpnDisconnected => {
-            build_vpn_event(rng, device, locations, EventType::VpnClientDisconnected)
-        }
-        EventKind::VpnMfaConnected => {
-            build_vpn_event(rng, device, locations, EventType::VpnClientMfaConnected)
-        }
-        EventKind::VpnMfaDisconnected => {
-            build_vpn_event(rng, device, locations, EventType::VpnClientMfaDisconnected)
-        }
+        EventKind::VpnDisconnected => build_vpn_event(
+            rng,
+            ctx.device,
+            ctx.locations,
+            EventType::VpnClientDisconnected,
+        ),
+        EventKind::VpnMfaConnected => build_vpn_event(
+            rng,
+            ctx.device,
+            ctx.locations,
+            EventType::VpnClientMfaConnected,
+        ),
+        EventKind::VpnMfaDisconnected => build_vpn_event(
+            rng,
+            ctx.device,
+            ctx.locations,
+            EventType::VpnClientMfaDisconnected,
+        ),
         EventKind::VpnMfaSuccess => {
-            build_vpn_event(rng, device, locations, EventType::VpnClientMfaSuccess)
+            build_vpn_event(rng, ctx.device, ctx.locations, EventType::VpnClientMfaSuccess)
         }
+    }
+}
+
+fn build_network_device_event(
+    rng: &mut ThreadRng,
+    ctx: &BuildContext,
+    user_agent: &str,
+    event_type: EventType,
+) -> GeneratedEvent {
+    let location = ctx
+        .locations
+        .choose(rng)
+        .expect("build_network_device_event called without any locations")
+        .clone();
+    let device = fabricate_network_device(rng, ctx.user.id);
+
+    let (description, metadata) = match event_type {
+        EventType::NetworkDeviceAdded => (
+            get_defguard_event_description(&DefguardEvent::NetworkDeviceAdded {
+                device: device.clone(),
+                location: location.clone(),
+            }),
+            serde_json::to_value(NetworkDeviceMetadata {
+                device,
+                location: location.clone(),
+            })
+            .ok(),
+        ),
+        EventType::NetworkDeviceRemoved => (
+            get_defguard_event_description(&DefguardEvent::NetworkDeviceRemoved {
+                device: device.clone(),
+                location: location.clone(),
+            }),
+            serde_json::to_value(NetworkDeviceMetadata {
+                device,
+                location: location.clone(),
+            })
+            .ok(),
+        ),
+        _ => unreachable!("build_network_device_event called with a non-network event type"),
+    };
+
+    GeneratedEvent {
+        module: ActivityLogModule::Defguard,
+        event_type,
+        description,
+        metadata,
+        location: Some(location.name),
+        device: user_agent.to_string(),
     }
 }
 
@@ -390,6 +777,34 @@ fn build_vpn_event(
         location: location_name,
         device: device_str,
     }
+}
+
+/// Build an in-memory security key snapshot. The passkey bytes are never serialized into
+/// metadata (only id/user_id/name are), so an empty passkey is enough to carry the event.
+fn fabricate_security_key(rng: &mut ThreadRng, user_id: Id) -> WebAuthn<Id> {
+    WebAuthn {
+        id: rng.gen_range(1_000..1_000_000),
+        user_id,
+        name: SECURITY_KEY_NAMES
+            .choose(rng)
+            .expect("SECURITY_KEY_NAMES is non-empty")
+            .to_string(),
+        passkey: Vec::new(),
+    }
+}
+
+/// Build an in-memory network device snapshot (not persisted, as the activity log only
+/// stores a metadata snapshot of it).
+fn fabricate_network_device(rng: &mut ThreadRng, user_id: Id) -> Device<Id> {
+    let mut device: Device = rng.r#gen();
+    device.name = NETWORK_DEVICE_NAMES
+        .choose(rng)
+        .expect("NETWORK_DEVICE_NAMES is non-empty")
+        .to_string();
+    device.user_id = user_id;
+    device.device_type = DeviceType::Network;
+    device.description = None;
+    device.with_id(rng.gen_range(1_000..1_000_000))
 }
 
 fn random_user_agent(rng: &mut ThreadRng) -> &'static str {

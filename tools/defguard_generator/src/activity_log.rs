@@ -12,9 +12,9 @@ use defguard_core::{
         metadata::{
             DeviceMetadata, EnrollmentDeviceAddedMetadata, EnrollmentTokenMetadata,
             GroupAssignedMetadata, GroupsBulkAssignedMetadata, LoginFailedMetadata,
-            MfaLoginFailedMetadata, MfaLoginMetadata, MfaSecurityKeyMetadata, NetworkDeviceMetadata,
-            PasswordChangedByAdminMetadata, PasswordResetMetadata, UserMetadata,
-            UserMfaDisabledMetadata, VpnClientMetadata, VpnClientMfaMetadata,
+            MfaLoginFailedMetadata, MfaLoginMetadata, MfaSecurityKeyMetadata,
+            NetworkDeviceMetadata, PasswordChangedByAdminMetadata, PasswordResetMetadata,
+            UserMetadata, UserMfaDisabledMetadata, VpnClientMetadata, VpnClientMfaMetadata,
         },
     },
     events::ClientMFAMethod,
@@ -627,9 +627,12 @@ fn build_event(rng: &mut ThreadRng, ctx: &BuildContext, kind: EventKind) -> Gene
             None,
             get_enrollment_event_description(&EnrollmentEvent::PasswordResetCompleted),
         ),
-        EventKind::VpnConnected => {
-            build_vpn_event(rng, ctx.device, ctx.locations, EventType::VpnClientConnected)
-        }
+        EventKind::VpnConnected => build_vpn_event(
+            rng,
+            ctx.device,
+            ctx.locations,
+            EventType::VpnClientConnected,
+        ),
         EventKind::VpnDisconnected => build_vpn_event(
             rng,
             ctx.device,
@@ -648,9 +651,12 @@ fn build_event(rng: &mut ThreadRng, ctx: &BuildContext, kind: EventKind) -> Gene
             ctx.locations,
             EventType::VpnClientMfaDisconnected,
         ),
-        EventKind::VpnMfaSuccess => {
-            build_vpn_event(rng, ctx.device, ctx.locations, EventType::VpnClientMfaSuccess)
-        }
+        EventKind::VpnMfaSuccess => build_vpn_event(
+            rng,
+            ctx.device,
+            ctx.locations,
+            EventType::VpnClientMfaSuccess,
+        ),
     }
 }
 

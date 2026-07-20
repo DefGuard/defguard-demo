@@ -1,0 +1,37 @@
+name: Weekly upstream sync
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: stable/2.x
+          fetch-depth: 0
+
+      - name: Pull in upstream stable/2.x (keep our own workflows)
+        run: |
+          git remote add upstream https://github.com/defguard/defguard.git
+          git fetch upstream stable/2.x
+          git reset --hard upstream/stable/2.x
+          rm -rf .github/workflows
+          git checkout origin/stable/2.x -- .github/workflows
+
+      - name: Create or update pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.SYNC_PAT }}
+          branch: sync/upstream-stable-2.x
+          base: stable/2.x
+          title: "Weekly upstream sync: stable/2.x"
+          body: "Automated weekly sync from upstream defguard/defguard stable/2.x (workflows excluded). Review and merge manually."

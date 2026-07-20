@@ -25,23 +25,19 @@ permissions:
 jobs:
   lint:
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-      - instance-size:large
-
+      - self-hosted
+      - Linux
+      - X64
     container: public.ecr.aws/docker/library/rust:1
 
     env:
       CARGO_TERM_COLOR: always
       SQLX_OFFLINE: true
       RUSTC_WRAPPER: sccache
-      SCCACHE_BUCKET: defguard-gh-build-cache
-      SCCACHE_REGION: eu-central-1
-      AWS_ACCESS_KEY_ID: ${{ secrets.S3_CACHE_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_CACHE_SECRET_KEY }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           submodules: recursive
 
@@ -61,7 +57,7 @@ jobs:
           restore-keys: cargo-registry-
 
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - name: Scan code with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -103,8 +99,9 @@ jobs:
 
   build:
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-      - instance-size:2xlarge
+      - self-hosted
+      - Linux
+      - X64
 
     container: public.ecr.aws/docker/library/rust:1
 
@@ -112,14 +109,10 @@ jobs:
       CARGO_TERM_COLOR: always
       SQLX_OFFLINE: true
       RUSTC_WRAPPER: sccache
-      SCCACHE_BUCKET: defguard-gh-build-cache
-      SCCACHE_REGION: eu-central-1
-      AWS_ACCESS_KEY_ID: ${{ secrets.S3_CACHE_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_CACHE_SECRET_KEY }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           submodules: recursive
 
@@ -139,7 +132,7 @@ jobs:
           restore-keys: cargo-registry-
 
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - name: Install protoc
         run: apt-get update && apt-get -y install protobuf-compiler
@@ -148,6 +141,9 @@ jobs:
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
         with:
           tool: cargo-nextest
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Build and archive tests
         run: |
@@ -171,10 +167,10 @@ jobs:
 
   test:
     needs: build
-
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-      - instance-size:large
+      - self-hosted
+      - Linux
+      - X64
 
     container: public.ecr.aws/docker/library/rust:1
 
@@ -209,7 +205,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           submodules: recursive
           fetch-depth: 1
@@ -233,14 +229,14 @@ jobs:
 
   test-ldap:
     needs: build
-
     runs-on:
-      - codebuild-defguard-core-runner-${{ github.run_id }}-${{ github.run_attempt }}
-      - instance-size:large
+      - self-hosted
+      - Linux
+      - X64
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           submodules: recursive
           fetch-depth: 1

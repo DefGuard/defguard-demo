@@ -11,6 +11,7 @@ pub mod oauth2;
 pub mod snat;
 mod utils;
 
+use defguard_common::config::server_config;
 use std::time::Duration;
 
 use self::{
@@ -36,6 +37,10 @@ pub fn is_enterprise_license_active() -> bool {
 /// Shared logic for gating features to specific license tiers
 fn is_license_tier_active(tier: LicenseTier) -> bool {
     trace!("Checking if features for {tier} license tier should be enabled");
+
+    if server_config().is_demo_mode {
+        return true;
+    }
 
     // get current object counts
     let counts = get_counts();

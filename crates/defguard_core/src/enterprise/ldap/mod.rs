@@ -1,11 +1,14 @@
 use std::{collections::HashSet, future::Future};
 
-use defguard_common::db::{
-    Id,
-    models::{
-        Settings, User,
-        group::Group,
-        settings::{LdapSyncStatus, update_current_settings},
+use defguard_common::{
+    config::server_config,
+    db::{
+        Id,
+        models::{
+            Settings, User,
+            group::Group,
+            settings::{LdapSyncStatus, update_current_settings},
+        },
     },
 };
 #[cfg(not(test))]
@@ -63,6 +66,11 @@ pub(crate) async fn do_ldap_sync(
 
     if !settings.ldap_sync_enabled {
         debug!("LDAP sync is disabled, not performing LDAP sync");
+        return Ok(());
+    }
+
+    if server_config().is_demo_mode {
+        debug!("Demo mode is enabled, not performing LDAP sync");
         return Ok(());
     }
 

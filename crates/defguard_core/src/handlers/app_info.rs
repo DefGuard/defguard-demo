@@ -1,6 +1,7 @@
 use axum::{extract::State, http::StatusCode};
 use defguard_common::{
     VERSION,
+    config::server_config,
     db::models::{Settings, WireguardNetwork},
 };
 
@@ -27,6 +28,7 @@ pub struct AppInfo {
     smtp_enabled: bool,
     ldap_info: LdapInfo,
     external_openid_enabled: bool,
+    demo_mode: bool,
 }
 
 pub async fn get_app_info(State(appstate): State<AppState>, _session: SessionInfo) -> ApiResult {
@@ -50,6 +52,7 @@ pub async fn get_app_info(State(appstate): State<AppState>, _session: SessionInf
             ad: settings.ldap_uses_ad,
         },
         external_openid_enabled,
+        demo_mode: server_config().is_demo_mode,
     };
 
     Ok(ApiResponse::json(res, StatusCode::OK))

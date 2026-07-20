@@ -17,6 +17,7 @@ import { TableCell } from '../../shared/defguard-ui/components/table/TableCell/T
 import { TableTop } from '../../shared/defguard-ui/components/table/TableTop/TableTop';
 import { useApiToTableState } from '../../shared/defguard-ui/hooks/useApiToTableState';
 import { isPresent } from '../../shared/defguard-ui/utils/isPresent';
+import { useApp } from '../../shared/hooks/useApp';
 import { displayDate } from '../../shared/utils/displayDate';
 import { formatIpForDisplay } from '../../shared/utils/formatIpForDisplay';
 
@@ -60,6 +61,8 @@ export const ActivityLogTable = ({
     defaultSortingKey: 'timestamp',
   });
 
+  const demoMode = useApp((s) => s.appInfo.demo_mode);
+
   const columns = useMemo(
     () => [
       columnHelper.accessor('timestamp', {
@@ -89,6 +92,13 @@ export const ActivityLogTable = ({
         header: m.activity_log_col_ip(),
         minSize: 150,
         cell: (info) => {
+          if (demoMode) {
+            return (
+              <TableCell>
+                <span>{'<REDACTED>'}</span>
+              </TableCell>
+            );
+          }
           const value = info.getValue();
           const displayValue = isPresent(value) ? formatIpForDisplay(value) : value;
           return (
@@ -163,7 +173,7 @@ export const ActivityLogTable = ({
         ),
       }),
     ],
-    [],
+    [demoMode],
   );
 
   const table = useReactTable({

@@ -11,6 +11,7 @@ use axum_extra::extract::cookie::Key;
 use chrono::NaiveDateTime;
 use defguard_common::{
     VERSION,
+    config::server_config,
     db::{
         Id,
         models::{Certificates, Settings, proxy::Proxy},
@@ -274,6 +275,13 @@ impl ProxyHandler {
         incompatible_components: Arc<RwLock<IncompatibleComponents>>,
         certs_rx: watch::Receiver<Arc<HashMap<Id, String>>>,
     ) -> Result<(), ProxyError> {
+        if server_config().is_demo_mode {
+            debug!(
+                "Demo mode enabled; not connecting to Edge id={}",
+                self.proxy_id
+            );
+            std::future::pending::<()>().await;
+        }
         let parsed_version = Version::parse(VERSION)?;
         loop {
             let channel = match self.connect_channel(certs_rx.clone()).await {

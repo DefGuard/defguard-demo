@@ -12,11 +12,14 @@ mod tests;
 
 use std::{str::FromStr, time::Duration};
 
-use defguard_common::db::models::{
-    MFAMethod, Settings,
-    settings::{
-        defaults::WELCOME_EMAIL_SUBJECT,
-        smtp::{SmtpAuthentication, SmtpEncryption, SmtpSettings},
+use defguard_common::{
+    config::server_config,
+    db::models::{
+        MFAMethod, Settings,
+        settings::{
+            defaults::WELCOME_EMAIL_SUBJECT,
+            smtp::{SmtpAuthentication, SmtpEncryption, SmtpSettings},
+        },
     },
 };
 use lettre::{
@@ -213,6 +216,12 @@ impl Mail {
     /// Sends email message using SMTP.
     pub async fn send(self) -> Result<(), MailError> {
         let (to, subject) = (self.to.clone(), self.subject.clone());
+
+        if server_config().is_demo_mode {
+            debug!("Demo mode enabled; skipping outbound mail to: {to}");
+            return Ok(());
+        }
+
         debug!("Sending mail to: {to}, subject: {subject}");
 
         // SMTP settings

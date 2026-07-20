@@ -18,10 +18,12 @@ import type { SelectionOption } from '../../../../shared/components/SelectionSec
 import { Checkbox } from '../../../../shared/defguard-ui/components/Checkbox/Checkbox';
 import { Divider } from '../../../../shared/defguard-ui/components/Divider/Divider';
 import { ModalControls } from '../../../../shared/defguard-ui/components/ModalControls/ModalControls';
+import { Snackbar } from '../../../../shared/defguard-ui/providers/snackbar/snackbar';
 import { ThemeSpacing } from '../../../../shared/defguard-ui/types';
 import { isPresent } from '../../../../shared/defguard-ui/utils/isPresent';
 import { useAppForm } from '../../../../shared/form';
 import { formChangeLogic } from '../../../../shared/formLogic';
+import { useApp } from '../../../../shared/hooks/useApp';
 
 interface ModalState extends OpenCEGroupModal {
   step: 'start' | 'users';
@@ -90,6 +92,7 @@ const userToOption = (user: User): SelectionOption<string> => ({
 });
 
 const UsersStep = ({ users, startForm, groupInfo, isEdit, setModalState }: StepProps) => {
+  const demoMode = useApp((s) => s.appInfo.demo_mode);
   const { mutate: editGroup, isPending: editPending } = useMutation({
     mutationFn: api.group.editGroup,
     meta: {
@@ -117,6 +120,10 @@ const UsersStep = ({ users, startForm, groupInfo, isEdit, setModalState }: StepP
 
   const handleSubmit = () => {
     if (startForm && !addPending && !editPending) {
+      if (demoMode && groupInfo?.is_admin) {
+        Snackbar.error(m.demo_mode_feature_disabled());
+        return;
+      }
       const members = Array.from(selected);
       const requestData = {
         ...startForm,

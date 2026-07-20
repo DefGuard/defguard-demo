@@ -22,6 +22,7 @@ use defguard_common::{
 };
 use defguard_core::{
     auth::failed_login::FailedLoginMap,
+    change_user_password,
     db::AppEvent,
     enterprise::{
         activity_log_stream::activity_log_stream_manager::run_activity_log_stream_manager,
@@ -124,6 +125,10 @@ async fn main() -> Result<(), anyhow::Error> {
             Command::GatewayConfig(args) => {
                 let config = gateway_config(&pool, args).await?;
                 println!("{config:?}");
+            }
+            Command::ChangePassword(args) => {
+                change_user_password(&pool, args).await?;
+                println!("Password for user {} changed", args.username);
             }
         }
 

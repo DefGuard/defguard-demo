@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use defguard_common::db::NoId;
+use defguard_common::{config::server_config, db::NoId};
 use defguard_core::db::models::activity_log::{
     ActivityLogEvent, ActivityLogModule, EventType,
     metadata::{
@@ -596,7 +596,11 @@ async fn process_batch(
                 user_id,
                 username,
                 location,
-                ip: ip.map(Into::into),
+                ip: if server_config().is_demo_mode {
+                    None
+                } else {
+                    ip.map(Into::into)
+                },
                 event,
                 module,
                 device,

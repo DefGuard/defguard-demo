@@ -123,16 +123,17 @@ export const BasicAuthForm = ({ initialValues, onApply, onClose }: FormProps) =>
             )}
           </form.AppField>
         </EvenSplit>
-        <SizedBox height={ThemeSpacing.Xl2} />
         <form.Subscribe selector={(s) => ({ isSubmitting: s.isSubmitting })}>
           {({ isSubmitting }) => (
             <ModalControls
               submitProps={{
+                testId: 'submit',
                 text: m.controls_submit(),
                 loading: isSubmitting,
                 onClick: () => form.handleSubmit(),
               }}
               cancelProps={{
+                testId: 'cancel',
                 text: m.controls_cancel(),
                 disabled: isSubmitting,
                 onClick: onClose,

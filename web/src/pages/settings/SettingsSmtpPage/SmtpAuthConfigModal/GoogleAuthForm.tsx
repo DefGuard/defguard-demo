@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import z from 'zod';
 import { m } from '../../../../paraglide/messages';
 import { SmtpAuthentication, SmtpEncryption } from '../../../../shared/api/types';
@@ -22,6 +21,7 @@ import {
   waitForOAuthCode,
 } from './oauthFlow';
 import type { FormProps } from './types';
+import { useOAuthSubmit } from './useOAuthSubmit';
 
 const schema = z.object({
   smtp_sender: z
@@ -34,7 +34,8 @@ const schema = z.object({
 });
 
 export const GoogleAuthForm = ({ initialValues, onApply, onClose }: FormProps) => {
-  const [oauthError, setOauthError] = useState<string | null>(null);
+  const { oauthError, setOauthError, handleCancel, beginOAuth, handleOAuthError } =
+    useOAuthSubmit(onClose);
 
   const form = useAppForm({
     defaultValues: {
@@ -66,7 +67,7 @@ export const GoogleAuthForm = ({ initialValues, onApply, onClose }: FormProps) =
       }
 
       try {
-        const code = await waitForOAuthCode(popup);
+        const code = await waitForOAuthCode(popup, beginOAuth());
         const refreshToken = await exchangeCodeForToken(
           GOOGLE_TOKEN_URL,
           code,
@@ -86,9 +87,7 @@ export const GoogleAuthForm = ({ initialValues, onApply, onClose }: FormProps) =
           smtp_encryption: SmtpEncryption.StartTls,
         });
       } catch (err) {
-        setOauthError(
-          err instanceof Error ? err.message : m.settings_smtp_auth_oauth_error(),
-        );
+        handleOAuthError(err);
       }
     },
   });
@@ -138,19 +137,19 @@ export const GoogleAuthForm = ({ initialValues, onApply, onClose }: FormProps) =
         <SizedBox height={ThemeSpacing.Md} />
         <p className="smtp-auth-oauth-info">{m.settings_smtp_auth_oauth_info()}</p>
         <FieldError error={oauthError} />
-        <SizedBox height={ThemeSpacing.Xl2} />
         <form.Subscribe selector={(s) => ({ isSubmitting: s.isSubmitting })}>
           {({ isSubmitting }) => (
             <ModalControls
               submitProps={{
+                testId: 'submit',
                 text: m.controls_submit(),
                 loading: isSubmitting,
                 onClick: () => form.handleSubmit(),
               }}
               cancelProps={{
+                testId: 'cancel',
                 text: m.controls_cancel(),
-                disabled: isSubmitting,
-                onClick: onClose,
+                onClick: handleCancel,
               }}
             />
           )}

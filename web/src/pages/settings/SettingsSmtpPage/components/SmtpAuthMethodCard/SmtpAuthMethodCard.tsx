@@ -5,7 +5,7 @@ import { m } from '../../../../../paraglide/messages';
 import { BusinessBadge } from '../../../../../shared/components/badges/BusinessBadge';
 import { Badge } from '../../../../../shared/defguard-ui/components/Badge/Badge';
 import { Button } from '../../../../../shared/defguard-ui/components/Button/Button';
-import { Icon } from '../../../../../shared/defguard-ui/components/Icon';
+import { Icon, IconKind } from '../../../../../shared/defguard-ui/components/Icon';
 import { IconButtonMenu } from '../../../../../shared/defguard-ui/components/IconButtonMenu/IconButtonMenu';
 import type { MenuItemsGroup } from '../../../../../shared/defguard-ui/components/Menu/types';
 import { ThemeVariable } from '../../../../../shared/defguard-ui/types';
@@ -63,13 +63,13 @@ export const SmtpAuthMethodCard = ({
         {
           text: m.controls_edit(),
           icon: 'edit',
-          testId: 'smtp-card-edit',
+          testId: `smtp-card-${variant}-edit`,
           onClick: onEdit,
         },
         {
           text: m.settings_smtp_button_send_test_email(),
           icon: 'mail',
-          testId: 'smtp-card-send-test-email',
+          testId: `smtp-card-${variant}-send-test-email`,
           onClick: onSendTestEmail,
         },
       ],
@@ -79,7 +79,7 @@ export const SmtpAuthMethodCard = ({
         {
           text: m.controls_delete(),
           icon: 'delete',
-          testId: 'smtp-card-delete',
+          testId: `smtp-card-${variant}-delete`,
           variant: 'danger',
           onClick: onDelete,
         },
@@ -88,7 +88,10 @@ export const SmtpAuthMethodCard = ({
   ];
 
   return (
-    <div className={clsx('smtp-auth-method-card', { active })}>
+    <div
+      className={clsx('smtp-auth-method-card', { active })}
+      data-testid={`smtp-auth-method-card-${variant}`}
+    >
       <div className="inner">
         <div className="icon-track">
           <div className={clsx('icon-box', `variant-${variant}`)}>
@@ -99,7 +102,12 @@ export const SmtpAuthMethodCard = ({
           <div className="top">
             <p className="name">{cardNames[variant]}</p>
             {active && (
-              <Badge variant="success" text={m.settings_smtp_auth_card_active_method()} />
+              <Badge
+                showIcon
+                icon={IconKind.CheckFilled}
+                variant="success"
+                text={m.settings_smtp_auth_card_active_method()}
+              />
             )}
             {locked && <BusinessBadge />}
           </div>
@@ -112,6 +120,7 @@ export const SmtpAuthMethodCard = ({
             <Button
               variant="outlined"
               text={m.controls_configure()}
+              testId={`smtp-card-${variant}-configure`}
               onClick={onConfigure}
             />
           )}

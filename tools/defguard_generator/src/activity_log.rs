@@ -17,7 +17,11 @@ use defguard_core::{
             UserMetadata, UserMfaDisabledMetadata, VpnClientMetadata, VpnClientMfaMetadata,
         },
     },
-    events::ClientMFAMethod,
+    events::{ApiEventType, ClientMFAMethod, EnrollmentEvent as CoreEnrollmentEvent},
+};
+use defguard_event_logger::description::{
+    get_api_event_description,
+    get_enrollment_event_description as get_core_enrollment_event_description,
 };
 use rand::{Rng, rngs::ThreadRng, seq::SliceRandom};
 
@@ -81,11 +85,6 @@ enum DefguardEvent {
         owner: User<Id>,
         device: Device<Id>,
     },
-    UserDeviceModified {
-        owner: User<Id>,
-        before: Device<Id>,
-        after: Device<Id>,
-    },
     NetworkDeviceAdded {
         device: Device<Id>,
         location: WireguardNetwork<Id>,
@@ -93,50 +92,6 @@ enum DefguardEvent {
     NetworkDeviceRemoved {
         device: Device<Id>,
         location: WireguardNetwork<Id>,
-    },
-    NetworkDeviceModified {
-        before: Device<Id>,
-        after: Device<Id>,
-        location: WireguardNetwork<Id>,
-    },
-    VpnLocationAdded {
-        location: WireguardNetwork<Id>,
-    },
-    VpnLocationRemoved {
-        location: WireguardNetwork<Id>,
-    },
-    VpnLocationModified {
-        before: WireguardNetwork<Id>,
-        after: WireguardNetwork<Id>,
-    },
-    OpenIdProviderModified {
-        provider: String,
-    },
-    OpenIdProviderRemoved {
-        provider: String,
-    },
-    SettingsUpdated {
-        before: Settings,
-        after: Settings,
-    },
-    SettingsUpdatedPartial {
-        before: Settings,
-        after: Settings,
-    },
-    SettingsDefaultBrandingRestored,
-    GroupsBulkAssigned {
-        users: Vec<User<Id>>,
-        groups: Vec<Group<Id>>,
-    },
-    GroupAdded {
-        group: Group<Id>,
-    },
-    GroupModified {
-        before: Group<Id>,
-        after: Group<Id>,
-    },
-    GroupRemoved {
-        group: Group<Id>,
     },
     GroupMemberAdded {
         group: Group<Id>,
@@ -146,104 +101,116 @@ enum DefguardEvent {
         group: Group<Id>,
         user: User<Id>,
     },
-    GroupMembersModified {
-        group: Group<Id>,
-        added: Vec<User<Id>>,
-        removed: Vec<User<Id>>,
+    GroupsBulkAssigned {
+        users: Vec<User<Id>>,
+        groups: Vec<Group<Id>>,
     },
-    WebHookAdded {
-        webhook: String,
-    },
-    WebHookModified {
-        before: String,
-        after: String,
-    },
-    WebHookRemoved {
-        webhook: String,
-    },
-    WebHookStateChanged {
-        webhook: String,
-        enabled: bool,
-    },
-    AuthenticationKeyAdded {
-        key: String,
-    },
-    AuthenticationKeyRemoved {
-        key: String,
-    },
-    AuthenticationKeyRenamed {
-        key: String,
-        old_name: String,
-        new_name: String,
-    },
-    ClientConfigurationTokenAdded {
-        user: User<Id>,
-    },
-    UserSnatBindingAdded {
-        user: User<Id>,
-        binding: String,
-    },
-    UserSnatBindingRemoved {
-        user: User<Id>,
-        binding: String,
-    },
-    UserSnatBindingModified {
-        user: User<Id>,
-        before: String,
-        after: String,
-    },
-    ProxyModified {
-        before: String,
-        after: String,
-    },
-    ProxyDeleted {
-        proxy: String,
-    },
-    GatewayModified {
-        before: String,
-        after: String,
-    },
-    GatewayDeleted {
-        gateway: String,
-    },
-    ActivityLogStreamCreated {
-        stream: String,
-    },
-    ActivityLogStreamModified {
-        before: String,
-        after: String,
-    },
-    ActivityLogStreamRemoved {
-        stream: String,
-    },
-    ApiTokenAdded {
-        owner: User<Id>,
-        token: String,
-    },
-    ApiTokenRemoved {
-        owner: User<Id>,
-        token: String,
-    },
-    ApiTokenRenamed {
-        owner: User<Id>,
-        token: String,
-        old_name: String,
-        new_name: String,
-    },
-    OpenIdAppAdded {
-        app: String,
-    },
-    OpenIdAppRemoved {
-        app: String,
-    },
-    OpenIdAppModified {
-        before: String,
-        after: String,
-    },
-    OpenIdAppStateChanged {
-        app: String,
-        enabled: bool,
-    },
+}
+
+impl DefguardEvent {
+    fn to_api_event_type(&self) -> Option<ApiEventType> {
+        match self {
+            DefguardEvent::UserLogin => Some(ApiEventType::UserLogin),
+            DefguardEvent::UserLoginFailed { message } => Some(ApiEventType::UserLoginFailed {
+                message: message.clone(),
+            }),
+            DefguardEvent::UserLogout => Some(ApiEventType::UserLogout),
+            DefguardEvent::UserMfaLogin { mfa_method } => Some(ApiEventType::UserMfaLogin {
+                mfa_method: *mfa_method,
+            }),
+            DefguardEvent::UserMfaLoginFailed {
+                mfa_method,
+                message,
+            } => Some(ApiEventType::UserMfaLoginFailed {
+                mfa_method: *mfa_method,
+                message: message.clone(),
+            }),
+            DefguardEvent::RecoveryCodeLoginFailed => Some(ApiEventType::RecoveryCodeLoginFailed),
+            DefguardEvent::RecoveryCodeUsed => Some(ApiEventType::RecoveryCodeUsed),
+            DefguardEvent::PasswordChangedByAdmin { user } => {
+                Some(ApiEventType::PasswordChangedByAdmin { user: user.clone() })
+            }
+            DefguardEvent::PasswordChanged => Some(ApiEventType::PasswordChanged),
+            DefguardEvent::PasswordReset { user } => {
+                Some(ApiEventType::PasswordReset { user: user.clone() })
+            }
+            DefguardEvent::MfaDisabled => Some(ApiEventType::MfaDisabled),
+            DefguardEvent::UserMfaDisabled { user } => {
+                Some(ApiEventType::UserMfaDisabled { user: user.clone() })
+            }
+            DefguardEvent::MfaTotpDisabled => Some(ApiEventType::MfaTotpDisabled),
+            DefguardEvent::MfaTotpEnabled => Some(ApiEventType::MfaTotpEnabled),
+            DefguardEvent::MfaEmailDisabled => Some(ApiEventType::MfaEmailDisabled),
+            DefguardEvent::MfaEmailEnabled => Some(ApiEventType::MfaEmailEnabled),
+            DefguardEvent::MfaSecurityKeyAdded { key } => {
+                Some(ApiEventType::MfaSecurityKeyAdded { key: key.clone() })
+            }
+            DefguardEvent::MfaSecurityKeyRemoved { key } => {
+                Some(ApiEventType::MfaSecurityKeyRemoved { key: key.clone() })
+            }
+            DefguardEvent::UserAdded { user } => {
+                Some(ApiEventType::UserAdded { user: user.clone() })
+            }
+            DefguardEvent::UserRemoved { user } => {
+                Some(ApiEventType::UserRemoved { user: user.clone() })
+            }
+            DefguardEvent::UserModified { before, after } => Some(ApiEventType::UserModified {
+                before: before.clone(),
+                after: after.clone(),
+            }),
+            DefguardEvent::UserGroupsModified {
+                user,
+                before,
+                after,
+            } => Some(ApiEventType::UserGroupsModified {
+                user: user.clone(),
+                before: before.clone(),
+                after: after.clone(),
+            }),
+            DefguardEvent::UserDeviceAdded { owner, device } => {
+                Some(ApiEventType::UserDeviceAdded {
+                    owner: owner.clone(),
+                    device: device.clone(),
+                })
+            }
+            DefguardEvent::UserDeviceRemoved { owner, device } => {
+                Some(ApiEventType::UserDeviceRemoved {
+                    owner: owner.clone(),
+                    device: device.clone(),
+                })
+            }
+            DefguardEvent::NetworkDeviceAdded { device, location } => {
+                Some(ApiEventType::NetworkDeviceAdded {
+                    device: device.clone(),
+                    location: location.clone(),
+                })
+            }
+            DefguardEvent::NetworkDeviceRemoved { device, location } => {
+                Some(ApiEventType::NetworkDeviceRemoved {
+                    device: device.clone(),
+                    location: location.clone(),
+                })
+            }
+            DefguardEvent::GroupMemberAdded { group, user } => {
+                Some(ApiEventType::GroupMemberAdded {
+                    group: group.clone(),
+                    user: user.clone(),
+                })
+            }
+            DefguardEvent::GroupMemberRemoved { group, user } => {
+                Some(ApiEventType::GroupMemberRemoved {
+                    group: group.clone(),
+                    user: user.clone(),
+                })
+            }
+            DefguardEvent::GroupsBulkAssigned { users, groups } => {
+                Some(ApiEventType::GroupsBulkAssigned {
+                    users: users.clone(),
+                    groups: groups.clone(),
+                })
+            }
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -288,16 +255,65 @@ enum EnrollmentEvent {
     TokenAdded { user: User<Id> },
 }
 
-fn get_defguard_event_description(_event: &DefguardEvent) -> Option<String> {
-    None
+fn get_defguard_event_description(event: &DefguardEvent) -> Option<String> {
+    event
+        .to_api_event_type()
+        .as_ref()
+        .and_then(get_api_event_description)
 }
 
-fn get_vpn_event_description(_event: &VpnEvent) -> Option<String> {
-    None
+fn get_vpn_event_description(event: &VpnEvent) -> Option<String> {
+    match event {
+        VpnEvent::ConnectedToLocation { location, device } => {
+            Some(format!("Device {device} connected to location {location}"))
+        }
+        VpnEvent::DisconnectedFromLocation { location, device } => Some(format!(
+            "Device {device} disconnected from location {location}"
+        )),
+        VpnEvent::MfaConnectedToLocation { location, device } => Some(format!(
+            "Device {device} connected to MFA location {location}"
+        )),
+        VpnEvent::MfaDisconnectedFromLocation { location, device } => Some(format!(
+            "Device {device} disconnected from MFA location {location}"
+        )),
+        VpnEvent::ClientMfaSuccess {
+            location,
+            device,
+            method,
+        } => Some(format!(
+            "Device {device} completed MFA authorization for location {location} using {method}"
+        )),
+        VpnEvent::ClientMfaFailed {
+            location,
+            device,
+            method,
+            message,
+        } => Some(format!(
+            "Device {device} failed to connect to MFA location {location} using {method} with: {message}"
+        )),
+    }
 }
 
-fn get_enrollment_event_description(_event: &EnrollmentEvent) -> Option<String> {
-    None
+fn get_enrollment_event_description(event: &EnrollmentEvent) -> Option<String> {
+    match event {
+        EnrollmentEvent::TokenAdded { user } => {
+            Some(format!("Added enrollment token for user {user}"))
+        }
+        EnrollmentEvent::PasswordResetRequested
+        | EnrollmentEvent::PasswordResetStarted
+        | EnrollmentEvent::PasswordResetCompleted => None,
+        EnrollmentEvent::EnrollmentStarted => {
+            get_core_enrollment_event_description(&CoreEnrollmentEvent::EnrollmentStarted)
+        }
+        EnrollmentEvent::EnrollmentDeviceAdded { device } => {
+            get_core_enrollment_event_description(&CoreEnrollmentEvent::EnrollmentDeviceAdded {
+                device: device.clone(),
+            })
+        }
+        EnrollmentEvent::EnrollmentCompleted => {
+            get_core_enrollment_event_description(&CoreEnrollmentEvent::EnrollmentCompleted)
+        }
+    }
 }
 use sqlx::PgPool;
 use tracing::info;

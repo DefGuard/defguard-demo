@@ -24,7 +24,10 @@ use crate::{
     enterprise::{
         db::models::enterprise_settings::EnterpriseSettings,
         handlers::LicenseInfo,
-        ldap::{LDAPConnection, sync::Authority},
+        ldap::{
+            LDAPConnection,
+            sync::{Authority, LdapDryRunAction, LdapDryRunResult, LdapDryRunUser},
+        },
         license::update_cached_license,
     },
     error::WebError,
@@ -258,14 +261,71 @@ pub(crate) async fn test_ldap_settings(_admin: AdminRole, _license: LicenseInfo)
     }
 }
 
+fn demo_ldap_dry_run_result() -> LdapDryRunResult {
+    LdapDryRunResult {
+        defguard: vec![
+            LdapDryRunUser {
+                username: "j.smith".to_string(),
+                email: "j.smith@example.com".to_string(),
+                first_name: "John".to_string(),
+                last_name: "Smith".to_string(),
+                action: LdapDryRunAction::Add,
+            },
+            LdapDryRunUser {
+                username: "a.johnson".to_string(),
+                email: "a.johnson@example.com".to_string(),
+                first_name: "Anna".to_string(),
+                last_name: "Johnson".to_string(),
+                action: LdapDryRunAction::Add,
+            },
+            LdapDryRunUser {
+                username: "p.brown".to_string(),
+                email: "p.brown@example.com".to_string(),
+                first_name: "Peter".to_string(),
+                last_name: "Brown".to_string(),
+                action: LdapDryRunAction::Remove,
+            },
+        ],
+        ldap: vec![
+            LdapDryRunUser {
+                username: "m.davis".to_string(),
+                email: "m.davis@example.com".to_string(),
+                first_name: "Maria".to_string(),
+                last_name: "Davis".to_string(),
+                action: LdapDryRunAction::Add,
+            },
+            LdapDryRunUser {
+                username: "t.wilson".to_string(),
+                email: "t.wilson@example.com".to_string(),
+                first_name: "Thomas".to_string(),
+                last_name: "Wilson".to_string(),
+                action: LdapDryRunAction::Remove,
+            },
+            LdapDryRunUser {
+                username: "k.miller".to_string(),
+                email: "k.miller@example.com".to_string(),
+                first_name: "Kate".to_string(),
+                last_name: "Miller".to_string(),
+                action: LdapDryRunAction::Remove,
+            },
+        ],
+    }
+}
+
 /// Tests the LDAP connection using the provided (not yet saved) settings.
 pub(crate) async fn test_submitted_ldap_settings(
     _admin: AdminRole,
     _license: LicenseInfo,
-    Json(settings): Json<Settings>,
+    Json(_settings): Json<Settings>,
 ) -> ApiResult {
     debug!("Testing LDAP connection with provided settings");
-    match LDAPConnection::create_with_settings(settings).await {
+    if server_config().is_demo_mode {
+        return Ok(ApiResponse::json(
+            demo_ldap_dry_run_result(),
+            StatusCode::OK,
+        ));
+    }
+    match LDAPConnection::create_with_settings(_settings).await {
         Ok(_) => {
             debug!("LDAP connected successfully");
             Ok(ApiResponse::with_status(StatusCode::OK))
@@ -286,6 +346,14 @@ pub(crate) async fn ldap_dry_run(
     Json(settings): Json<Settings>,
 ) -> ApiResult {
     debug!("Performing LDAP dry run with provided settings");
+
+    if server_config().is_demo_mode {
+        return Ok(ApiResponse::json(
+            demo_ldap_dry_run_result(),
+            StatusCode::OK,
+        ));
+    }
+
     let authority = if settings.ldap_is_authoritative {
         Authority::LDAP
     } else {

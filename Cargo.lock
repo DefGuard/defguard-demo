@@ -1471,6 +1471,7 @@ dependencies = [
  "sqlx",
  "struct-patch",
  "thiserror 2.0.19",
+ "tokio",
  "tonic",
  "totp-lite",
  "tracing",

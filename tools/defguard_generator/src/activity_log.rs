@@ -19,13 +19,286 @@ use defguard_core::{
     },
     events::ClientMFAMethod,
 };
-use defguard_event_logger::{
-    description::{
-        get_defguard_event_description, get_enrollment_event_description, get_vpn_event_description,
-    },
-    message::{DefguardEvent, EnrollmentEvent, VpnEvent},
-};
 use rand::{Rng, rngs::ThreadRng, seq::SliceRandom};
+
+#[allow(dead_code)]
+enum DefguardEvent {
+    UserLogin,
+    UserLoginFailed {
+        message: String,
+    },
+    UserLogout,
+    UserMfaLogin {
+        mfa_method: MFAMethod,
+    },
+    UserMfaLoginFailed {
+        mfa_method: MFAMethod,
+        message: String,
+    },
+    RecoveryCodeLoginFailed,
+    RecoveryCodeUsed,
+    PasswordChangedByAdmin {
+        user: User<Id>,
+    },
+    PasswordChanged,
+    PasswordReset {
+        user: User<Id>,
+    },
+    MfaDisabled,
+    UserMfaDisabled {
+        user: User<Id>,
+    },
+    MfaTotpDisabled,
+    MfaTotpEnabled,
+    MfaEmailDisabled,
+    MfaEmailEnabled,
+    MfaSecurityKeyAdded {
+        key: WebAuthn<Id>,
+    },
+    MfaSecurityKeyRemoved {
+        key: WebAuthn<Id>,
+    },
+    UserAdded {
+        user: User<Id>,
+    },
+    UserRemoved {
+        user: User<Id>,
+    },
+    UserModified {
+        before: User<Id>,
+        after: User<Id>,
+    },
+    UserGroupsModified {
+        user: User<Id>,
+        before: Vec<String>,
+        after: Vec<String>,
+    },
+    UserDeviceAdded {
+        owner: User<Id>,
+        device: Device<Id>,
+    },
+    UserDeviceRemoved {
+        owner: User<Id>,
+        device: Device<Id>,
+    },
+    UserDeviceModified {
+        owner: User<Id>,
+        before: Device<Id>,
+        after: Device<Id>,
+    },
+    NetworkDeviceAdded {
+        device: Device<Id>,
+        location: WireguardNetwork<Id>,
+    },
+    NetworkDeviceRemoved {
+        device: Device<Id>,
+        location: WireguardNetwork<Id>,
+    },
+    NetworkDeviceModified {
+        before: Device<Id>,
+        after: Device<Id>,
+        location: WireguardNetwork<Id>,
+    },
+    VpnLocationAdded {
+        location: WireguardNetwork<Id>,
+    },
+    VpnLocationRemoved {
+        location: WireguardNetwork<Id>,
+    },
+    VpnLocationModified {
+        before: WireguardNetwork<Id>,
+        after: WireguardNetwork<Id>,
+    },
+    OpenIdProviderModified {
+        provider: String,
+    },
+    OpenIdProviderRemoved {
+        provider: String,
+    },
+    SettingsUpdated {
+        before: Settings,
+        after: Settings,
+    },
+    SettingsUpdatedPartial {
+        before: Settings,
+        after: Settings,
+    },
+    SettingsDefaultBrandingRestored,
+    GroupsBulkAssigned {
+        users: Vec<User<Id>>,
+        groups: Vec<Group<Id>>,
+    },
+    GroupAdded {
+        group: Group<Id>,
+    },
+    GroupModified {
+        before: Group<Id>,
+        after: Group<Id>,
+    },
+    GroupRemoved {
+        group: Group<Id>,
+    },
+    GroupMemberAdded {
+        group: Group<Id>,
+        user: User<Id>,
+    },
+    GroupMemberRemoved {
+        group: Group<Id>,
+        user: User<Id>,
+    },
+    GroupMembersModified {
+        group: Group<Id>,
+        added: Vec<User<Id>>,
+        removed: Vec<User<Id>>,
+    },
+    WebHookAdded {
+        webhook: String,
+    },
+    WebHookModified {
+        before: String,
+        after: String,
+    },
+    WebHookRemoved {
+        webhook: String,
+    },
+    WebHookStateChanged {
+        webhook: String,
+        enabled: bool,
+    },
+    AuthenticationKeyAdded {
+        key: String,
+    },
+    AuthenticationKeyRemoved {
+        key: String,
+    },
+    AuthenticationKeyRenamed {
+        key: String,
+        old_name: String,
+        new_name: String,
+    },
+    ClientConfigurationTokenAdded {
+        user: User<Id>,
+    },
+    UserSnatBindingAdded {
+        user: User<Id>,
+        binding: String,
+    },
+    UserSnatBindingRemoved {
+        user: User<Id>,
+        binding: String,
+    },
+    UserSnatBindingModified {
+        user: User<Id>,
+        before: String,
+        after: String,
+    },
+    ProxyModified {
+        before: String,
+        after: String,
+    },
+    ProxyDeleted {
+        proxy: String,
+    },
+    GatewayModified {
+        before: String,
+        after: String,
+    },
+    GatewayDeleted {
+        gateway: String,
+    },
+    ActivityLogStreamCreated {
+        stream: String,
+    },
+    ActivityLogStreamModified {
+        before: String,
+        after: String,
+    },
+    ActivityLogStreamRemoved {
+        stream: String,
+    },
+    ApiTokenAdded {
+        owner: User<Id>,
+        token: String,
+    },
+    ApiTokenRemoved {
+        owner: User<Id>,
+        token: String,
+    },
+    ApiTokenRenamed {
+        owner: User<Id>,
+        token: String,
+        old_name: String,
+        new_name: String,
+    },
+    OpenIdAppAdded {
+        app: String,
+    },
+    OpenIdAppRemoved {
+        app: String,
+    },
+    OpenIdAppModified {
+        before: String,
+        after: String,
+    },
+    OpenIdAppStateChanged {
+        app: String,
+        enabled: bool,
+    },
+}
+
+#[allow(dead_code)]
+enum VpnEvent {
+    ClientMfaSuccess {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+        method: ClientMFAMethod,
+    },
+    ClientMfaFailed {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+        method: ClientMFAMethod,
+        message: String,
+    },
+    ConnectedToLocation {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+    },
+    DisconnectedFromLocation {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+    },
+    MfaConnectedToLocation {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+    },
+    MfaDisconnectedFromLocation {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+    },
+}
+
+#[allow(dead_code)]
+enum EnrollmentEvent {
+    EnrollmentStarted,
+    EnrollmentDeviceAdded { device: Device<Id> },
+    EnrollmentCompleted,
+    PasswordResetRequested,
+    PasswordResetStarted,
+    PasswordResetCompleted,
+    TokenAdded { user: User<Id> },
+}
+
+fn get_defguard_event_description(_event: &DefguardEvent) -> Option<String> {
+    None
+}
+
+fn get_vpn_event_description(_event: &VpnEvent) -> Option<String> {
+    None
+}
+
+fn get_enrollment_event_description(_event: &EnrollmentEvent) -> Option<String> {
+    None
+}
 use sqlx::PgPool;
 use tracing::info;
 
@@ -209,7 +482,7 @@ pub async fn generate_activity_log(
         let event = ActivityLogEvent {
             id: NoId,
             timestamp,
-            user_id: user.id,
+            user_id: Some(user.id),
             username: user.username.clone(),
             location: generated.location,
             ip: None,
@@ -768,6 +1041,7 @@ fn build_vpn_event(
                     location,
                     device,
                     method,
+                    mobile_auth_device_name: None,
                 })
                 .ok(),
             )

@@ -289,7 +289,7 @@ impl DirectorySyncClient {
                 let client = microsoft::MicrosoftDirectorySync::new(
                     provider_settings.client_id,
                     provider_settings.client_secret,
-                    &provider_settings.base_url,
+                    provider_settings.base_url,
                     provider_settings.directory_sync_group_match,
                 );
                 debug!("Microsoft directory sync client created");

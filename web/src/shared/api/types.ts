@@ -305,9 +305,11 @@ export interface User {
   enrolled: boolean;
   is_admin: boolean;
   ldap_pass_requires_change: boolean;
+  password_management_disabled: boolean;
   phone: string | null;
   authorized_apps?: OAuth2AuthorizedApps[];
   devices: Device[];
+  has_non_mfa_location_access: boolean;
 }
 
 export interface LoginRequest {
@@ -402,6 +404,16 @@ export interface MfaFinishResponse {
 export const WebErrorCode = {
   NetworkFull: 'network_full',
   UserGroupsNotSynced: 'user_groups_not_synced',
+  LicenseLimitReached: 'license_limit_reached',
+  CertMissingCertPem: 'cert_missing_cert_pem',
+  CertMissingKeyPem: 'cert_missing_key_pem',
+  CertInvalidCertOrKey: 'cert_invalid_cert_or_key',
+  CertInvalidValidityPeriod: 'cert_invalid_validity_period',
+  CertExpired: 'cert_expired',
+  CertNotYetValid: 'cert_not_yet_valid',
+  CertParseError: 'cert_parse_error',
+  SmtpNotConfigured: 'smtp_not_configured',
+  MailSendFailed: 'mail_send_failed',
 } as const;
 
 export type WebErrorCode = (typeof WebErrorCode)[keyof typeof WebErrorCode];
@@ -471,6 +483,17 @@ export const SupportType = {
   DirectEnterprise: 'DirectEnterprise',
 } as const;
 
+// Additive, per-license feature grants mirrored from the backend `LicenseFeature` enum.
+// Each value enables a single enterprise capability regardless of the license tier.
+export const LicenseFeature = {
+  ServiceLocations: 'ServiceLocations',
+  DevicePosture: 'DevicePosture',
+  AclAllowedIps: 'AclAllowedIps',
+  ComponentHa: 'ComponentHa',
+} as const;
+
+export type LicenseFeatureValue = (typeof LicenseFeature)[keyof typeof LicenseFeature];
+
 export type LicenseTierValue = (typeof LicenseTier)[keyof typeof LicenseTier];
 export type SupportTypeValue = (typeof SupportType)[keyof typeof SupportType];
 
@@ -488,6 +511,9 @@ export interface LicenseInfoApi {
   tier: LicenseTierValue;
   support_type: SupportTypeValue;
   limits: LicenseLimitsInfo | null;
+  // Effective set of enabled enterprise features (tier-granted plus additive flags).
+  features: LicenseFeatureValue[];
+  customer_id: string;
 }
 
 export interface LicenseInfoResponse {
@@ -500,7 +526,7 @@ export interface LdapInfo {
 }
 
 export interface ApplicationInfo {
-  version: string;
+  version: string | null;
   network_present: boolean;
   smtp_enabled: boolean;
   external_openid_enabled: boolean;
@@ -779,9 +805,11 @@ export interface NetworkLocation {
   peer_disconnect_threshold: number;
   acl_enabled: boolean;
   acl_default_allow: boolean;
+  allowed_ips_from_acl: boolean;
   location_mfa_mode: LocationMfaModeValue;
   service_location_mode: LocationServiceModeValue;
   has_devices: boolean;
+  posture_checks: number[];
 }
 
 export interface EditNetworkLocation
@@ -794,6 +822,7 @@ export interface EditNetworkLocation
     | 'allowed_ips'
     | 'address'
     | 'has_devices'
+    | 'posture_checks'
   > {
   allowed_ips: string;
   address: string;
@@ -921,6 +950,79 @@ export interface SettingsEnterprise {
   admin_device_management: boolean;
   client_traffic_policy: ClientTrafficPolicyValue;
   only_client_activation: boolean;
+  display_download_step: boolean;
+  display_password_reset: boolean;
+}
+
+export type ApiDevicePostureOsRule =
+  | {
+      os_type: 'windows';
+      min_os_version: number | null;
+      disk_encryption_required: boolean | null;
+      antivirus_required: boolean | null;
+      ad_domain_joined_required: boolean | null;
+      windows_security_update_max_age: number | null;
+    }
+  | {
+      os_type: 'macos';
+      min_os_version: number | null;
+      disk_encryption_required: boolean | null;
+      device_integrity_required: boolean | null;
+    }
+  | {
+      os_type: 'linux';
+      min_kernel_version: number | null;
+      disk_encryption_required: boolean | null;
+    }
+  | {
+      os_type: 'ios';
+      min_os_version: number | null;
+    }
+  | {
+      os_type: 'android';
+      min_os_version: number | null;
+      device_integrity_required: boolean | null;
+      android_security_patch_level_max_age: number | null;
+    };
+
+export type EditDevicePostureOsRule = ApiDevicePostureOsRule;
+
+export interface ApiDevicePosture {
+  id: number;
+  name: string;
+  description: string | null;
+  min_desktop_client_version: string | null;
+  min_mobile_client_version: string | null;
+  allow_prerelease_client: boolean;
+  os_rules: ApiDevicePostureOsRule[];
+  locations: number[];
+}
+
+export interface AssignPosturesData {
+  postures: number[];
+}
+
+export interface EditDevicePostureRequest {
+  name: string;
+  description: string | null;
+  min_desktop_client_version: string | null;
+  min_mobile_client_version: string | null;
+  allow_prerelease_client: boolean;
+  os_rules: EditDevicePostureOsRule[];
+}
+
+export interface DevicePostureOsVersionCatalog {
+  windows: number[];
+  macos: number[];
+  ios: number[];
+  android: number[];
+}
+
+export interface DevicePostureVersionMetadata {
+  os_versions: DevicePostureOsVersionCatalog;
+  linux_kernel_versions: number[];
+  desktop_client_versions: string[];
+  mobile_client_versions: string[];
 }
 
 export type InitialSetupStepValue =
@@ -1039,6 +1141,7 @@ export interface SettingsSMTP {
   smtp_oauth_client_secret: string | null;
   smtp_oauth_refresh_token: string | null;
   smtp_oauth_tenant_id: string | null;
+  smtp_tls_verify_cert: boolean;
 }
 
 export interface SettingsEnrollment {
@@ -1088,6 +1191,22 @@ export interface SettingsLDAP {
   ldap_sync_groups: string[];
   ldap_remote_enrollment_enabled: boolean;
   ldap_remote_enrollment_send_invite: boolean;
+  ldap_disable_password_management: boolean;
+}
+
+export type LdapDryRunAction = 'add' | 'remove';
+
+export interface LdapDryRunUser {
+  username: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  action: LdapDryRunAction;
+}
+
+export interface LdapDryRunResult {
+  defguard: LdapDryRunUser[];
+  ldap: LdapDryRunUser[];
 }
 
 export interface SettingsOpenID {
@@ -1199,6 +1318,7 @@ export interface OpenIdProvider {
   directory_sync_group_match?: string[] | null;
   jumpcloud_api_key?: string | null;
   prefetch_users: boolean;
+  disable_password_management: boolean;
   directory_sync_user_groups?: string[] | null;
 }
 
@@ -1361,7 +1481,7 @@ export interface OpenIdAuthInfo {
 export interface ActivityLogEvent {
   id: number;
   timestamp: string;
-  user_id: number;
+  user_id: number | null;
   username: string;
   location?: string;
   ip: string | null;
@@ -1448,6 +1568,17 @@ export interface PaginationParams {
   per_page?: number;
 }
 
+export interface DevicePostureListFilters extends PaginationParams {
+  windows?: string[];
+  macos?: string[];
+  linux?: string[];
+  ios?: string[];
+  android?: string[];
+  defguard_desktop?: string[];
+  defguard_mobile?: string[];
+  defguard?: string[];
+}
+
 export interface PaginationMeta {
   current_page: number;
   page_size: number;
@@ -1483,9 +1614,10 @@ export interface ActivityLogFilters {
   search: string;
 }
 
-export type ActivityLogRequestParams = Partial<ActivityLogFilters> &
-  RequestSortParams<ActivityLogSortKey> &
-  PaginationParams;
+export type ActivityLogRequestParams = Partial<ActivityLogFilters> & {
+  sort_by?: ActivityLogSortKey;
+  sort_order?: SortDirectionValue;
+} & PaginationParams;
 
 export interface UserListParams extends PaginationParams {
   groups?: string[];

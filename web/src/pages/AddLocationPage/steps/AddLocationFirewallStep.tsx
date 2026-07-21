@@ -26,8 +26,9 @@ import { useAddLocationStore } from '../useAddLocationStore';
 type Choice = 'disable' | 'enabled-allowed' | 'enabled-denied';
 
 export const AddLocationFirewallStep = () => {
-  const [showGateway, setShowGateway] = useState(true);
+  const locationType = useAddLocationStore((s) => s.locationType);
   const [state, setState] = useState<Choice>('disable');
+  const [showGateway, setShowGateway] = useState(true);
   const navigate = useNavigate();
 
   const { data: licenseInfo } = useQuery(getLicenseInfoQueryOptions);
@@ -70,8 +71,7 @@ export const AddLocationFirewallStep = () => {
   }, []);
 
   const handleSubmit = () => {
-    const enabled = state !== 'disable';
-    const allowed = state === 'enabled-allowed';
+    saveChanges(state);
     const storageState = cloneDeep(
       omit(useAddLocationStore.getState(), [
         'start',
@@ -80,8 +80,6 @@ export const AddLocationFirewallStep = () => {
         'locationType',
       ]),
     );
-    storageState.acl_enabled = enabled;
-    storageState.acl_default_allow = allowed;
     mutate(storageState);
   };
 
@@ -149,11 +147,13 @@ export const AddLocationFirewallStep = () => {
         <Button
           variant="outlined"
           text={m.controls_back()}
-          disabled={isPending}
           onClick={() => {
             saveChanges(state);
             useAddLocationStore.setState({
-              activeStep: AddLocationPageStep.AccessControl,
+              activeStep:
+                locationType === 'service'
+                  ? AddLocationPageStep.AccessControl
+                  : AddLocationPageStep.PostureCheck,
             });
           }}
         />

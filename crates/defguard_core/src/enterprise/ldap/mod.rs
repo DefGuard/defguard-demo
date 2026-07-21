@@ -18,7 +18,7 @@ use model::UserObjectClass;
 use rand::Rng;
 use sqlx::PgPool;
 use sync::{get_ldap_sync_status, is_ldap_desynced, set_ldap_sync_status};
-use tokio::sync::broadcast::Sender;
+use tokio::sync::{broadcast::Sender, mpsc::UnboundedSender};
 
 use self::error::LdapError;
 use crate::{
@@ -30,7 +30,8 @@ use crate::{
         },
         limits::update_counts,
     },
-    grpc::GatewayEvent,
+    events::LdapSyncEventType,
+    grpc::GatewayCommand,
 };
 
 #[cfg(not(test))]
@@ -47,7 +48,11 @@ pub mod utils;
 ///
 /// This function may trigger either full and incremental sync based on the current sync status.
 /// Sets LDAP sync status to OutOfSync if any errors occur during the process.
-pub async fn do_ldap_sync(pool: &PgPool, wg_tx: &Sender<GatewayEvent>) -> Result<(), LdapError> {
+pub async fn do_ldap_sync(
+    pool: &PgPool,
+    wg_tx: &Sender<GatewayCommand>,
+    ldap_tx: &UnboundedSender<LdapSyncEventType>,
+) -> Result<(), LdapError> {
     debug!("Starting LDAP sync, if enabled");
     let mut settings = Settings::get_current_settings();
 
@@ -78,7 +83,7 @@ pub async fn do_ldap_sync(pool: &PgPool, wg_tx: &Sender<GatewayEvent>) -> Result
         );
         settings.ldap_sync_enabled = false;
         update_current_settings(pool, settings).await?;
-        return Err(LdapError::EnterpriseDisabled("LDAP sync".to_string()));
+        return Err(LdapError::EnterpriseDisabled("LDAP sync".to_owned()));
     }
 
     if is_ldap_desynced() {
@@ -98,7 +103,10 @@ pub async fn do_ldap_sync(pool: &PgPool, wg_tx: &Sender<GatewayEvent>) -> Result
         }
     };
 
-    if let Err(err) = ldap_connection.sync(pool, is_ldap_desynced(), wg_tx).await {
+    if let Err(err) = ldap_connection
+        .sync(pool, is_ldap_desynced(), wg_tx, ldap_tx)
+        .await
+    {
         set_ldap_sync_status(LdapSyncStatus::OutOfSync, pool).await?;
         return Err(err);
     }
@@ -121,7 +129,7 @@ where
     if !is_business_license_active() {
         info!("Enterprise features are disabled, not performing LDAP operation");
         set_ldap_sync_status(LdapSyncStatus::OutOfSync, pool).await?;
-        return Err(LdapError::EnterpriseDisabled("LDAP".to_string()));
+        return Err(LdapError::EnterpriseDisabled("LDAP".to_owned()));
     }
 
     if !settings.ldap_enabled {
@@ -186,15 +194,15 @@ impl Default for LDAPConfig {
     /// Provides default LDAP configuration values for testing purposes.
     fn default() -> Self {
         Self {
-            ldap_bind_username: "admin".to_string(),
-            ldap_group_search_base: "ou=groups,dc=example,dc=com".to_string(),
-            ldap_user_search_base: "ou=users,dc=example,dc=com".to_string(),
-            ldap_user_obj_class: "inetOrgPerson".to_string(),
-            ldap_group_obj_class: "groupOfUniqueNames".to_string(),
-            ldap_username_attr: "cn".to_string(),
-            ldap_groupname_attr: "cn".to_string(),
-            ldap_group_member_attr: "uniqueMember".to_string(),
-            ldap_member_attr: "memberOf".to_string(),
+            ldap_bind_username: "admin".to_owned(),
+            ldap_group_search_base: "ou=groups,dc=example,dc=com".to_owned(),
+            ldap_user_search_base: "ou=users,dc=example,dc=com".to_owned(),
+            ldap_user_obj_class: "inetOrgPerson".to_owned(),
+            ldap_group_obj_class: "groupOfUniqueNames".to_owned(),
+            ldap_username_attr: "cn".to_owned(),
+            ldap_groupname_attr: "cn".to_owned(),
+            ldap_group_member_attr: "uniqueMember".to_owned(),
+            ldap_member_attr: "memberOf".to_owned(),
             ldap_user_auxiliary_obj_classes: Vec::new(),
             ldap_uses_ad: false,
             ldap_sync_account_status: false,
@@ -292,7 +300,7 @@ impl TryFrom<Settings> for LDAPConfig {
     /// This is to scope the full Settings struct to only the LDAP-related settings.
     ///
     /// TODO: Since settings are now a global singleton, it may be better to do this differently.
-    fn try_from(settings: Settings) -> Result<LDAPConfig, LdapError> {
+    fn try_from(settings: Settings) -> Result<Self, LdapError> {
         /// Helper function to validate non-empty string settings.
         /// Returns an error if the setting is None or is an empty string.
         /// This is to prevent constructing an invalid LDAPConfig.
@@ -378,7 +386,8 @@ impl LDAPConnection {
         &mut self,
         users: Vec<&mut User<Id>>,
         pool: &PgPool,
-        wg_tx: &Sender<GatewayEvent>,
+        wg_tx: &Sender<GatewayCommand>,
+        ldap_tx: &UnboundedSender<LdapSyncEventType>,
     ) -> Result<(), LdapError> {
         debug!("Updating users state in LDAP");
 
@@ -450,7 +459,7 @@ impl LDAPConnection {
                 debug!(
                     "User {user} is in LDAP and is allowed to be synced, synchronizing his data"
                 );
-                self.sync_user_data(user, pool, wg_tx).await?;
+                self.sync_user_data(user, pool, wg_tx, ldap_tx).await?;
                 debug!("User {user} data synchronized");
             }
         }
@@ -647,7 +656,7 @@ impl LDAPConnection {
         let password_is_random = password.is_none();
         let password = if let Some(password) = password {
             debug!("Using provided password for user {user}");
-            password.to_string()
+            password.to_owned()
         } else {
             // LDAP may not accept no password, this is a workaround when we don't have access to
             // the user's password
@@ -665,7 +674,7 @@ impl LDAPConnection {
         let nt_password = hash::nthash(&password);
         let user_obj_classes = self.config.get_all_user_obj_classes();
         let username_attr = self.config.ldap_username_attr.clone();
-        let rdn_attr = self.config.get_rdn_attr().to_string();
+        let rdn_attr = self.config.get_rdn_attr().to_owned();
         if !self.is_username_available(&user.username).await?
             || self.user_exists_by_dn(&user_dn).await?
         {
@@ -804,7 +813,7 @@ impl LDAPConnection {
             &user_dn,
             &user_dn,
             vec![Mod::Replace(
-                "userAccountControl".to_string(),
+                "userAccountControl".to_owned(),
                 hashset![new_uac.to_string()],
             )],
         )

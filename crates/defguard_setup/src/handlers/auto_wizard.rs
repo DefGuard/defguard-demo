@@ -1,13 +1,16 @@
 use axum::{Extension, Json};
 use defguard_certs::{PemLabel, der_to_pem};
 use defguard_common::{
-    db::models::{
-        Certificates, WireguardNetwork,
-        initial_setup_wizard::InitialSetupStep,
-        settings::update_current_settings,
-        setup_auto_adoption::{AutoAdoptionWizardState, AutoAdoptionWizardStep},
-        wireguard::LocationMfaMode,
-        wizard::{ActiveWizard, Wizard},
+    db::{
+        Id,
+        models::{
+            Certificates, WireguardNetwork,
+            initial_setup_wizard::InitialSetupStep,
+            settings::update_current_settings,
+            setup_auto_adoption::{AutoAdoptionWizardState, AutoAdoptionWizardStep},
+            wireguard::LocationMfaMode,
+            wizard::{ActiveWizard, Wizard},
+        },
     },
     utils::{parse_address_list, parse_network_address_list},
 };
@@ -81,6 +84,7 @@ pub(crate) async fn apply_internal_url_settings(
         },
     )
     .await
+    .map_err(WebError::from)
 }
 
 /// Updates internal URL settings and configures SSL for the core web server.
@@ -194,6 +198,7 @@ pub(crate) async fn apply_external_url_settings(
         },
     )
     .await
+    .map_err(WebError::from)
 }
 
 /// Returns external SSL certificate info (for the "Download CA certificate" step).
@@ -240,11 +245,11 @@ pub async fn set_vpn_settings(
     info!("Applying Auto-adoption wizard VPN settings");
 
     let first_network_id =
-        query_scalar::<_, i64>("SELECT id FROM wireguard_network ORDER BY id ASC LIMIT 1")
+        query_scalar::<_, Id>("SELECT id FROM wireguard_network ORDER BY id ASC LIMIT 1")
             .fetch_optional(&pool)
             .await?
             .ok_or_else(|| {
-                WebError::ObjectNotFound("No network location found to configure".to_string())
+                WebError::ObjectNotFound("No network location found to configure".to_owned())
             })?;
 
     let mut network = WireguardNetwork::find_by_id(&pool, first_network_id)
@@ -258,7 +263,7 @@ pub async fn set_vpn_settings(
     let addresses = parse_address_list(vpn_settings.gateway_address.as_str());
     if addresses.is_empty() {
         return Err(WebError::BadRequest(
-            "Invalid gateway address value".to_string(),
+            "Invalid gateway address value".to_owned(),
         ));
     }
 
@@ -268,9 +273,7 @@ pub async fn set_vpn_settings(
     } else {
         let parsed = parse_network_address_list(allowed_ips_input);
         if parsed.is_empty() {
-            return Err(WebError::BadRequest(
-                "Invalid allowed IPs value".to_string(),
-            ));
+            return Err(WebError::BadRequest("Invalid allowed IPs value".to_owned()));
         }
         parsed
     };
@@ -284,7 +287,7 @@ pub async fn set_vpn_settings(
         if dns.is_empty() {
             None
         } else {
-            Some(dns.to_string())
+            Some(dns.to_owned())
         }
     };
     network.save(&pool).await?;
@@ -314,11 +317,11 @@ pub async fn set_mfa_settings(
     info!("Applying Auto-adoption wizard MFA settings");
 
     let first_network_id =
-        query_scalar::<_, i64>("SELECT id FROM wireguard_network ORDER BY id ASC LIMIT 1")
+        query_scalar::<_, Id>("SELECT id FROM wireguard_network ORDER BY id ASC LIMIT 1")
             .fetch_optional(&pool)
             .await?
             .ok_or_else(|| {
-                WebError::ObjectNotFound("No network location found to configure".to_string())
+                WebError::ObjectNotFound("No network location found to configure".to_owned())
             })?;
 
     let mut network = WireguardNetwork::find_by_id(&pool, first_network_id)

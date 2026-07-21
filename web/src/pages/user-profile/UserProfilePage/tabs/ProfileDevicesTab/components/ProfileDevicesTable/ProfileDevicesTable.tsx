@@ -114,10 +114,19 @@ const DevicesTable = ({ rowData }: { rowData: RowData[] }) => {
         useAddUserDeviceModal.getState().open({
           devices,
           user,
+          hideManualConfiguration:
+            !isAdmin && (enterpriseSettings?.only_client_activation ?? false),
         });
       },
     }),
-    [canModifyDevices, devices, user, info.network_present],
+    [
+      canModifyDevices,
+      devices,
+      user,
+      info.network_present,
+      enterpriseSettings?.only_client_activation,
+      isAdmin,
+    ],
   );
 
   const makeRowMenu = useCallback(
@@ -132,6 +141,8 @@ const DevicesTable = ({ rowData }: { rowData: RowData[] }) => {
               reservedNames: reservedNames,
               reservedPubkeys: reservedPubkeys,
               username,
+              hidePubkey:
+                !isAdmin && (enterpriseSettings?.only_client_activation ?? false),
             });
           },
         },
@@ -158,7 +169,10 @@ const DevicesTable = ({ rowData }: { rowData: RowData[] }) => {
           },
         });
       }
-      if (row.networks.some((n) => n.location_mfa_mode === LocationMfaMode.Disabled)) {
+      if (
+        row.networks.some((n) => n.location_mfa_mode === LocationMfaMode.Disabled) &&
+        (!enterpriseSettings?.only_client_activation || isAdmin)
+      ) {
         items.push({
           text: m.profile_devices_menu_show_config(),
           onClick: () => {
@@ -176,7 +190,12 @@ const DevicesTable = ({ rowData }: { rowData: RowData[] }) => {
             title: m.modal_delete_user_device_title(),
             contentMd: m.modal_delete_user_device_body({ name: row.name }),
             actionPromise: () => api.device.deleteDevice(row.id),
-            invalidateKeys: [['user', username], ['network']],
+            invalidateKeys: [
+              ['user'],
+              ['user', username],
+              ['network'],
+              ['device', 'all'],
+            ],
             submitProps: { text: m.controls_delete(), variant: 'critical' },
             onSuccess: () => Snackbar.default(m.user_device_delete_success()),
             onError: () => Snackbar.error(m.user_device_delete_failed()),
@@ -187,7 +206,13 @@ const DevicesTable = ({ rowData }: { rowData: RowData[] }) => {
       });
       return [{ items }];
     },
-    [reservedNames, username, isAdmin, reservedPubkeys],
+    [
+      reservedNames,
+      username,
+      isAdmin,
+      reservedPubkeys,
+      enterpriseSettings?.only_client_activation,
+    ],
   );
 
   const tableColumns = useMemo(
@@ -236,6 +261,9 @@ const DevicesTable = ({ rowData }: { rowData: RowData[] }) => {
         header: m.profile_devices_col_connected(),
         enableSorting: false,
         minSize: 200,
+        meta: {
+          flex: !canModifyDevices,
+        },
         cell: (info) => CellWithFallback(info.getValue()),
       }),
       ...(canModifyDevices

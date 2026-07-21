@@ -78,37 +78,56 @@ use defguard_common::db::{
         settings::{LdapSyncStatus, update_current_settings},
     },
 };
+use serde::Serialize;
 use sqlx::{PgConnection, PgPool};
-use tokio::sync::broadcast::Sender;
+use tokio::sync::{broadcast::Sender, mpsc::UnboundedSender};
 
 use super::{LDAPConfig, error::LdapError};
 use crate::{
     enrollment_management::try_send_ldap_enrollment_invite,
     enterprise::{
         ldap::model::{
-            get_users_without_ldap_path, ldap_sync_allowed_for_user, update_from_ldap_user,
-            user_from_searchentry,
+            get_users_without_ldap_path, ldap_sync_allowed_for_user,
+            ldap_sync_allowed_for_user_scoped, update_from_ldap_user, user_from_searchentry,
         },
         license::get_cached_license,
         limits::{get_counts, update_counts},
     },
-    grpc::GatewayEvent,
+    events::LdapSyncEventType,
+    grpc::GatewayCommand,
     hashset,
     user_management::{disable_user, sync_allowed_user_devices},
 };
 
+fn emit_ldap_sync_events(
+    ldap_tx: &UnboundedSender<LdapSyncEventType>,
+    events: Vec<LdapSyncEventType>,
+) {
+    for event in events {
+        if let Err(err) = ldap_tx.send(event) {
+            error!("Failed to send LDAP sync activity log event: {err}");
+        }
+    }
+}
+
+fn emit_ldap_sync_event(ldap_tx: &UnboundedSender<LdapSyncEventType>, event: LdapSyncEventType) {
+    if let Err(err) = ldap_tx.send(event) {
+        error!("Failed to send LDAP sync activity log event: {err}");
+    }
+}
+
 async fn get_or_create_group(
     transaction: &mut PgConnection,
     groupname: &str,
-) -> Result<Group<Id>, LdapError> {
+) -> Result<(Group<Id>, bool), LdapError> {
     let group = if let Some(group) = Group::find_by_name(&mut *transaction, groupname).await? {
         debug!("Group {groupname} already exists, skipping creation");
-        group
+        (group, false)
     } else {
         debug!("Group {groupname} didn't exist, creating it now");
         let new_group = Group::new(groupname).save(&mut *transaction).await?;
         debug!("Group {groupname} created");
-        new_group
+        (new_group, true)
     };
 
     Ok(group)
@@ -146,6 +165,74 @@ pub(super) struct UserSyncChanges {
     pub add_defguard: Vec<User>,
     pub delete_ldap: Vec<User>,
     pub add_ldap: Vec<User<Id>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LdapDryRunAction {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LdapDryRunUser {
+    pub username: String,
+    pub email: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub action: LdapDryRunAction,
+}
+
+/// Preview of the user changes a full sync would make, split by the system that would be
+/// modified. Built from [`UserSyncChanges`].
+#[derive(Debug, Serialize)]
+pub struct LdapDryRunResult {
+    pub defguard: Vec<LdapDryRunUser>,
+    pub ldap: Vec<LdapDryRunUser>,
+}
+
+fn dry_run_user<I>(user: &User<I>, action: LdapDryRunAction) -> LdapDryRunUser {
+    LdapDryRunUser {
+        username: user.username.clone(),
+        email: user.email.clone(),
+        first_name: user.first_name.clone(),
+        last_name: user.last_name.clone(),
+        action,
+    }
+}
+
+impl From<UserSyncChanges> for LdapDryRunResult {
+    fn from(changes: UserSyncChanges) -> Self {
+        let mut defguard = Vec::new();
+        defguard.extend(
+            changes
+                .add_defguard
+                .iter()
+                .map(|u| dry_run_user(u, LdapDryRunAction::Add)),
+        );
+        defguard.extend(
+            changes
+                .delete_defguard
+                .iter()
+                .map(|u| dry_run_user(u, LdapDryRunAction::Remove)),
+        );
+
+        let mut ldap = Vec::new();
+        ldap.extend(
+            changes
+                .add_ldap
+                .iter()
+                .map(|u| dry_run_user(u, LdapDryRunAction::Add)),
+        );
+        ldap.extend(
+            changes
+                .delete_ldap
+                .iter()
+                .map(|u| dry_run_user(u, LdapDryRunAction::Remove)),
+        );
+
+        Self { defguard, ldap }
+    }
 }
 
 /// Computes what users should be added/deleted and where
@@ -482,10 +569,12 @@ impl super::LDAPConnection {
         mut intersecting_users: Vec<(User, User<Id>)>,
         authority: Authority,
         pool: &PgPool,
-        wg_tx: &Sender<GatewayEvent>,
+        wg_tx: &Sender<GatewayCommand>,
+        ldap_tx: &UnboundedSender<LdapSyncEventType>,
     ) -> Result<(), LdapError> {
         let sync_account_status = self.config.ldap_uses_ad && self.config.ldap_sync_account_status;
         let mut transaction = pool.begin().await?;
+        let mut events = Vec::new();
 
         for (ldap_user, defguard_user) in &mut intersecting_users {
             if sync_account_status && ldap_user.is_active != defguard_user.is_active {
@@ -498,17 +587,33 @@ impl super::LDAPConnection {
                             sync_allowed_user_devices(defguard_user, &mut transaction, wg_tx)
                                 .await
                                 .map_err(|err| LdapError::UserStatusUpdate(err.to_string()))?;
+                            events.push(LdapSyncEventType::UserEnabled {
+                                user: defguard_user.clone(),
+                            });
                         } else {
                             debug!("Disabling Defguard user {defguard_user} based on AD status");
                             disable_user(defguard_user, &mut transaction, wg_tx)
                                 .await
                                 .map_err(|err| LdapError::UserStatusUpdate(err.to_string()))?;
+                            events.push(LdapSyncEventType::UserDisabled {
+                                user: defguard_user.clone(),
+                            });
                         }
                     }
                     Authority::Defguard => {
                         debug!("Applying Defguard account status to AD for {defguard_user}");
                         self.set_ad_account_status(defguard_user, defguard_user.is_active)
                             .await?;
+                        let event = if defguard_user.is_active {
+                            LdapSyncEventType::OutboundUserEnabled {
+                                user: defguard_user.clone(),
+                            }
+                        } else {
+                            LdapSyncEventType::OutboundUserDisabled {
+                                user: defguard_user.clone(),
+                            }
+                        };
+                        events.push(event);
                     }
                 }
             }
@@ -520,18 +625,27 @@ impl super::LDAPConnection {
                 match authority {
                     Authority::LDAP => {
                         debug!("Applying LDAP user attributes to Defguard user");
+                        let before = defguard_user.clone();
                         update_from_ldap_user(defguard_user, ldap_user, &self.config);
                         defguard_user.save(&mut *transaction).await?;
+                        events.push(LdapSyncEventType::UserModified {
+                            before,
+                            after: defguard_user.clone(),
+                        });
                     }
                     Authority::Defguard => {
                         debug!("Applying Defguard user attributes to LDAP user");
                         self.modify_user(&ldap_user.username, defguard_user).await?;
+                        events.push(LdapSyncEventType::OutboundUserModified {
+                            user: defguard_user.clone(),
+                        });
                     }
                 }
             }
         }
 
         transaction.commit().await?;
+        emit_ldap_sync_events(ldap_tx, events);
 
         Ok(())
     }
@@ -544,7 +658,8 @@ impl super::LDAPConnection {
         &mut self,
         user: &User<Id>,
         pool: &PgPool,
-        wg_tx: &Sender<GatewayEvent>,
+        wg_tx: &Sender<GatewayCommand>,
+        ldap_tx: &UnboundedSender<LdapSyncEventType>,
     ) -> Result<(), LdapError> {
         debug!("Syncing user data for {user}");
         let settings = Settings::get_current_settings();
@@ -578,7 +693,7 @@ impl super::LDAPConnection {
             .map(|g| (g.clone(), hashset![&ldap_user]))
             .collect::<HashMap<_, _>>();
 
-        self.apply_user_modifications(intersecting_users, authority, pool, wg_tx)
+        self.apply_user_modifications(intersecting_users, authority, pool, wg_tx, ldap_tx)
             .await?;
 
         let changes = compute_group_sync_changes(
@@ -587,7 +702,8 @@ impl super::LDAPConnection {
             authority,
             &self.config,
         );
-        self.apply_user_group_sync_changes(pool, changes).await?;
+        self.apply_user_group_sync_changes(pool, changes, ldap_tx)
+            .await?;
 
         Ok(())
     }
@@ -671,7 +787,8 @@ impl super::LDAPConnection {
         &mut self,
         pool: &PgPool,
         full: bool,
-        wg_tx: &Sender<GatewayEvent>,
+        wg_tx: &Sender<GatewayCommand>,
+        ldap_tx: &UnboundedSender<LdapSyncEventType>,
     ) -> Result<(), LdapError> {
         let settings = Settings::get_current_settings();
         let authority = if full {
@@ -710,17 +827,7 @@ impl super::LDAPConnection {
             sync_group_members.extend(members);
         }
 
-        let mut all_ldap_users = self.get_all_users().await?;
-        let mut all_defguard_users = User::all(pool).await?;
-
-        // Filter out users that should be ignored from sync
-        let mut filtered_users = Vec::new();
-        for user in all_defguard_users {
-            if ldap_sync_allowed_for_user(&user, pool).await? {
-                filtered_users.push(user);
-            }
-        }
-        all_defguard_users = filtered_users;
+        let (mut all_ldap_users, mut all_defguard_users) = self.get_sync_users(pool).await?;
 
         let ldap_usernames = all_ldap_users
             .iter()
@@ -754,7 +861,7 @@ impl super::LDAPConnection {
         let intersecting_users =
             extract_intersecting_users(&mut all_defguard_users, &mut all_ldap_users, &self.config);
 
-        self.apply_user_modifications(intersecting_users, authority, pool, wg_tx)
+        self.apply_user_modifications(intersecting_users, authority, pool, wg_tx, ldap_tx)
             .await?;
 
         let user_changes = compute_user_sync_changes(
@@ -771,8 +878,9 @@ impl super::LDAPConnection {
             &self.config,
         );
 
-        self.apply_user_sync_changes(pool, user_changes).await?;
-        self.apply_user_group_sync_changes(pool, membership_changes)
+        self.apply_user_sync_changes(pool, user_changes, ldap_tx)
+            .await?;
+        self.apply_user_group_sync_changes(pool, membership_changes, ldap_tx)
             .await?;
 
         if full {
@@ -784,20 +892,107 @@ impl super::LDAPConnection {
         Ok(())
     }
 
+    /// Fetches all LDAP users alongside the Defguard users that are allowed to participate in
+    /// sync, filtering out the ones that should be ignored.
+    async fn get_sync_users(
+        &mut self,
+        pool: &PgPool,
+    ) -> Result<(Vec<User>, Vec<User<Id>>), LdapError> {
+        let all_ldap_users = self.get_all_users().await?;
+        let all_defguard_users = User::all(pool).await?;
+
+        let sync_account_status = self.config.ldap_uses_ad && self.config.ldap_sync_account_status;
+        let mut filtered_users = Vec::new();
+        for user in all_defguard_users {
+            if ldap_sync_allowed_for_user_scoped(
+                &user,
+                pool,
+                sync_account_status,
+                &self.config.ldap_sync_groups,
+            )
+            .await?
+            {
+                filtered_users.push(user);
+            }
+        }
+
+        Ok((all_ldap_users, filtered_users))
+    }
+
+    /// Computes the user additions/removals a full sync would perform, without applying any
+    /// of them.
+    pub async fn dry_run(
+        &mut self,
+        pool: &PgPool,
+        authority: Authority,
+    ) -> Result<LdapDryRunResult, LdapError> {
+        debug!("Performing LDAP dry run with authority: {authority:?}");
+
+        let (mut all_ldap_users, mut all_defguard_users) = self.get_sync_users(pool).await?;
+
+        // Mirror `fix_missing_user_path()` in memory.
+        let ldap_paths_by_username: HashMap<&str, (&str, Option<&str>)> = all_ldap_users
+            .iter()
+            .map(|u| {
+                (
+                    u.username.as_str(),
+                    (u.ldap_rdn_value(), u.ldap_user_path.as_deref()),
+                )
+            })
+            .collect();
+        for defguard_user in &mut all_defguard_users {
+            if defguard_user.ldap_user_path.is_some() {
+                continue;
+            }
+            if let Some((ldap_rdn, ldap_path)) =
+                ldap_paths_by_username.get(defguard_user.username.as_str())
+                && defguard_user.ldap_rdn_value() == *ldap_rdn
+            {
+                defguard_user.ldap_user_path = ldap_path.map(str::to_owned);
+            }
+        }
+
+        let mut user_changes = compute_user_sync_changes(
+            &mut all_ldap_users,
+            &mut all_defguard_users,
+            authority,
+            &self.config,
+        );
+
+        let existing_usernames = User::all(pool)
+            .await?
+            .into_iter()
+            .map(|user| user.username)
+            .collect::<HashSet<_>>();
+        user_changes
+            .add_defguard
+            .retain(|user| !existing_usernames.contains(&user.username));
+
+        debug!("LDAP dry run completed");
+        Ok(LdapDryRunResult::from(user_changes))
+    }
+
     async fn apply_user_group_sync_changes(
         &mut self,
         pool: &PgPool,
         changes: GroupSyncChanges<'_>,
+        ldap_tx: &UnboundedSender<LdapSyncEventType>,
     ) -> Result<(), LdapError> {
         debug!("Applying group memberships sync changes");
         let mut transaction = pool.begin().await?;
         let mut admin_count = User::find_admins(&mut *transaction).await?.len();
+        let mut events = Vec::new();
         for (groupname, members) in changes.delete_defguard {
             if members.is_empty() {
                 debug!("No members to remove from group {groupname}, skipping");
                 continue;
             }
-            let group = get_or_create_group(&mut transaction, &groupname).await?;
+            let (group, group_created) = get_or_create_group(&mut transaction, &groupname).await?;
+            if group_created {
+                events.push(LdapSyncEventType::GroupCreated {
+                    group: group.clone(),
+                });
+            }
 
             for member in members {
                 if member.is_admin(&mut *transaction).await? {
@@ -814,10 +1009,18 @@ impl super::LDAPConnection {
                         );
                         admin_count -= 1;
                         member.remove_from_group(&mut *transaction, &group).await?;
+                        events.push(LdapSyncEventType::GroupMemberRemoved {
+                            group: group.clone(),
+                            user: member,
+                        });
                     }
                 } else {
                     debug!("Removing user {} from group {}", member.username, groupname);
                     member.remove_from_group(&mut *transaction, &group).await?;
+                    events.push(LdapSyncEventType::GroupMemberRemoved {
+                        group: group.clone(),
+                        user: member,
+                    });
                 }
             }
         }
@@ -827,12 +1030,21 @@ impl super::LDAPConnection {
                 debug!("No members to add to group {groupname}, skipping");
                 continue;
             }
-            let group = get_or_create_group(&mut transaction, &groupname).await?;
+            let (group, group_created) = get_or_create_group(&mut transaction, &groupname).await?;
+            if group_created {
+                events.push(LdapSyncEventType::GroupCreated {
+                    group: group.clone(),
+                });
+            }
             for member in members {
                 if let Some(user) =
                     User::find_by_username(&mut *transaction, &member.username).await?
                 {
                     user.add_to_group(&mut *transaction, &group).await?;
+                    events.push(LdapSyncEventType::GroupMemberAdded {
+                        group: group.clone(),
+                        user,
+                    });
                 } else {
                     warn!(
                         "LDAP user {} not found in Defguard, despite completing user sync earlier. \
@@ -845,16 +1057,31 @@ impl super::LDAPConnection {
         }
 
         transaction.commit().await?;
+        emit_ldap_sync_events(ldap_tx, events);
 
         for (groupname, members) in changes.delete_ldap {
             for member in members {
                 self.remove_user_from_group(member, &groupname).await?;
+                emit_ldap_sync_event(
+                    ldap_tx,
+                    LdapSyncEventType::OutboundGroupMemberRemoved {
+                        group: groupname.clone(),
+                        username: member.username.clone(),
+                    },
+                );
             }
         }
 
         for (groupname, members) in changes.add_ldap {
             for member in members {
                 self.add_user_to_group(&member, &groupname).await?;
+                emit_ldap_sync_event(
+                    ldap_tx,
+                    LdapSyncEventType::OutboundGroupMemberAdded {
+                        group: groupname.clone(),
+                        username: member.username,
+                    },
+                );
             }
         }
 
@@ -865,10 +1092,12 @@ impl super::LDAPConnection {
         &mut self,
         pool: &PgPool,
         mut changes: UserSyncChanges,
+        ldap_tx: &UnboundedSender<LdapSyncEventType>,
     ) -> Result<(), LdapError> {
         let mut transaction = pool.begin().await?;
         let mut admin_count = User::find_admins(&mut *transaction).await?.len();
         let mut user_count = get_counts().user();
+        let mut events = Vec::new();
 
         let user_limit = get_cached_license()
             .as_ref()
@@ -885,11 +1114,15 @@ impl super::LDAPConnection {
                 } else {
                     admin_count -= 1;
                     debug!("Deleting admin user {} from Defguard", user.username);
+                    let deleted_user = user.clone();
                     user.delete(&mut *transaction).await?;
+                    events.push(LdapSyncEventType::UserDeleted { user: deleted_user });
                 }
             } else {
                 debug!("Deleting user {} from Defguard", user.username);
+                let deleted_user = user.clone();
                 user.delete(&mut *transaction).await?;
+                events.push(LdapSyncEventType::UserDeleted { user: deleted_user });
             }
         }
 
@@ -932,12 +1165,16 @@ impl super::LDAPConnection {
                     continue;
                 }
                 let saved_user = user.save(&mut *transaction).await?;
+                events.push(LdapSyncEventType::UserCreated {
+                    user: saved_user.clone(),
+                });
                 new_users.push(saved_user);
                 user_count += 1;
             }
         }
 
         transaction.commit().await?;
+        emit_ldap_sync_events(ldap_tx, events);
 
         // attempt to send enrollment invites after the original DB transaction is commited
         // and users actually exist in DB
@@ -952,11 +1189,21 @@ impl super::LDAPConnection {
         for user in changes.delete_ldap {
             debug!("Deleting user {} from LDAP", user.username);
             self.delete_user(&user).await?;
+            emit_ldap_sync_event(
+                ldap_tx,
+                LdapSyncEventType::OutboundUserDeleted {
+                    username: user.username.clone(),
+                },
+            );
         }
 
         for user in &mut changes.add_ldap {
             debug!("Adding user {} to LDAP", user.username);
             self.add_user(user, None, pool).await?;
+            emit_ldap_sync_event(
+                ldap_tx,
+                LdapSyncEventType::OutboundUserCreated { user: user.clone() },
+            );
         }
 
         Ok(())

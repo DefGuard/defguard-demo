@@ -9,14 +9,15 @@ use std::{path::PathBuf, str::FromStr, sync::Mutex as StdMutex};
 use axum_extra::extract::cookie::Key;
 use defguard_common::{
     db::{Id, models::proxy::Proxy},
+    gateway_event::GatewayCommand,
     types::proxy::ProxyControlMessage,
 };
 use defguard_core::{
-    events::BidiStreamEvent,
-    grpc::{GatewayEvent, proxy::client_mfa::ClientLoginSession},
+    events::{ApiEvent, BidiStreamEvent, DirectorySyncEvent, LdapSyncEventType},
+    grpc::proxy::client_mfa::ClientLoginSession,
     version::IncompatibleComponents,
 };
-use defguard_proto::proxy::{CoreResponse, HttpsCerts, core_response};
+use defguard_proto::proxy::{CoreResponse, HttpsCerts, PublicSettings, core_response};
 use sqlx::PgPool;
 #[cfg(test)]
 use tokio::sync::Notify;
@@ -385,6 +386,27 @@ impl ProxyManager {
                                 }
                             }
                         }
+                        Some(ProxyControlMessage::BroadcastPublicSettings {
+                            display_password_reset,
+                            display_download_step,
+                        }) => {
+                            debug!("Broadcasting PublicSettings to all connected proxies");
+                            let msg = CoreResponse {
+                                id: 0,
+                                payload: Some(core_response::Payload::PublicSettings(
+                                    PublicSettings {
+                                        display_password_reset,
+                                        display_download_step,
+                                    },
+                                )),
+                            };
+                            if let Ok(map) = handler_tx_map.read() {
+                                for (pid, tx) in map.iter() {
+                                    debug!("Sending PublicSettings to proxy {pid}");
+                                    let _ = tx.send(msg.clone());
+                                }
+                            }
+                        }
                         None => {
                             debug!("Proxy control channel closed");
                             break;
@@ -401,19 +423,28 @@ impl ProxyManager {
 /// events, notifications, and side effects to Core components.
 #[derive(Clone)]
 pub struct ProxyTxSet {
-    wireguard: Sender<GatewayEvent>,
+    wireguard: Sender<GatewayCommand>,
     bidi_events: UnboundedSender<BidiStreamEvent>,
+    pub(crate) ldap: UnboundedSender<LdapSyncEventType>,
+    pub(crate) dirsync: UnboundedSender<DirectorySyncEvent>,
+    pub(crate) event_tx: UnboundedSender<ApiEvent>,
 }
 
 impl ProxyTxSet {
     #[must_use]
-    pub const fn new(
-        wireguard: Sender<GatewayEvent>,
+    pub fn new(
+        wireguard: Sender<GatewayCommand>,
         bidi_events: UnboundedSender<BidiStreamEvent>,
+        ldap: UnboundedSender<LdapSyncEventType>,
+        dirsync: UnboundedSender<DirectorySyncEvent>,
+        event_tx: UnboundedSender<ApiEvent>,
     ) -> Self {
         Self {
             wireguard,
             bidi_events,
+            ldap,
+            dirsync,
+            event_tx,
         }
     }
 }

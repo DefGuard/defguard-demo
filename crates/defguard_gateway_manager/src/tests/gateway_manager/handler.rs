@@ -1,8 +1,10 @@
 #[path = "handler/support.rs"]
 mod support;
 
-use defguard_common::db::models::device::{DeviceInfo, WireguardNetworkDevice};
-use defguard_core::grpc::GatewayEvent;
+use defguard_common::{
+    db::models::device::{DeviceInfo, WireguardNetworkDevice},
+    gateway_event::GatewayCommand,
+};
 use defguard_proto::gateway::{UpdateType, core_response};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tonic::Status;
@@ -14,8 +16,9 @@ use self::support::{
     assert_network_create_update, assert_network_delete_update, assert_network_modify_update,
     assert_peer_update, assert_send_ok, build_test_firewall_config,
     create_authorized_mfa_device_for_current_network, create_authorized_mfa_device_for_network,
-    create_device_for_network, create_device_info_for_current_network,
-    enable_internal_mfa_for_network, expected_keepalive_interval, panic_unexpected, parse_test_ip,
+    create_authorized_posture_device_for_current_network, create_device_for_network,
+    create_device_info_for_current_network, enable_internal_mfa_for_network,
+    enable_linux_posture_for_network, expected_keepalive_interval, panic_unexpected, parse_test_ip,
 };
 use crate::tests::common::{HandlerTestContext, build_peer_stats, reload_gateway};
 

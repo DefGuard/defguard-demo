@@ -19,9 +19,9 @@ use defguard_common::{
         },
         setup_pool,
     },
+    gateway_event::GatewayCommand,
     messages::peer_stats_update::PeerStatsUpdate,
 };
-use defguard_core::grpc::GatewayEvent;
 use defguard_proto::gateway::{CoreRequest, CoreResponse, PeerStats, core_request, gateway_server};
 use prost_types::Timestamp;
 use sqlx::{PgPool, postgres::PgConnectOptions};
@@ -476,7 +476,7 @@ pub(crate) struct HandlerTestContext {
     pub(crate) network: WireguardNetwork<Id>,
     pub(crate) gateway: Gateway<Id>,
     pub(crate) peer_stats_rx: UnboundedReceiver<PeerStatsUpdate>,
-    events_tx: Option<broadcast::Sender<GatewayEvent>>,
+    events_tx: Option<broadcast::Sender<GatewayCommand>>,
     pub(crate) mock_gateway: Option<MockGatewayHarness>,
     handler_task: Option<JoinHandle<anyhow::Result<()>>>,
 }
@@ -489,7 +489,7 @@ impl HandlerTestContext {
 
     pub(crate) async fn new_with_events_tx(
         options: PgConnectOptions,
-        events_tx: broadcast::Sender<GatewayEvent>,
+        events_tx: broadcast::Sender<GatewayCommand>,
     ) -> Self {
         let pool = setup_pool(options).await;
         initialize_current_settings(&pool)
@@ -524,7 +524,7 @@ impl HandlerTestContext {
         }
     }
 
-    pub(crate) fn events_tx(&self) -> &broadcast::Sender<GatewayEvent> {
+    pub(crate) fn events_tx(&self) -> &broadcast::Sender<GatewayCommand> {
         self.events_tx
             .as_ref()
             .expect("events sender already taken from context")
@@ -661,8 +661,8 @@ pub(crate) async fn wait_for_gateway_connection_state(
 
 pub(crate) fn build_peer_stats(endpoint: &str) -> PeerStats {
     PeerStats {
-        public_key: "peer-public-key".to_string(),
-        endpoint: endpoint.to_string(),
+        public_key: "peer-public-key".to_owned(),
+        endpoint: endpoint.to_owned(),
         upload: 123,
         download: 456,
         keepalive_interval: 25,
@@ -670,7 +670,7 @@ pub(crate) fn build_peer_stats(endpoint: &str) -> PeerStats {
             seconds: 1_700_000_000,
             nanos: 0,
         }),
-        allowed_ips: "10.10.0.2/32".to_string(),
+        allowed_ips: "10.10.0.2/32".to_owned(),
     }
 }
 
@@ -678,9 +678,10 @@ pub(crate) async fn create_network(pool: &PgPool) -> WireguardNetwork<Id> {
     let network = WireguardNetwork::new(
         unique_name("network"),
         51820,
-        "198.51.100.10".to_string(),
+        "198.51.100.10".to_owned(),
         None,
         Vec::new(),
+        false,
         false,
         false,
         false,
@@ -716,9 +717,9 @@ pub(crate) fn build_gateway_with_enabled(location_id: Id, enabled: bool) -> Gate
     let mut gateway = Gateway::new(
         location_id,
         unique_name("gateway"),
-        "127.0.0.1".to_string(),
+        "127.0.0.1".to_owned(),
         port,
-        "test-admin".to_string(),
+        "test-admin".to_owned(),
     );
     gateway.enabled = enabled;
     gateway

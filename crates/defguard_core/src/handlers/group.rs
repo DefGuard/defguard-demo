@@ -113,17 +113,18 @@ pub(crate) async fn bulk_assign_to_groups(
         }
     }
 
-    sync_all_networks(&mut transaction, &appstate.wireguard_tx).await?;
+    sync_all_networks(&mut transaction, &appstate.gateway_tx).await?;
 
     transaction.commit().await?;
 
-    ldap_add_users_to_groups(ldap_user_groups, &appstate.pool).await;
+    ldap_add_users_to_groups(ldap_user_groups, &appstate.pool, &appstate.ldap_tx).await;
 
     let users_to_maybe_update = users.iter_mut().collect::<Vec<_>>();
     Box::pin(ldap_update_users_state(
         users_to_maybe_update,
         &appstate.pool,
-        &appstate.wireguard_tx,
+        &appstate.gateway_tx,
+        &appstate.ldap_tx,
     ))
     .await;
 
@@ -368,17 +369,18 @@ pub(crate) async fn create_group(
             .insert(&group_info.name);
     }
 
-    sync_all_networks(&mut transaction, &appstate.wireguard_tx).await?;
+    sync_all_networks(&mut transaction, &appstate.gateway_tx).await?;
 
     transaction.commit().await?;
 
     if !ldap_user_groups.is_empty() {
-        ldap_add_users_to_groups(ldap_user_groups, &appstate.pool).await;
+        ldap_add_users_to_groups(ldap_user_groups, &appstate.pool, &appstate.ldap_tx).await;
         let users_to_maybe_update = members.iter_mut().collect::<Vec<_>>();
         Box::pin(ldap_update_users_state(
             users_to_maybe_update,
             &appstate.pool,
-            &appstate.wireguard_tx,
+            &appstate.gateway_tx,
+            &appstate.ldap_tx,
         ))
         .await;
     }
@@ -508,12 +510,12 @@ pub(crate) async fn modify_group(
             .insert(group.name.as_str());
     }
 
-    sync_all_networks(&mut transaction, &appstate.wireguard_tx).await?;
+    sync_all_networks(&mut transaction, &appstate.gateway_tx).await?;
     let users_after = group.members(&mut *transaction).await?.clone();
     transaction.commit().await?;
 
-    ldap_add_users_to_groups(add_to_ldap_groups, &appstate.pool).await;
-    ldap_remove_users_from_groups(remove_from_ldap_groups, &appstate.pool).await;
+    ldap_add_users_to_groups(add_to_ldap_groups, &appstate.pool, &appstate.ldap_tx).await;
+    ldap_remove_users_from_groups(remove_from_ldap_groups, &appstate.pool, &appstate.ldap_tx).await;
     if before.name != group.name {
         ldap_modify_group(&before.name, &group, &appstate.pool).await;
     }
@@ -522,7 +524,13 @@ pub(crate) async fn modify_group(
         .iter_mut()
         .chain(current_members.iter_mut())
         .collect::<Vec<_>>();
-    ldap_update_users_state(affected_users, &appstate.pool, &appstate.wireguard_tx).await;
+    ldap_update_users_state(
+        affected_users,
+        &appstate.pool,
+        &appstate.gateway_tx,
+        &appstate.ldap_tx,
+    )
+    .await;
 
     let set_users_before: HashSet<_> = users_before.into_iter().collect();
     let set_users_after: HashSet<_> = users_after.into_iter().collect();
@@ -618,7 +626,7 @@ pub(crate) async fn delete_group(
 
         // sync allowed devices for all locations
         let mut conn = appstate.pool.acquire().await?;
-        sync_all_networks(&mut conn, &appstate.wireguard_tx).await?;
+        sync_all_networks(&mut conn, &appstate.gateway_tx).await?;
 
         info!(
             "User {} deleted group {}",
@@ -672,10 +680,22 @@ pub(crate) async fn add_group_member(
         if let Some(mut user) = User::find_by_username(&appstate.pool, &data.username).await? {
             debug!("Adding user: {} to group: {}", user.username, group.name);
             user.add_to_group(&appstate.pool, &group).await?;
-            ldap_add_user_to_groups(&user, hashset![group.name.as_str()], &appstate.pool).await;
-            ldap_update_user_state(&mut user, &appstate.pool, &appstate.wireguard_tx).await;
+            ldap_add_user_to_groups(
+                &user,
+                hashset![group.name.as_str()],
+                &appstate.pool,
+                &appstate.ldap_tx,
+            )
+            .await;
+            ldap_update_user_state(
+                &mut user,
+                &appstate.pool,
+                &appstate.gateway_tx,
+                &appstate.ldap_tx,
+            )
+            .await;
             let mut conn = appstate.pool.acquire().await?;
-            sync_all_networks(&mut conn, &appstate.wireguard_tx).await?;
+            sync_all_networks(&mut conn, &appstate.gateway_tx).await?;
             info!("Added user: {} to group: {}", user.username, group.name);
             appstate.emit_event(ApiEvent {
                 context,
@@ -739,11 +759,16 @@ pub(crate) async fn remove_group_member(
                 user.username, group.name
             );
             user.remove_from_group(&appstate.pool, &group).await?;
-            ldap_remove_user_from_groups(&user, hashset![group.name.as_str()], &appstate.pool)
-                .await;
+            ldap_remove_user_from_groups(
+                &user,
+                hashset![group.name.as_str()],
+                &appstate.pool,
+                &appstate.ldap_tx,
+            )
+            .await;
 
             let mut conn = appstate.pool.acquire().await?;
-            sync_all_networks(&mut conn, &appstate.wireguard_tx).await?;
+            sync_all_networks(&mut conn, &appstate.gateway_tx).await?;
             info!("Removed user: {} from group: {}", user.username, group.name);
             appstate.emit_event(ApiEvent {
                 context,

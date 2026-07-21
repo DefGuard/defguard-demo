@@ -22,7 +22,7 @@ pub async fn update_counts<'e, E: sqlx::PgExecutor<'e>>(executor: E) -> sqlx::Re
     debug!("Updating device, user, and wireguard network counts.");
     let result = query!(
         "SELECT \
-        (SELECT count(*) FROM \"user\") \"users!\", \
+        (SELECT count(*) FROM \"user\" WHERE is_active) \"users!\", \
         (SELECT count(*) FROM device WHERE device_type = 'user') \"user_devices!\", \
         (SELECT count(*) FROM device WHERE device_type = 'network') \"network_devices!\",
         (SELECT count(*) FROM wireguard_network) \"wireguard_networks!\"
@@ -165,13 +165,14 @@ mod test {
         };
 
         let license = License::new(
-            "test".to_string(),
+            "test".to_owned(),
             false,
             None,
             Some(limits),
             None,
             LicenseTier::Business,
             SupportType::Basic,
+            vec![],
         );
 
         set_cached_license(Some(license));
@@ -232,13 +233,14 @@ mod test {
     #[test]
     fn test_is_over_limit_unlimited_license() {
         let license = License::new(
-            "test".to_string(),
+            "test".to_owned(),
             true,
             Some(Utc::now() + TimeDelta::days(1)),
             None,
             None,
             LicenseTier::Business,
             SupportType::Basic,
+            vec![],
         );
         set_cached_license(Some(license));
 

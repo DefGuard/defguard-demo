@@ -1,16 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use defguard_proto::enterprise::firewall::{
-    IpAddress, IpRange, Port, PortRange as PortRangeProto, ip_address::Address,
-    port::Port as PortInner,
-};
+use defguard_common::gateway_types::{IpAddress, IpRange, Port, PortRange as GwPortRange};
 use ipnetwork::Ipv6Network;
 
 use crate::enterprise::{
     db::models::acl::PortRange,
-    firewall::{
-        find_largest_subnet_in_range, get_last_ip_in_v6_subnet, merge_addrs, merge_port_ranges,
-    },
+    firewall::{merge_addrs, merge_port_ranges},
+    utils::{find_largest_subnet_in_range, get_last_ip_in_v6_subnet},
 };
 
 #[test]
@@ -30,30 +26,14 @@ fn test_merge_v4_addrs() {
     assert_eq!(
         merged_addrs,
         [
-            IpAddress {
-                address: Some(Address::Ip("10.0.8.127".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("10.0.8.128/25".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("10.0.9.0/24".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("10.0.10.0/27".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::Ip("10.0.20.20".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("10.0.60.20/30".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("10.0.60.24/31".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::Ip("192.168.0.20".to_string())),
-            },
+            IpAddress::Ip("10.0.8.127".to_owned()),
+            IpAddress::IpSubnet("10.0.8.128/25".to_owned()),
+            IpAddress::IpSubnet("10.0.9.0/24".to_owned()),
+            IpAddress::IpSubnet("10.0.10.0/27".to_owned()),
+            IpAddress::Ip("10.0.20.20".to_owned()),
+            IpAddress::IpSubnet("10.0.60.20/30".to_owned()),
+            IpAddress::IpSubnet("10.0.60.24/31".to_owned()),
+            IpAddress::Ip("192.168.0.20".to_owned()),
         ]
     );
 
@@ -70,12 +50,8 @@ fn test_merge_v4_addrs() {
     assert_eq!(
         merged_addrs,
         [
-            IpAddress {
-                address: Some(Address::IpSubnet("10.0.10.0/30".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::Ip("10.0.10.20".to_string())),
-            },
+            IpAddress::IpSubnet("10.0.10.0/30".to_owned()),
+            IpAddress::Ip("10.0.10.20".to_owned()),
         ]
     );
 }
@@ -97,27 +73,13 @@ fn test_merge_v6_addrs() {
     assert_eq!(
         merged_addrs,
         [
-            IpAddress {
-                address: Some(Address::Ip("2001:db8:1::1".to_string()))
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("2001:db8:1::2/127".to_string()))
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("2001:db8:1::4/126".to_string()))
-            },
-            IpAddress {
-                address: Some(Address::Ip("2001:db8:1::8".to_string()))
-            },
-            IpAddress {
-                address: Some(Address::Ip("2001:db8:2::1".to_string()))
-            },
-            IpAddress {
-                address: Some(Address::Ip("2001:db8:3::1".to_string()))
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("2001:db8:3::2/127".to_string()))
-            }
+            IpAddress::Ip("2001:db8:1::1".to_owned()),
+            IpAddress::IpSubnet("2001:db8:1::2/127".to_owned()),
+            IpAddress::IpSubnet("2001:db8:1::4/126".to_owned()),
+            IpAddress::Ip("2001:db8:1::8".to_owned()),
+            IpAddress::Ip("2001:db8:2::1".to_owned()),
+            IpAddress::Ip("2001:db8:3::1".to_owned()),
+            IpAddress::IpSubnet("2001:db8:3::2/127".to_owned())
         ]
     );
 }
@@ -133,12 +95,8 @@ fn test_merge_addrs_extracts_ipv4_subnets() {
     assert_eq!(
         result,
         [
-            IpAddress {
-                address: Some(Address::IpSubnet("192.168.1.0/24".to_string()))
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("192.168.2.0/24".to_string()))
-            },
+            IpAddress::IpSubnet("192.168.1.0/24".to_owned()),
+            IpAddress::IpSubnet("192.168.2.0/24".to_owned()),
         ]
     );
 }
@@ -154,12 +112,8 @@ fn test_merge_addrs_extracts_ipv6_subnets() {
     assert_eq!(
         result,
         [
-            IpAddress {
-                address: Some(Address::IpSubnet("2001:db8::/32".to_string()))
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("2001:db9::/112".to_string()))
-            },
+            IpAddress::IpSubnet("2001:db8::/32".to_owned()),
+            IpAddress::IpSubnet("2001:db9::/112".to_owned()),
         ]
     );
 }
@@ -174,12 +128,10 @@ fn test_merge_addrs_falls_back_to_range_when_no_subnet_fits() {
 
     assert_eq!(
         result,
-        [IpAddress {
-            address: Some(Address::IpRange(IpRange {
-                start: "192.168.1.255".to_string(),
-                end: "192.168.2.0".to_string(),
-            })),
-        },]
+        [IpAddress::IpRange(IpRange {
+            start: "192.168.1.255".to_owned(),
+            end: "192.168.2.0".to_owned(),
+        }),]
     );
 
     let start = "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"
@@ -192,12 +144,10 @@ fn test_merge_addrs_falls_back_to_range_when_no_subnet_fits() {
 
     assert_eq!(
         result,
-        [IpAddress {
-            address: Some(Address::IpRange(IpRange {
-                start: "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff".to_string(),
-                end: "2001:db9::".to_string(),
-            })),
-        },]
+        [IpAddress::IpRange(IpRange {
+            start: "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff".to_owned(),
+            end: "2001:db9::".to_owned(),
+        }),]
     );
 }
 
@@ -209,12 +159,7 @@ fn test_merge_addrs_handles_single_ip() {
 
     let result = merge_addrs(ranges);
 
-    assert_eq!(
-        result,
-        [IpAddress {
-            address: Some(Address::Ip("192.168.1.1".to_string())),
-        },]
-    );
+    assert_eq!(result, [IpAddress::Ip("192.168.1.1".to_owned()),]);
 
     let start = "2001:db8::".parse::<Ipv6Addr>().unwrap();
     let end = "2001:db8::".parse::<Ipv6Addr>().unwrap();
@@ -222,12 +167,7 @@ fn test_merge_addrs_handles_single_ip() {
 
     let result = merge_addrs(ranges);
 
-    assert_eq!(
-        result,
-        [IpAddress {
-            address: Some(Address::Ip("2001:db8::".to_string())),
-        },]
-    );
+    assert_eq!(result, [IpAddress::Ip("2001:db8::".to_owned()),]);
 }
 
 #[test]
@@ -299,12 +239,8 @@ fn test_merge_addrs_subnet_at_start_of_range() {
     assert_eq!(
         result,
         [
-            IpAddress {
-                address: Some(Address::IpSubnet("192.168.1.0/26".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::Ip("192.168.1.64".to_string())),
-            },
+            IpAddress::IpSubnet("192.168.1.0/26".to_owned()),
+            IpAddress::Ip("192.168.1.64".to_owned()),
         ]
     );
 
@@ -318,12 +254,8 @@ fn test_merge_addrs_subnet_at_start_of_range() {
     assert_eq!(
         result,
         [
-            IpAddress {
-                address: Some(Address::IpSubnet("2001:db8::/122".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::Ip("2001:db8::40".to_string())),
-            },
+            IpAddress::IpSubnet("2001:db8::/122".to_owned()),
+            IpAddress::Ip("2001:db8::40".to_owned()),
         ]
     );
 }
@@ -339,12 +271,8 @@ fn test_merge_addrs_subnet_at_end_of_range() {
     assert_eq!(
         result,
         [
-            IpAddress {
-                address: Some(Address::Ip("192.168.1.15".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("192.168.1.16/28".to_string())),
-            },
+            IpAddress::Ip("192.168.1.15".to_owned()),
+            IpAddress::IpSubnet("192.168.1.16/28".to_owned()),
         ]
     );
 
@@ -358,12 +286,8 @@ fn test_merge_addrs_subnet_at_end_of_range() {
     assert_eq!(
         result,
         [
-            IpAddress {
-                address: Some(Address::Ip("2001:db8::f".to_string())),
-            },
-            IpAddress {
-                address: Some(Address::IpSubnet("2001:db8::10/124".to_string())),
-            },
+            IpAddress::Ip("2001:db8::f".to_owned()),
+            IpAddress::IpSubnet("2001:db8::10/124".to_owned()),
         ]
     );
 }
@@ -373,12 +297,7 @@ fn test_merge_port_ranges() {
     // single port
     let input_ranges = vec![PortRange::new(100, 100)];
     let merged = merge_port_ranges(input_ranges);
-    assert_eq!(
-        merged,
-        [Port {
-            port: Some(PortInner::SinglePort(100))
-        }]
-    );
+    assert_eq!(merged, [Port::Single(100)]);
 
     // overlapping ranges
     let input_ranges = vec![
@@ -389,12 +308,10 @@ fn test_merge_port_ranges() {
     let merged = merge_port_ranges(input_ranges);
     assert_eq!(
         merged,
-        [Port {
-            port: Some(PortInner::PortRange(PortRangeProto {
-                start: 100,
-                end: 300
-            }))
-        }]
+        [Port::Range(GwPortRange {
+            start: 100,
+            end: 300
+        })]
     );
 
     // duplicate ranges
@@ -413,18 +330,14 @@ fn test_merge_port_ranges() {
     assert_eq!(
         merged,
         [
-            Port {
-                port: Some(PortInner::PortRange(PortRangeProto {
-                    start: 100,
-                    end: 300
-                }))
-            },
-            Port {
-                port: Some(PortInner::PortRange(PortRangeProto {
-                    start: 350,
-                    end: 400
-                }))
-            }
+            Port::Range(GwPortRange {
+                start: 100,
+                end: 300
+            }),
+            Port::Range(GwPortRange {
+                start: 350,
+                end: 400
+            })
         ]
     );
 
@@ -441,24 +354,16 @@ fn test_merge_port_ranges() {
     assert_eq!(
         merged,
         [
-            Port {
-                port: Some(PortInner::SinglePort(50))
-            },
-            Port {
-                port: Some(PortInner::PortRange(PortRangeProto {
-                    start: 151,
-                    end: 300
-                }))
-            },
-            Port {
-                port: Some(PortInner::PortRange(PortRangeProto {
-                    start: 501,
-                    end: 699
-                }))
-            },
-            Port {
-                port: Some(PortInner::SinglePort(800))
-            }
+            Port::Single(50),
+            Port::Range(GwPortRange {
+                start: 151,
+                end: 300
+            }),
+            Port::Range(GwPortRange {
+                start: 501,
+                end: 699
+            }),
+            Port::Single(800)
         ]
     );
 
@@ -467,12 +372,10 @@ fn test_merge_port_ranges() {
     let merged = merge_port_ranges(input_ranges);
     assert_eq!(
         merged,
-        [Port {
-            port: Some(PortInner::PortRange(PortRangeProto {
-                start: 100,
-                end: 200
-            }))
-        }]
+        [Port::Range(GwPortRange {
+            start: 100,
+            end: 200
+        })]
     );
 }
 

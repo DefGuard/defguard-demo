@@ -7,7 +7,9 @@ use defguard_common::db::{
 use ipnetwork::IpNetwork;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-use crate::location_management::sync_location_allowed_devices;
+use crate::{
+    device_access::join_device_to_all_networks, location_management::sync_location_allowed_devices,
+};
 
 #[sqlx::test]
 fn test_network_readdress(_: PgPoolOptions, options: PgConnectOptions) {
@@ -32,8 +34,8 @@ fn test_network_readdress(_: PgPoolOptions, options: PgConnectOptions) {
 
     // Only one device will fit.
     let device = Device::new(
-        "device".to_string(),
-        "fF9K0tgatZTEJRvzpNUswr0h8HqCIi+v39B45+QZZzE=".to_string(),
+        "device".to_owned(),
+        "fF9K0tgatZTEJRvzpNUswr0h8HqCIi+v39B45+QZZzE=".to_owned(),
         user.id,
         DeviceType::User,
         None,
@@ -42,7 +44,9 @@ fn test_network_readdress(_: PgPoolOptions, options: PgConnectOptions) {
     .save(&pool)
     .await
     .unwrap();
-    let (_, _) = device.add_to_all_networks(&mut conn).await.unwrap();
+    let (_, _) = join_device_to_all_networks(&mut conn, &device, &user)
+        .await
+        .unwrap();
 
     let devices = Device::all(&mut *conn).await.unwrap();
     assert_eq!(1, devices.len(), "{devices:#?}");

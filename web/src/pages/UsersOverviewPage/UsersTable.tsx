@@ -28,6 +28,7 @@ import {
   type StartEnrollmentResponse,
   type User,
   type UserSortKey,
+  WebErrorCode,
 } from '../../shared/api/types';
 import { useSelectionModal } from '../../shared/components/modals/SelectionModal/useSelectionModal';
 import type { SelectionOption } from '../../shared/components/SelectionSection/type';
@@ -69,6 +70,17 @@ import { useAddUserModal } from './modals/AddUserModal/useAddUserModal';
 type RowData = User;
 
 const columnHelper = createColumnHelper<RowData>();
+
+const getEnableErrorMessage = (
+  code: WebErrorCode | undefined,
+  genericMessage: string,
+  licenseLimitMessage: string,
+): string => {
+  if (code === WebErrorCode.LicenseLimitReached) {
+    return licenseLimitMessage;
+  }
+  return genericMessage;
+};
 
 export const UsersTable = () => {
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
@@ -188,7 +200,13 @@ export const UsersTable = () => {
     onSuccess: () => Snackbar.default(m.users_edit_success()),
     onError: () => Snackbar.error(m.users_edit_error()),
     meta: {
-      invalidate: [['user'], ['activity-log']],
+      invalidate: [
+        ['user'],
+        ['group'],
+        ['group-info'],
+        ['activity-log'],
+        ['enterprise_info'],
+      ],
     },
   });
 
@@ -339,7 +357,7 @@ export const UsersTable = () => {
                           active: false,
                           username: rowData.username,
                         }),
-                      invalidateKeys: [['user']],
+                      invalidateKeys: [['user'], ['enterprise_info']],
                       submitProps: {
                         text: m.users_row_menu_disable(),
                         variant: 'critical',
@@ -358,12 +376,19 @@ export const UsersTable = () => {
                           active: true,
                           username: rowData.username,
                         }),
-                      invalidateKeys: [['user']],
+                      invalidateKeys: [['user'], ['enterprise_info']],
                       submitProps: {
                         text: m.users_row_menu_enable(),
                       },
                       onSuccess: () => Snackbar.default(m.users_enable_success()),
-                      onError: () => Snackbar.error(m.users_enable_error()),
+                      onError: (_msg, code) =>
+                        Snackbar.error(
+                          getEnableErrorMessage(
+                            code,
+                            m.users_enable_error(),
+                            m.users_enable_error_license_limit(),
+                          ),
+                        ),
                     });
                   }
                 },
@@ -381,20 +406,24 @@ export const UsersTable = () => {
                 });
               },
             },
-            {
-              text: m.users_row_menu_change_password(),
-              icon: 'lock-open',
-              testId: 'change-password',
-              onClick: () => {
-                openModal(ModalName.ChangePassword, {
-                  adminForm: rowData.username !== authUsername,
-                  user: rowData,
-                });
-              },
-            },
+            ...(!rowData.password_management_disabled
+              ? [
+                  {
+                    text: m.users_row_menu_change_password(),
+                    icon: 'lock-open' as const,
+                    testId: 'change-password',
+                    onClick: () => {
+                      openModal(ModalName.ChangePassword, {
+                        adminForm: rowData.username !== authUsername,
+                        user: rowData,
+                      });
+                    },
+                  },
+                ]
+              : []),
             {
               text: m.users_row_menu_go_profile(),
-              icon: 'profile',
+              icon: 'profile' as const,
               onClick: () => {
                 navigate({
                   to: '/user/$username',
@@ -406,7 +435,7 @@ export const UsersTable = () => {
             },
             {
               text: m.users_row_menu_edit_groups(),
-              icon: 'add-group',
+              icon: 'add-group' as const,
               testId: 'edit-groups',
               onClick: () => {
                 useSelectionModal.setState({
@@ -536,7 +565,7 @@ export const UsersTable = () => {
                       send_enrollment_notification: false,
                       username: rowData.username,
                     }),
-                  invalidateKeys: [['user-overview'], ['user']],
+                  invalidateKeys: [['user']],
                   submitProps: {
                     text: m.users_row_menu_trigger_re_enrollment(),
                     variant: 'critical',
@@ -623,6 +652,7 @@ export const UsersTable = () => {
               reservedNames: reservedDeviceNames,
               reservedPubkeys,
               username,
+              hidePubkey: false,
             });
           },
         },
@@ -667,7 +697,7 @@ export const UsersTable = () => {
             title: m.modal_delete_user_device_title(),
             contentMd: m.modal_delete_user_device_body({ name: device.name }),
             actionPromise: () => api.device.deleteDevice(device.id),
-            invalidateKeys: [['user'], ['network']],
+            invalidateKeys: [['user'], ['network'], ['device', 'all']],
             submitProps: { text: m.controls_delete(), variant: 'critical' },
             onSuccess: () => Snackbar.default(m.user_device_delete_success()),
             onError: () => Snackbar.error(m.user_device_delete_failed()),
@@ -777,6 +807,10 @@ export const UsersTable = () => {
   });
 
   const handleBulkStartEnrollment = useCallback(() => {
+    if (!appInfo.smtp_enabled) {
+      Snackbar.error(m.state_smtp_not_configured_admin());
+      return;
+    }
     const selectedRows = table.getFilteredSelectedRowModel().rows;
     const selectedUsers = selectedRows
       .filter((row) => row.original.username !== authUsername)
@@ -795,7 +829,7 @@ export const UsersTable = () => {
           users: selectedUsers,
           send_enrollment_notification: true,
         }),
-      invalidateKeys: [['user-overview'], ['user']],
+      invalidateKeys: [['user']],
       submitProps: {
         text: m.users_bulk_start_enrollment(),
       },
@@ -813,7 +847,7 @@ export const UsersTable = () => {
       },
       onError: () => Snackbar.error(m.users_bulk_start_enrollment_error()),
     });
-  }, [authUsername, table]);
+  }, [appInfo.smtp_enabled, authUsername, table]);
 
   const handleBulkDisable = useCallback(() => {
     const selectedRows = table.getFilteredSelectedRowModel().rows;
@@ -834,7 +868,7 @@ export const UsersTable = () => {
         count: selectedUsers.length,
       }),
       actionPromise: () => api.user.bulkDisable(selectedUsers),
-      invalidateKeys: [['user-overview'], ['user']],
+      invalidateKeys: [['user']],
       submitProps: {
         text: m.users_bulk_disable(),
         variant: 'critical',
@@ -861,14 +895,21 @@ export const UsersTable = () => {
         count: selectedUsers.length,
       }),
       actionPromise: () => api.user.bulkEnable(selectedUsers),
-      invalidateKeys: [['user-overview'], ['user']],
+      invalidateKeys: [['user']],
       submitProps: {
         text: m.users_bulk_enable(),
       },
       onSuccess: () => {
         Snackbar.default(m.users_bulk_enable_success());
       },
-      onError: () => Snackbar.error(m.users_bulk_enable_error()),
+      onError: (_msg, code) =>
+        Snackbar.error(
+          getEnableErrorMessage(
+            code,
+            m.users_bulk_enable_error(),
+            m.users_bulk_enable_error_license_limit(),
+          ),
+        ),
     });
   }, [table]);
 
@@ -887,7 +928,7 @@ export const UsersTable = () => {
         count: selectedUsers.length,
       }),
       actionPromise: () => api.user.bulkDelete(selectedUsers),
-      invalidateKeys: [['user-overview'], ['user']],
+      invalidateKeys: [['user']],
       submitProps: {
         text: m.users_bulk_delete(),
         variant: 'critical',

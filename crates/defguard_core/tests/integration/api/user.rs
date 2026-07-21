@@ -10,6 +10,7 @@ use defguard_common::{
             gateway::Gateway,
             group::Group,
             oauth2client::OAuth2Client,
+            settings::{Settings, update_current_settings},
             vpn_client_session::{VpnClientSession, VpnClientSessionState},
             vpn_session_stats::VpnSessionStats,
         },
@@ -18,6 +19,9 @@ use defguard_common::{
 };
 use defguard_core::{
     enterprise::{
+        db::models::openid_provider::{
+            DirectorySyncTarget, DirectorySyncUserBehavior, OpenIdProvider, OpenIdProviderKind,
+        },
         license::{License, LicenseTier, SupportType, get_cached_license, set_cached_license},
         limits::update_counts,
     },
@@ -40,7 +44,7 @@ use crate::api::common::{get_db_device, get_db_location, get_db_user, make_clien
 
 async fn seed_user_with_mfa_artifacts(pool: &sqlx::PgPool, username: &str) -> Vec<String> {
     let test_user = get_db_user(pool, username).await;
-    let recovery_codes = vec!["recovery-code-1".to_string(), "recovery-code-2".to_string()];
+    let recovery_codes = vec!["recovery-code-1".to_owned(), "recovery-code-2".to_owned()];
 
     sqlx::query(
         "UPDATE \"user\" SET mfa_enabled = TRUE, totp_enabled = TRUE, email_mfa_enabled = TRUE, \
@@ -1012,7 +1016,7 @@ async fn test_add_user_blocked_when_user_count_exceeds_license_limit(
 
     let license = get_cached_license().clone();
     set_cached_license(Some(License::new(
-        "test_customer".to_string(),
+        "test_customer".to_owned(),
         false,
         None,
         Some(LicenseLimits {
@@ -1024,6 +1028,7 @@ async fn test_add_user_blocked_when_user_count_exceeds_license_limit(
         None,
         LicenseTier::Business,
         SupportType::Basic,
+        vec![],
     )));
 
     let new_user = AddUserData {
@@ -1039,6 +1044,222 @@ async fn test_add_user_blocked_when_user_count_exceeds_license_limit(
 
     set_cached_license(license);
     client.assert_event_queue_is_empty();
+}
+
+#[sqlx::test]
+async fn test_disabled_users_not_counted_towards_license_limit(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+
+    let (mut client, pool) = make_client_with_db(pool).await;
+
+    client.login_user("admin", "pass123").await;
+
+    // baseline is admin + hpotter, both active
+    let hpotter = get_db_user(&pool, "hpotter").await;
+    let response = client
+        .post("/api/v1/user/bulk-disable")
+        .json(&serde_json::json!({ "users": [hpotter.id] }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let license = get_cached_license().clone();
+    set_cached_license(Some(License::new(
+        "test_customer".to_owned(),
+        false,
+        None,
+        Some(LicenseLimits {
+            users: 2,
+            devices: 100,
+            locations: 100,
+            network_devices: Some(100),
+        }),
+        None,
+        LicenseTier::Business,
+        SupportType::Basic,
+        vec![],
+    )));
+
+    // only admin is active, so there is still room under the limit of 2
+    let new_user = AddUserData {
+        username: "adumbledore".into(),
+        last_name: "Dumbledore".into(),
+        first_name: "Albus".into(),
+        email: "a.dumbledore@hogwart.edu.uk".into(),
+        phone: Some("1234".into()),
+        password: Some("Password1234543$!".into()),
+    };
+    let response = client.post("/api/v1/user").json(&new_user).send().await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    set_cached_license(license);
+}
+
+#[sqlx::test]
+async fn test_modify_user_enable_blocked_when_it_would_exceed_license_limit(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+
+    let (mut client, pool) = make_client_with_db(pool).await;
+
+    client.login_user("admin", "pass123").await;
+
+    let new_user = AddUserData {
+        username: "adumbledore".into(),
+        last_name: "Dumbledore".into(),
+        first_name: "Albus".into(),
+        email: "a.dumbledore@hogwart.edu.uk".into(),
+        phone: Some("1234".into()),
+        password: Some("Password1234543$!".into()),
+    };
+    let response = client.post("/api/v1/user").json(&new_user).send().await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let added_dumbledore = get_db_user(&pool, "adumbledore").await;
+
+    // disable the new user so there is something to re-enable; active count drops back to 2
+    let response = client
+        .post("/api/v1/user/bulk-disable")
+        .json(&serde_json::json!({ "users": [added_dumbledore.id] }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let disabled_dumbledore = get_db_user(&pool, "adumbledore").await;
+    assert!(!disabled_dumbledore.is_active);
+
+    let license = get_cached_license().clone();
+    set_cached_license(Some(License::new(
+        "test_customer".to_owned(),
+        false,
+        None,
+        Some(LicenseLimits {
+            users: 2,
+            devices: 100,
+            locations: 100,
+            network_devices: Some(100),
+        }),
+        None,
+        LicenseTier::Business,
+        SupportType::Basic,
+        vec![],
+    )));
+
+    // active count is already at the limit of 2 (admin, hpotter), so re-enabling must be blocked
+    let mut user_details = fetch_user_details(&client, "adumbledore").await;
+    user_details.user.is_active = true;
+    let response = client
+        .put("/api/v1/user/adumbledore")
+        .json(&user_details.user)
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let still_disabled_dumbledore = get_db_user(&pool, "adumbledore").await;
+    assert!(!still_disabled_dumbledore.is_active);
+
+    set_cached_license(license);
+    client.verify_api_events(&[
+        ApiEventType::UserAdded {
+            user: added_dumbledore.clone(),
+        },
+        ApiEventType::UserModified {
+            before: added_dumbledore,
+            after: disabled_dumbledore,
+        },
+    ]);
+}
+
+#[sqlx::test]
+async fn test_bulk_enable_users_blocked_when_it_would_exceed_license_limit(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+
+    let (mut client, pool) = make_client_with_db(pool).await;
+
+    client.login_user("admin", "pass123").await;
+
+    for (username, email) in [
+        ("adumbledore", "a.dumbledore@hogwart.edu.uk"),
+        ("mmcgonagall", "m.mcgonagall@hogwart.edu.uk"),
+    ] {
+        let new_user = AddUserData {
+            username: username.into(),
+            last_name: format!("{username}-last"),
+            first_name: format!("{username}-first"),
+            email: email.into(),
+            phone: Some("1234".into()),
+            password: Some("Password1234543$!".into()),
+        };
+        let response = client.post("/api/v1/user").json(&new_user).send().await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let added_dumbledore = get_db_user(&pool, "adumbledore").await;
+    let added_mcgonagall = get_db_user(&pool, "mmcgonagall").await;
+
+    // disable both new users; active count drops back to 2 (admin, hpotter)
+    let response = client
+        .post("/api/v1/user/bulk-disable")
+        .json(&serde_json::json!({ "users": [added_dumbledore.id, added_mcgonagall.id] }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let disabled_dumbledore = get_db_user(&pool, "adumbledore").await;
+    let disabled_mcgonagall = get_db_user(&pool, "mmcgonagall").await;
+
+    let license = get_cached_license().clone();
+    set_cached_license(Some(License::new(
+        "test_customer".to_owned(),
+        false,
+        None,
+        Some(LicenseLimits {
+            users: 3,
+            devices: 100,
+            locations: 100,
+            network_devices: Some(100),
+        }),
+        None,
+        LicenseTier::Business,
+        SupportType::Basic,
+        vec![],
+    )));
+
+    // active count is 2 (admin, hpotter); re-enabling both would bring it to 4, over the limit of 3
+    let response = client
+        .post("/api/v1/user/bulk-enable")
+        .json(&serde_json::json!({ "users": [disabled_dumbledore.id, disabled_mcgonagall.id] }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let still_disabled_dumbledore = get_db_user(&pool, "adumbledore").await;
+    let still_disabled_mcgonagall = get_db_user(&pool, "mmcgonagall").await;
+    assert!(!still_disabled_dumbledore.is_active);
+    assert!(!still_disabled_mcgonagall.is_active);
+
+    set_cached_license(license);
+    client.verify_api_events(&[
+        ApiEventType::UserAdded {
+            user: added_dumbledore.clone(),
+        },
+        ApiEventType::UserAdded {
+            user: added_mcgonagall.clone(),
+        },
+        ApiEventType::UserModified {
+            before: added_dumbledore,
+            after: disabled_dumbledore,
+        },
+        ApiEventType::UserModified {
+            before: added_mcgonagall,
+            after: disabled_mcgonagall,
+        },
+    ]);
 }
 
 #[sqlx::test]
@@ -1430,6 +1651,9 @@ async fn test_disable(_: PgPoolOptions, options: PgConnectOptions) {
         ApiEventType::UserModified {
             before: old_test_user,
             after: new_test_user.clone(),
+        },
+        ApiEventType::UserDisabled {
+            user: new_test_user,
         },
     ]);
 }
@@ -2301,6 +2525,91 @@ async fn test_bulk_delete_deduplicates_ids(_: PgPoolOptions, options: PgConnectO
 }
 
 #[sqlx::test]
+async fn test_delete_user_clears_stale_default_admin_settings_cache(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (mut client, pool) = make_client_with_db(pool).await;
+    client.login_user("admin", "pass123").await;
+
+    let new_user = AddUserData {
+        username: "adumbledore".into(),
+        last_name: "Dumbledore".into(),
+        first_name: "Albus".into(),
+        email: "a.dumbledore@hogwart.edu.uk".into(),
+        phone: None,
+        password: Some("Password1234543$!".into()),
+    };
+    let response = client.post("/api/v1/user").json(&new_user).send().await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let dumbledore = get_db_user(&pool, "adumbledore").await;
+
+    // simulate `dumbledore` being the default admin set up during initial setup
+    let mut settings = Settings::get(&pool).await.unwrap().unwrap();
+    settings.default_admin_id = Some(dumbledore.id);
+    update_current_settings(&pool, settings).await.unwrap();
+
+    let response = client.delete("/api/v1/user/adumbledore").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let from_db = Settings::get(&pool).await.unwrap().unwrap();
+    assert_eq!(from_db.default_admin_id, None);
+
+    // any settings update used to fail with a `fk_default_admin` violation here, since the
+    // in-memory cache still held the now-dangling `dumbledore.id`
+    let response = client
+        .patch("/api/v1/settings")
+        .json(&serde_json::json!({ "wireguard_enabled": false }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[sqlx::test]
+async fn test_bulk_delete_users_clears_stale_default_admin_settings_cache(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (mut client, pool) = make_client_with_db(pool).await;
+    client.login_user("admin", "pass123").await;
+
+    let new_user = AddUserData {
+        username: "adumbledore".into(),
+        last_name: "Dumbledore".into(),
+        first_name: "Albus".into(),
+        email: "a.dumbledore@hogwart.edu.uk".into(),
+        phone: None,
+        password: Some("Password1234543$!".into()),
+    };
+    let response = client.post("/api/v1/user").json(&new_user).send().await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let dumbledore = get_db_user(&pool, "adumbledore").await;
+
+    let mut settings = Settings::get(&pool).await.unwrap().unwrap();
+    settings.default_admin_id = Some(dumbledore.id);
+    update_current_settings(&pool, settings).await.unwrap();
+
+    let response = client
+        .post("/api/v1/user/bulk-delete")
+        .json(&serde_json::json!({ "users": [dumbledore.id] }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let from_db = Settings::get(&pool).await.unwrap().unwrap();
+    assert_eq!(from_db.default_admin_id, None);
+
+    let response = client
+        .patch("/api/v1/settings")
+        .json(&serde_json::json!({ "wireguard_enabled": false }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[sqlx::test]
 async fn test_bulk_start_enrollment_deduplicates_ids(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = setup_pool(options).await;
     let (mut client, pool) = make_client_with_db(pool).await;
@@ -2337,4 +2646,289 @@ async fn test_bulk_start_enrollment_deduplicates_ids(_: PgPoolOptions, options: 
 
     let dumbledore_after = get_db_user(&pool, "adumbledore").await;
     assert!(dumbledore_after.enrollment_pending);
+}
+
+/// Admin disabling a user emits both UserModified and UserDisabled events.
+#[sqlx::test]
+async fn test_modify_user_admin_disables_user(_: PgPoolOptions, options: PgConnectOptions) {
+    let pool = setup_pool(options).await;
+    let (mut client, pool) = make_client_with_db(pool).await;
+    client.login_user("admin", "pass123").await;
+
+    let mut user_details = fetch_user_details(&client, "hpotter").await;
+    let old_user = get_db_user(&pool, "hpotter").await;
+    assert!(old_user.is_active);
+
+    user_details.user.is_active = false;
+
+    let response = client
+        .put("/api/v1/user/hpotter")
+        .json(&user_details.user)
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let updated = get_db_user(&pool, "hpotter").await;
+    assert!(!updated.is_active);
+
+    client.verify_api_events(&[
+        ApiEventType::UserModified {
+            before: old_user,
+            after: updated.clone(),
+        },
+        ApiEventType::UserDisabled { user: updated },
+    ]);
+}
+
+/// Admin enabling a previously disabled user emits both UserModified and UserEnabled events.
+#[sqlx::test]
+async fn test_modify_user_admin_enables_user(_: PgPoolOptions, options: PgConnectOptions) {
+    let pool = setup_pool(options).await;
+    let (mut client, pool) = make_client_with_db(pool).await;
+    client.login_user("admin", "pass123").await;
+
+    // First disable the user via the API
+    let mut user_details = fetch_user_details(&client, "hpotter").await;
+    user_details.user.is_active = false;
+    client
+        .put("/api/v1/user/hpotter")
+        .json(&user_details.user)
+        .send()
+        .await;
+    client.drain_all_events();
+
+    // Now re-enable
+    user_details = fetch_user_details(&client, "hpotter").await;
+    let old_user = get_db_user(&pool, "hpotter").await;
+    assert!(!old_user.is_active);
+
+    user_details.user.is_active = true;
+
+    let response = client
+        .put("/api/v1/user/hpotter")
+        .json(&user_details.user)
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let updated = get_db_user(&pool, "hpotter").await;
+    assert!(updated.is_active);
+
+    client.verify_api_events(&[
+        ApiEventType::UserModified {
+            before: old_user,
+            after: updated.clone(),
+        },
+        ApiEventType::UserEnabled { user: updated },
+    ]);
+}
+
+/// Password management is disabled for an LDAP-sourced, non-admin user with no local password
+/// when the LDAP "disable password management" flag is on.
+#[sqlx::test]
+async fn test_password_management_disabled_for_ldap_user(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (mut client, pool) = make_client_with_db(pool).await;
+
+    // Create an LDAP-sourced user with no local password hash.
+    let ldap_user = User::new("ldapuser", None, "LDAP", "User", "ldap@example.com", None)
+        .save(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE \"user\" SET from_ldap = true WHERE id = $1")
+        .bind(ldap_user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Enable the LDAP disable-password-management flag.
+    let mut settings = Settings::get_current_settings();
+    settings.ldap_disable_password_management = true;
+    update_current_settings(&pool, settings).await.unwrap();
+
+    // Login as admin to exercise admin-level password operations on the LDAP user.
+    client.login_user("admin", "pass123").await;
+
+    // change_password (admin → LDAP user) → 403
+    let response = client
+        .put("/api/v1/user/ldapuser/password")
+        .json(&PasswordChange {
+            new_password: "NewPass123!".into(),
+        })
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // reset_password (admin → LDAP user) → 403
+    let response = client
+        .post("/api/v1/user/ldapuser/reset_password")
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Give the LDAP user a local password and verify they are now allowed
+    // (passing password_hash guard in password_management_disabled).
+    client.drain_all_events();
+    let mut u = get_db_user(&pool, "ldapuser").await;
+    u.set_password("temppass");
+    u.save(&pool).await.unwrap();
+
+    client.login_user("ldapuser", "temppass").await;
+    let response = client
+        .put("/api/v1/user/change_password")
+        .json(&PasswordChangeSelf {
+            old_password: "temppass".into(),
+            new_password: "NewPass456!".into(),
+        })
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let ldap_user = get_db_user(&pool, "ldapuser").await;
+    client.verify_api_events_with_user(&[(
+        ApiEventType::PasswordChanged,
+        ldap_user.id,
+        "ldapuser",
+    )]);
+}
+
+/// An admin user is always exempt from password-management gating, even when sourced externally.
+#[sqlx::test]
+async fn test_password_management_disabled_admin_exempt(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (mut client, pool) = make_client_with_db(pool).await;
+
+    // Make the admin user appear LDAP-sourced, then enable the LDAP disable flag.
+    // Admin keeps their local password so they can still authenticate;
+    // the is_admin check in the helper runs before the password_hash check,
+    // so having a password hash does not weaken the test.
+    let admin = get_db_user(&pool, "admin").await;
+    sqlx::query("UPDATE \"user\" SET from_ldap = true WHERE id = $1")
+        .bind(admin.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut settings = Settings::get_current_settings();
+    settings.ldap_disable_password_management = true;
+    update_current_settings(&pool, settings).await.unwrap();
+
+    // Admin should still be able to change someone else's password.
+    client.login_user("admin", "pass123").await;
+    let response = client
+        .put("/api/v1/user/hpotter/password")
+        .json(&PasswordChange {
+            new_password: "NewPass789!".into(),
+        })
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let hpotter = get_db_user(&pool, "hpotter").await;
+    client.verify_api_events_with_user(&[(
+        ApiEventType::PasswordChangedByAdmin { user: hpotter },
+        1,
+        "admin",
+    )]);
+}
+
+/// A user with a local password hash is always allowed, even if externally sourced.
+#[sqlx::test]
+async fn test_password_management_disabled_allowed_with_local_password(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (mut client, pool) = make_client_with_db(pool).await;
+
+    // hpotter is a local user with a password => change_self_password should work.
+    client.login_user("hpotter", "pass123").await;
+    let response = client
+        .put("/api/v1/user/change_password")
+        .json(&PasswordChangeSelf {
+            old_password: "pass123".into(),
+            new_password: "NewPass000!".into(),
+        })
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let hpotter = get_db_user(&pool, "hpotter").await;
+    client.verify_api_events_with_user(&[(ApiEventType::PasswordChanged, hpotter.id, "hpotter")]);
+}
+
+/// Password management is disabled for an OIDC-sourced non-admin user when the provider flag is on.
+#[sqlx::test]
+async fn test_password_management_disabled_for_oidc_user(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (mut client, pool) = make_client_with_db(pool).await;
+
+    // Create an OIDC provider with disable_password_management enabled.
+    OpenIdProvider::new(
+        "test-oidc".to_owned(),
+        "https://example.com".to_owned(),
+        OpenIdProviderKind::Custom,
+        "client-id".to_owned(),
+        "client-secret".to_owned(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        600,
+        DirectorySyncUserBehavior::Keep,
+        DirectorySyncUserBehavior::Keep,
+        DirectorySyncTarget::All,
+        None,
+        None,
+        Vec::new(),
+        None,
+        false,
+        true, // disable_password_management
+        None, // directory_sync_user_groups
+    )
+    .save(&pool)
+    .await
+    .unwrap();
+
+    // Create an OIDC-sourced user with no local password.
+    let oidc_user = User::new("oidcuser", None, "OIDC", "User", "oidc@example.com", None)
+        .save(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE \"user\" SET openid_sub = $1, password_hash = NULL WHERE id = $2")
+        .bind("sub-123")
+        .bind(oidc_user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Login as admin to exercise admin-level password operations on the OIDC user.
+    client.login_user("admin", "pass123").await;
+
+    // change_password -> 403
+    let response = client
+        .put("/api/v1/user/oidcuser/password")
+        .json(&PasswordChange {
+            new_password: "NewPass123!".into(),
+        })
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // reset_password -> 403
+    let response = client
+        .post("/api/v1/user/oidcuser/reset_password")
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }

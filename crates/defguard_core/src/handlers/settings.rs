@@ -12,6 +12,7 @@ use defguard_common::{
             settings::{LdapSyncStatus, SettingsPatch, update_current_settings},
         },
     },
+    types::proxy::ProxyControlMessage,
 };
 use sqlx::PgPool;
 use struct_patch::Patch;
@@ -20,7 +21,12 @@ use super::{ApiResponse, ApiResult};
 use crate::{
     AppState,
     auth::{AdminRole, SessionInfo},
-    enterprise::{handlers::LicenseInfo, ldap::LDAPConnection, license::update_cached_license},
+    enterprise::{
+        db::models::enterprise_settings::EnterpriseSettings,
+        handlers::LicenseInfo,
+        ldap::{LDAPConnection, sync::Authority},
+        license::update_cached_license,
+    },
     error::WebError,
     events::{ApiEvent, ApiEventType, ApiRequestContext},
 };
@@ -81,6 +87,24 @@ pub(crate) async fn update_settings(
 
     update_current_settings(&appstate.pool, data).await?;
     update_cached_license(license.as_deref())?;
+
+    // If SMTP configuration changed (e.g. server/port/sender toggled),
+    // push updated password-reset visibility to all connected proxies.
+    if before.smtp_configured() != after.smtp_configured()
+        && let Ok(enterprise_settings) = EnterpriseSettings::get(&appstate.pool).await
+    {
+        let display_password_reset = enterprise_settings.edge_can_display_password_reset();
+        if let Err(err) = appstate
+            .proxy_control_tx
+            .send(ProxyControlMessage::BroadcastPublicSettings {
+                display_password_reset,
+                display_download_step: enterprise_settings.display_download_step,
+            })
+            .await
+        {
+            error!("Failed to broadcast PublicSettings after SMTP config change: {err:?}");
+        }
+    }
 
     info!("User {} updated settings", session.user.username);
     appstate.emit_event(ApiEvent {
@@ -191,6 +215,24 @@ pub async fn patch_settings(
         debug!("Updated cached license after saving settings patch");
     }
 
+    // If SMTP configuration changed (e.g. server/port/sender toggled),
+    // push updated password-reset visibility to all connected proxies.
+    if before.smtp_configured() != after.smtp_configured()
+        && let Ok(enterprise_settings) = EnterpriseSettings::get(&appstate.pool).await
+    {
+        let display_password_reset = enterprise_settings.edge_can_display_password_reset();
+        if let Err(err) = appstate
+            .proxy_control_tx
+            .send(ProxyControlMessage::BroadcastPublicSettings {
+                display_password_reset,
+                display_download_step: enterprise_settings.display_download_step,
+            })
+            .await
+        {
+            error!("Failed to broadcast PublicSettings after SMTP config change: {err:?}");
+        }
+    }
+
     info!("Admin {} patched settings", session.user.username);
     appstate.emit_event(ApiEvent {
         context,
@@ -211,6 +253,60 @@ pub(crate) async fn test_ldap_settings(_admin: AdminRole, _license: LicenseInfo)
         }
         Err(err) => {
             debug!("LDAP connection rejected: {err}");
+            Ok(ApiResponse::with_status(StatusCode::BAD_REQUEST))
+        }
+    }
+}
+
+/// Tests the LDAP connection using the provided (not yet saved) settings.
+pub(crate) async fn test_submitted_ldap_settings(
+    _admin: AdminRole,
+    _license: LicenseInfo,
+    Json(settings): Json<Settings>,
+) -> ApiResult {
+    debug!("Testing LDAP connection with provided settings");
+    match LDAPConnection::create_with_settings(settings).await {
+        Ok(_) => {
+            debug!("LDAP connected successfully");
+            Ok(ApiResponse::with_status(StatusCode::OK))
+        }
+        Err(err) => {
+            debug!("LDAP connection rejected: {err}");
+            Ok(ApiResponse::with_status(StatusCode::BAD_REQUEST))
+        }
+    }
+}
+
+/// Previews the user changes a full LDAP sync would make using the provided (not yet saved)
+/// settings. This is strictly read-only: nothing is imported, removed or persisted.
+pub(crate) async fn ldap_dry_run(
+    _admin: AdminRole,
+    _license: LicenseInfo,
+    State(appstate): State<AppState>,
+    Json(settings): Json<Settings>,
+) -> ApiResult {
+    debug!("Performing LDAP dry run with provided settings");
+    let authority = if settings.ldap_is_authoritative {
+        Authority::LDAP
+    } else {
+        Authority::Defguard
+    };
+
+    let mut connection = match LDAPConnection::create_with_settings(settings).await {
+        Ok(connection) => connection,
+        Err(err) => {
+            debug!("LDAP dry run connection rejected: {err}");
+            return Ok(ApiResponse::with_status(StatusCode::BAD_REQUEST));
+        }
+    };
+
+    match connection.dry_run(&appstate.pool, authority).await {
+        Ok(result) => {
+            debug!("LDAP dry run completed successfully");
+            Ok(ApiResponse::json(result, StatusCode::OK))
+        }
+        Err(err) => {
+            debug!("LDAP dry run failed: {err}");
             Ok(ApiResponse::with_status(StatusCode::BAD_REQUEST))
         }
     }

@@ -1,12 +1,20 @@
-use defguard_common::db::models::{
-    Settings,
-    settings::{SettingsPatch, update_current_settings},
+use std::{str::FromStr, time::Duration};
+
+use defguard_common::{
+    db::models::{
+        Settings,
+        settings::{SettingsPatch, update_current_settings},
+    },
+    secret::SecretStringWrapper,
+    types::proxy::ProxyControlMessage,
 };
 use defguard_core::handlers::Auth;
 use reqwest::StatusCode;
+use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use tokio::time::sleep;
 
-use super::common::{make_test_client, setup_pool};
+use super::common::{exceed_enterprise_limits, make_test_client, setup_pool};
 
 #[sqlx::test]
 async fn test_settings(_: PgPoolOptions, options: PgConnectOptions) {
@@ -22,7 +30,7 @@ async fn test_settings(_: PgPoolOptions, options: PgConnectOptions) {
     let mut settings: Settings = response.json().await;
     // modify settings
     settings.wireguard_enabled = false;
-    settings.challenge_template = "Modified".to_string();
+    settings.challenge_template = "Modified".to_owned();
     let response = client.put("/api/v1/settings").json(&settings).send().await;
     assert_eq!(response.status(), StatusCode::OK);
     // verify modified settings
@@ -117,7 +125,7 @@ async fn test_patch_settings_clears_optional_fields(_: PgPoolOptions, options: P
     let from_db = Settings::get(&pool).await.unwrap().unwrap();
     assert_eq!(
         from_db.ldap_user_rdn_attr,
-        Some("uid".to_string()),
+        Some("uid".to_owned()),
         "ldap_user_rdn_attr should be set after PATCH"
     );
 
@@ -132,6 +140,35 @@ async fn test_patch_settings_clears_optional_fields(_: PgPoolOptions, options: P
         from_db.ldap_user_rdn_attr.is_none(),
         "ldap_user_rdn_attr should be cleared to None after PATCH with null"
     );
+}
+
+#[sqlx::test]
+async fn test_mail_reports_smtp_failure(_: PgPoolOptions, options: PgConnectOptions) {
+    let pool = setup_pool(options).await;
+    let (client, _client_state) = make_test_client(pool).await;
+
+    let auth = Auth::new("admin", "pass123");
+    let response = client.post("/api/v1/auth").json(&auth).send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // point SMTP at an unreachable server so the send fails deterministically
+    let patch: SettingsPatch = serde_json::from_str(
+        r#"{
+            "smtp_server": "127.0.0.1",
+            "smtp_port": 1,
+            "smtp_sender": "noreply@example.com"
+        }"#,
+    )
+    .unwrap();
+    let response = client.patch("/api/v1/settings").json(&patch).send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = client
+        .post("/api/v1/mail/test")
+        .json(&json!({ "to": "recipient@example.com" }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 // JSON fragment containing all required LDAP fields except ldap_url (add that at the call site).
@@ -190,6 +227,54 @@ async fn test_ldap_settings_validation(_: PgPoolOptions, options: PgConnectOptio
         response.status(),
         StatusCode::OK,
         "enabling LDAP with all required fields should return 200"
+    );
+}
+
+#[sqlx::test]
+async fn test_ldap_connection_test_with_submitted_settings(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (client, _client_state) = make_test_client(pool).await;
+
+    let auth = Auth::new("admin", "pass123");
+    let response = client.post("/api/v1/auth").json(&auth).send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = client.get("/api/v1/settings").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved_settings: Settings = response.json().await;
+
+    let mut submitted = saved_settings.clone();
+    submitted.ldap_url = Some("ldap://127.0.0.1:1".to_owned());
+    submitted.ldap_bind_username = Some("cn=admin,dc=example,dc=com".to_owned());
+    submitted.ldap_bind_password = Some(SecretStringWrapper::from_str("secret").unwrap());
+    submitted.ldap_username_attr = Some("uid".to_owned());
+    submitted.ldap_user_search_base = Some("ou=users,dc=example,dc=com".to_owned());
+    submitted.ldap_user_obj_class = Some("inetOrgPerson".to_owned());
+    submitted.ldap_member_attr = Some("memberUid".to_owned());
+    submitted.ldap_groupname_attr = Some("cn".to_owned());
+    submitted.ldap_group_obj_class = Some("posixGroup".to_owned());
+    submitted.ldap_group_member_attr = Some("memberUid".to_owned());
+    submitted.ldap_group_search_base = Some("ou=groups,dc=example,dc=com".to_owned());
+    let response = client
+        .post("/api/v1/ldap/test")
+        .json(&submitted)
+        .send()
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "connection test against an unreachable server should return 400"
+    );
+
+    let response = client.get("/api/v1/settings").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let settings_after: Settings = response.json().await;
+    assert_eq!(
+        settings_after, saved_settings,
+        "the connection test must not save the submitted settings"
     );
 }
 
@@ -299,5 +384,70 @@ async fn test_ldap_remote_enrollment_validation(_: PgPoolOptions, options: PgCon
     assert!(
         from_db.ldap_remote_enrollment_send_invite,
         "ldap_remote_enrollment_send_invite must be persisted to DB after enabling"
+    );
+}
+
+/// When SMTP settings change from unconfigured to configured via the settings
+/// API, a `BroadcastPublicSettings` control message must be sent so connected
+/// proxies receive the updated password-reset visibility.
+///
+/// The `display_password_reset` in the broadcast is the folded value
+/// (`enterprise_toggle && smtp_configured()`).
+#[sqlx::test]
+async fn test_smtp_change_triggers_public_settings_broadcast(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (client, client_state) = make_test_client(pool).await;
+    let mut proxy_control_rx = client_state.proxy_control_rx;
+
+    exceed_enterprise_limits(&client).await;
+
+    // Drain any messages sent during setup (e.g. from app startup).
+    while proxy_control_rx.try_recv().is_ok() {}
+
+    // Patch settings to enable SMTP.  Previously SMTP is unconfigured, so
+    // smtp_configured() transitions from false → true and the handler must
+    // broadcast the updated public settings.
+    let settings = json!({
+        "smtp_server": "smtp.example.com",
+        "smtp_port": 587,
+        "smtp_sender": "noreply@example.com",
+    });
+    let response = client
+        .patch("/api/v1/settings")
+        .json(&settings)
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Allow the async broadcast to land.
+    sleep(Duration::from_millis(100)).await;
+
+    let mut found = false;
+    loop {
+        match proxy_control_rx.try_recv() {
+            Ok(ProxyControlMessage::BroadcastPublicSettings {
+                display_password_reset,
+                display_download_step,
+            }) => {
+                assert!(
+                    display_password_reset,
+                    "with SMTP configured, display_password_reset should be true"
+                );
+                assert!(
+                    display_download_step,
+                    "display_download_step should remain the enterprise default"
+                );
+                found = true;
+            }
+            Ok(_) => {} // ignore other control messages
+            Err(_) => break,
+        }
+    }
+    assert!(
+        found,
+        "BroadcastPublicSettings should have been sent after SMTP config change"
     );
 }

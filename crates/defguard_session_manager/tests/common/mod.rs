@@ -6,7 +6,7 @@ use std::{
 use chrono::{NaiveDateTime, TimeDelta, Timelike, Utc};
 use defguard_common::{
     db::{
-        Id,
+        Id, NoId,
         models::{
             Device, DeviceType, User, WireguardNetwork,
             device::WireguardNetworkDevice,
@@ -16,7 +16,11 @@ use defguard_common::{
             wireguard::{LocationMfaMode, ServiceLocationMode},
         },
     },
+    gateway_event::GatewayCommand,
     messages::peer_stats_update::PeerStatsUpdate,
+};
+use defguard_core::enterprise::db::models::device_posture::{
+    DevicePosture, DevicePostureLocation, DevicePostureOsRule, OsType,
 };
 use defguard_session_manager::{
     IterationOutcome, SESSION_UPDATE_INTERVAL, SessionManager, events::SessionManagerEvent,
@@ -37,7 +41,7 @@ pub(crate) struct SessionManagerHarness {
     stats_tx: mpsc::UnboundedSender<PeerStatsUpdate>,
     pub(crate) stats_rx: mpsc::UnboundedReceiver<PeerStatsUpdate>,
     pub(crate) event_rx: mpsc::UnboundedReceiver<SessionManagerEvent>,
-    pub(crate) gateway_rx: broadcast::Receiver<defguard_core::grpc::GatewayEvent>,
+    pub(crate) gateway_rx: broadcast::Receiver<GatewayCommand>,
 }
 
 pub(crate) fn assert_no_session_manager_events(harness: &mut SessionManagerHarness) {
@@ -121,12 +125,13 @@ pub(crate) async fn create_location_with_mfa_mode(
     location_mfa_mode: LocationMfaMode,
 ) -> WireguardNetwork<Id> {
     WireguardNetwork::new(
-        "TestNet".to_string(),
+        "TestNet".to_owned(),
         51820,
-        "10.0.0.1".to_string(),
+        "10.0.0.1".to_owned(),
         None,
         vec![IpNetwork::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap()],
         true,
+        false,
         false,
         false,
         location_mfa_mode,
@@ -163,8 +168,8 @@ pub(crate) async fn create_device_with_pubkey(
     wireguard_pubkey: &str,
 ) -> Device<Id> {
     Device::new(
-        "session-test-device".to_string(),
-        wireguard_pubkey.to_string(),
+        "session-test-device".to_owned(),
+        wireguard_pubkey.to_owned(),
         user_id,
         DeviceType::User,
         None,
@@ -187,6 +192,45 @@ pub(crate) async fn attach_device_to_location(pool: &PgPool, location_id: Id, de
         .expect("failed to attach device to location");
 }
 
+pub(crate) async fn enable_linux_posture_for_location(pool: &PgPool, location_id: Id) {
+    let policy = DevicePosture {
+        id: NoId,
+        name: "session-manager-test-posture".to_owned(),
+        description: None,
+        min_desktop_client_version: None,
+        min_mobile_client_version: None,
+        allow_prerelease_client: true,
+    }
+    .save(pool)
+    .await
+    .expect("failed to save posture policy");
+
+    DevicePostureOsRule {
+        id: NoId,
+        posture_id: policy.id,
+        os_type: OsType::Linux,
+        min_os_version: None,
+        disk_encryption_required: Some(true),
+        antivirus_required: None,
+        ad_domain_joined_required: None,
+        windows_security_update_max_age: None,
+        min_kernel_version: None,
+        device_integrity_required: None,
+        android_security_patch_level_max_age: None,
+    }
+    .save(pool)
+    .await
+    .expect("failed to save posture OS rule");
+
+    DevicePostureLocation::set_for_location(
+        &mut pool.acquire().await.expect("failed to acquire connection"),
+        location_id,
+        &[policy.id],
+    )
+    .await
+    .expect("failed to assign posture policy to location");
+}
+
 pub(crate) async fn create_gateway(
     pool: &PgPool,
     location_id: Id,
@@ -203,8 +247,8 @@ pub(crate) async fn create_gateway_named(
 ) -> Gateway<Id> {
     Gateway::new(
         location_id,
-        name.to_string(),
-        "127.0.0.1".to_string(),
+        name.to_owned(),
+        "127.0.0.1".to_owned(),
         51820,
         modified_by,
     )
@@ -227,7 +271,7 @@ pub(crate) async fn authorize_device_in_location(
         Some(truncate_timestamp(chrono::Utc::now().naive_utc())),
         Some(VpnClientMfaMethod::Totp),
     );
-    session.preshared_key = Some(preshared_key.to_string());
+    session.preshared_key = Some(preshared_key.to_owned());
     session.state = VpnClientSessionState::Connected;
     session
         .save(pool)

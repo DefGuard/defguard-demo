@@ -20,7 +20,11 @@
                 "defguard",
                 "client",
                 "vpn",
-                "enrollment"
+                "enrollment",
+                "posture",
+                "active_directory",
+                "ldap",
+                "oidc_directory_sync"
               ]
             }
           }

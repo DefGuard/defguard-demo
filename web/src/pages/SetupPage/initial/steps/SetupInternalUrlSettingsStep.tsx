@@ -1,7 +1,10 @@
 import { useMutation } from '@tanstack/react-query';
+import type { AxiosError } from 'axios';
 import z from 'zod';
 import { m } from '../../../../paraglide/messages';
 import api from '../../../../shared/api/api';
+import { getApiErrorMessage } from '../../../../shared/api/apiErrorMessages';
+import type { ApiError } from '../../../../shared/api/types';
 import { Controls } from '../../../../shared/components/Controls/Controls';
 import { WizardCard } from '../../../../shared/components/wizard/WizardCard/WizardCard';
 import { Button } from '../../../../shared/defguard-ui/components/Button/Button';
@@ -47,7 +50,7 @@ export const SetupInternalUrlSettingsStep = () => {
 
   const { mutate, isPending } = useMutation({
     mutationFn: api.initial_setup.setAutoAdoptionInternalUrlSettings,
-    meta: { invalidate: ['setupStatus'] },
+    meta: { invalidate: [['info'], ['internal_ssl_info']] },
     onSuccess: (response) => {
       useSetupWizardStore.setState({
         internal_ssl_type: form.getFieldValue('ssl_type'),
@@ -55,8 +58,15 @@ export const SetupInternalUrlSettingsStep = () => {
       });
       setActiveStep(SetupPageStep.InternalUrlSslConfig);
     },
-    onError: (error) => {
-      Snackbar.error(m.initial_setup_general_config_error_save_failed());
+    onError: (error: AxiosError<ApiError>) => {
+      const code = error.response?.data?.code;
+      const fallback =
+        error.response?.data?.msg ?? m.initial_setup_general_config_error_save_failed();
+      if (code) {
+        Snackbar.error(getApiErrorMessage(code, fallback));
+      } else {
+        Snackbar.error(fallback);
+      }
       console.error('Failed to save internal URL settings:', error);
     },
   });

@@ -17,6 +17,7 @@ use defguard_common::{
             settings::{initialize_current_settings, update_current_settings},
         },
     },
+    gateway_event::GatewayCommand,
     messages::peer_stats_update::PeerStatsUpdate,
     types::proxy::ProxyControlMessage,
 };
@@ -31,14 +32,13 @@ use defguard_core::{
     },
     events::{ApiEvent, BidiStreamEvent},
     gateway_config,
-    grpc::{GatewayEvent, WorkerState, run_grpc_server},
+    grpc::{WorkerState, run_grpc_server},
     init_dev_env, init_vpn_location, run_web_server,
     setup_logs::CoreSetupLogLayer,
     utility_thread::run_utility_thread,
     version::IncompatibleComponents,
 };
-use defguard_event_logger::{message::EventLoggerMessage, run_event_logger};
-use defguard_event_router::{RouterReceiverSet, run_event_router};
+use defguard_event_logger::run_event_logger;
 use defguard_gateway_manager::{GatewayManager, GatewayTxSet};
 use defguard_proxy_manager::{ProxyManager, ProxyTxSet};
 use defguard_session_manager::{events::SessionManagerEvent, run_session_manager};
@@ -207,6 +207,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let (bidi_event_tx, bidi_event_rx) = unbounded_channel::<BidiStreamEvent>();
     let (session_manager_event_tx, session_manager_event_rx) =
         unbounded_channel::<SessionManagerEvent>();
+    let (ldap_tx, ldap_rx) = unbounded_channel();
+    let (dirsync_tx, dirsync_rx) = unbounded_channel();
 
     // Activity log stream setup
     let (activity_log_messages_tx, activity_log_messages_rx) = broadcast::channel::<Bytes>(100);
@@ -215,8 +217,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // setup communication channels for services
     let (webhook_tx, webhook_rx) = unbounded_channel::<AppEvent>();
     // RX is discarded here since it can be derived from TX later on
-    let (gateway_tx, _gateway_rx) = broadcast::channel::<GatewayEvent>(256);
-    let (event_logger_tx, event_logger_rx) = unbounded_channel::<EventLoggerMessage>();
+    let (gateway_tx, _gateway_rx) = broadcast::channel::<GatewayCommand>(256);
     let (peer_stats_tx, peer_stats_rx) = unbounded_channel::<PeerStatsUpdate>();
 
     let worker_state = Arc::new(Mutex::new(WorkerState::new(webhook_tx.clone())));
@@ -249,7 +250,13 @@ async fn main() -> Result<(), anyhow::Error> {
     let proxy_secret_key = settings.secret_key_required()?;
     let proxy_manager = ProxyManager::new(
         pool.clone(),
-        ProxyTxSet::new(gateway_tx.clone(), bidi_event_tx.clone()),
+        ProxyTxSet::new(
+            gateway_tx.clone(),
+            bidi_event_tx.clone(),
+            ldap_tx.clone(),
+            dirsync_tx.clone(),
+            api_event_tx.clone(),
+        ),
         Arc::clone(&incompatible_components),
         proxy_control_rx,
         proxy_secret_key,
@@ -287,6 +294,8 @@ async fn main() -> Result<(), anyhow::Error> {
             pool.clone(),
             failed_logins,
             api_event_tx,
+            ldap_tx.clone(),
+            dirsync_tx.clone(),
             incompatible_components,
             proxy_control_tx.clone()
         ) => bail!("Web server returned early: {res:?}"),
@@ -298,20 +307,18 @@ async fn main() -> Result<(), anyhow::Error> {
             bail!("Periodic stats purge task returned early: {res:?}"),
         res = run_periodic_license_check(&pool, proxy_control_tx.clone()) =>
             bail!("Periodic license check task returned early: {res:?}"),
-        res = run_utility_thread(&pool, gateway_tx.clone(), proxy_control_tx, web_reload_tx.clone()) =>
+        res = run_utility_thread(&pool, gateway_tx.clone(), proxy_control_tx, web_reload_tx.clone(), ldap_tx, dirsync_tx) =>
             bail!("Utility thread returned early: {res:?}"),
-        res = run_event_router(
-            RouterReceiverSet::new(
-                api_event_rx,
-                bidi_event_rx,
-                session_manager_event_rx
-            ),
-            event_logger_tx,
-            gateway_tx.clone(),
-            activity_log_stream_reload_notify.clone()
-        ) => bail!("Event router returned early: {res:?}"),
-        res = run_event_logger(pool.clone(), event_logger_rx, activity_log_messages_tx.clone()) =>
-            bail!("Activity log event logger returned early: {res:?}"),
+        res = run_event_logger(
+            pool.clone(),
+            api_event_rx,
+            bidi_event_rx,
+            session_manager_event_rx,
+            ldap_rx,
+            dirsync_rx,
+            activity_log_stream_reload_notify.clone(),
+            activity_log_messages_tx.clone()
+        ) => bail!("Activity log event logger returned early: {res:?}"),
         res = run_activity_log_stream_manager(
             pool.clone(),
             activity_log_stream_reload_notify.clone(),

@@ -9,12 +9,15 @@ use rsa::{
     RsaPrivateKey,
     pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey},
     pkcs8::{DecodePrivateKey, LineEnding},
-    traits::PublicKeyParts,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 
-use crate::{VERSION, db::models::Settings};
+use crate::{
+    VERSION,
+    db::{Id, models::Settings},
+    rsa_jwk_thumbprint,
+};
 
 pub static SERVER_CONFIG: OnceLock<DefGuardConfig> = OnceLock::new();
 
@@ -249,13 +252,13 @@ pub struct InitVpnLocationArgs {
     #[arg(long)]
     pub allowed_ips: Vec<IpNetwork>,
     #[arg(long)]
-    pub id: Option<i64>,
+    pub id: Option<Id>,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct GatewayConfigArgs {
     #[arg(long)]
-    pub location_id: i64,
+    pub location_id: Id,
 }
 
 impl DefGuardConfig {
@@ -278,13 +281,13 @@ impl DefGuardConfig {
             reason = "Test config still initializes compatibility-only deprecated fields"
         )]
         let config = Self {
-            log_level: "info".to_string(),
+            log_level: "info".to_owned(),
             log_file: None,
             secret_key: None,
-            database_host: "localhost".to_string(),
+            database_host: "localhost".to_owned(),
             database_port: 5432,
-            database_name: "defguard".to_string(),
-            database_user: "defguard".to_string(),
+            database_name: "defguard".to_owned(),
+            database_user: "defguard".to_owned(),
             database_password: SecretString::from(String::new()),
             http_port: 8000,
             grpc_port: 50055,
@@ -330,11 +333,11 @@ impl DefGuardConfig {
             (Some(_), None) => Err("--adopt-edge (DEFGUARD_ADOPT_EDGE) was provided but \
                 --adopt-gateway (DEFGUARD_ADOPT_GATEWAY) is missing. \
                 Both flags must be provided together to launch the auto-adoption wizard."
-                .to_string()),
+                .to_owned()),
             (None, Some(_)) => Err("--adopt-gateway (DEFGUARD_ADOPT_GATEWAY) was provided but \
                 --adopt-edge (DEFGUARD_ADOPT_EDGE) is missing. \
                 Both flags must be provided together to launch the auto-adoption wizard."
-                .to_string()),
+                .to_owned()),
             _ => Ok(()),
         }
     }
@@ -354,7 +357,7 @@ impl DefGuardConfig {
         #[allow(deprecated)]
         let key = self.openid_signing_key.as_ref()?;
         if let Ok(pem) = key.to_pkcs1_pem(LineEnding::default()) {
-            let key_id = JsonWebKeyId::new(key.n().to_str_radix(36));
+            let key_id = JsonWebKeyId::new(rsa_jwk_thumbprint(key));
             CoreRsaPrivateSigningKey::from_pem(pem.as_ref(), Some(key_id)).ok()
         } else {
             None
@@ -380,8 +383,8 @@ mod tests {
 
     fn make_config(adopt_edge: Option<&str>, adopt_gateway: Option<&str>) -> DefGuardConfig {
         let mut config = DefGuardConfig::new_test_config();
-        config.adopt_edge = adopt_edge.map(str::to_string);
-        config.adopt_gateway = adopt_gateway.map(str::to_string);
+        config.adopt_edge = adopt_edge.map(str::to_owned);
+        config.adopt_gateway = adopt_gateway.map(str::to_owned);
         config
     }
 

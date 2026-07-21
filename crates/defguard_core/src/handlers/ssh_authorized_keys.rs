@@ -26,7 +26,7 @@ pub(crate) struct AuthenticationKeyInfo {
     key: String,
     user_id: Id,
     yubikey_serial: Option<String>,
-    yubikey_id: Option<i64>,
+    yubikey_id: Option<Id>,
     yubikey_name: Option<String>,
 }
 
@@ -198,7 +198,7 @@ pub async fn add_authentication_key(
 
     let key = AuthenticationKey::new(
         user.id,
-        trimmed_key.to_string(),
+        trimmed_key.to_owned(),
         Some(data.name.clone()),
         data.key_type.clone(),
         None,

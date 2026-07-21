@@ -20,7 +20,7 @@ const defaults: StoreValues = {
     },
     network_present: false,
     smtp_enabled: false,
-    version: '',
+    version: null,
     demo_mode: false,
   },
   settingsEssentials: undefined,

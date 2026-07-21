@@ -22,6 +22,7 @@ use defguard_common::{
         },
     },
     secret::SecretStringWrapper,
+    types::proxy::ProxyControlMessage,
 };
 use defguard_core::{
     apply_security_layers,
@@ -30,7 +31,7 @@ use defguard_core::{
     db::AppEvent,
     enterprise::license::{License, LicenseTier, SupportType, set_cached_license},
     events::ApiEvent,
-    grpc::{GatewayEvent, WorkerState},
+    grpc::{GatewayCommand, WorkerState},
     handlers::{Auth, user::UserDetails},
 };
 use reqwest::{StatusCode, header::HeaderName};
@@ -40,7 +41,7 @@ use tokio::{
     net::TcpListener,
     sync::{
         broadcast::{self, Receiver},
-        mpsc::{channel, unbounded_channel},
+        mpsc::{self, channel, unbounded_channel},
     },
 };
 
@@ -60,7 +61,8 @@ pub const X_FORWARDED_URI: HeaderName = HeaderName::from_static("x-forwarded-uri
 pub(crate) struct ClientState {
     pub pool: PgPool,
     pub worker_state: Arc<Mutex<WorkerState>>,
-    pub wireguard_rx: Receiver<GatewayEvent>,
+    pub gateway_rx: Receiver<GatewayCommand>,
+    pub proxy_control_rx: mpsc::Receiver<ProxyControlMessage>,
     pub test_user: User<Id>,
     #[allow(dead_code)]
     pub config: DefGuardConfig,
@@ -70,14 +72,16 @@ impl ClientState {
     pub fn new(
         pool: PgPool,
         worker_state: Arc<Mutex<WorkerState>>,
-        wireguard_rx: Receiver<GatewayEvent>,
+        gateway_rx: Receiver<GatewayCommand>,
+        proxy_control_rx: mpsc::Receiver<ProxyControlMessage>,
         test_user: User<Id>,
         config: DefGuardConfig,
     ) -> Self {
         Self {
             pool,
             worker_state,
-            wireguard_rx,
+            gateway_rx,
+            proxy_control_rx,
             test_user,
             config,
         }
@@ -92,13 +96,13 @@ pub(crate) async fn make_base_client(
     let (api_event_tx, api_event_rx) = unbounded_channel::<ApiEvent>();
     let (tx, rx) = unbounded_channel::<AppEvent>();
     let worker_state = Arc::new(Mutex::new(WorkerState::new(tx.clone())));
-    let (wg_tx, wg_rx) = broadcast::channel::<GatewayEvent>(16);
+    let (gateway_tx, gateway_rx) = broadcast::channel::<GatewayCommand>(16);
 
     let failed_logins = FailedLoginMap::new();
     let failed_logins = Arc::new(Mutex::new(failed_logins));
 
     let license = License::new(
-        "test_customer".to_string(),
+        "test_customer".to_owned(),
         false,
         // Permanent license
         None,
@@ -106,22 +110,24 @@ pub(crate) async fn make_base_client(
         None,
         LicenseTier::Business,
         SupportType::Basic,
+        vec![],
     );
 
     set_cached_license(Some(license));
 
+    let (proxy_control_tx, proxy_control_rx) = channel(10);
+
     let client_state = ClientState::new(
         pool.clone(),
         worker_state.clone(),
-        wg_rx,
+        gateway_rx,
+        proxy_control_rx,
         User::find_by_username(&pool, "hpotter")
             .await
             .unwrap()
             .unwrap(),
         config.clone(),
     );
-
-    let (proxy_control_tx, _proxy_control_rx) = channel(10);
 
     // Uncomment this to enable tracing in tests.
     // It only works for running a single test, so leave it commented out for running all tests.
@@ -141,18 +147,22 @@ pub(crate) async fn make_base_client(
             .as_bytes(),
     );
     let (web_reload_tx, _web_reload_rx) = broadcast::channel::<()>(8);
+    let (ldap_tx, _ldap_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (dirsync_tx, _dirsync_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let tls_active = Arc::new(AtomicBool::new(false));
     let webapp = build_webapp(
         tx,
         rx,
-        wg_tx,
+        gateway_tx,
         web_reload_tx,
         worker_state,
         pool,
         key,
         failed_logins,
         api_event_tx,
+        ldap_tx,
+        dirsync_tx,
         Arc::default(),
         proxy_control_tx,
         Arc::clone(&tls_active),
@@ -228,6 +238,8 @@ pub(crate) async fn make_network(client: &TestClient, name: &str) -> TestRespons
             "peer_disconnect_threshold": 300,
             "acl_enabled": false,
             "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
+            "allowed_ips_from_acl": false,
             "location_mfa_mode": "disabled",
             "service_location_mode": "disabled"
         }))
@@ -275,7 +287,7 @@ pub(crate) async fn get_db_device(pool: &PgPool, device_id: Id) -> Device<Id> {
 pub(crate) fn generate_test_cert_pem(common_name: &str) -> (String, String) {
     let ca = CertificateAuthority::new("Test CA", "test@example.com", 365).unwrap();
     let key_pair = generate_key_pair().unwrap();
-    let san = vec![common_name.to_string()];
+    let san = vec![common_name.to_owned()];
     let dn = vec![(DnType::CommonName, common_name)];
     let csr = Csr::new(&key_pair, &san, dn).unwrap();
     let cert = ca.sign_server_cert(&csr).unwrap();
@@ -287,7 +299,7 @@ pub(crate) fn generate_test_cert_pem(common_name: &str) -> (String, String) {
 pub(crate) fn generate_expired_test_cert_pem(common_name: &str) -> (String, String) {
     let ca = CertificateAuthority::new("Test CA", "test@example.com", 365).unwrap();
     let key_pair = generate_key_pair().unwrap();
-    let san = vec![common_name.to_string()];
+    let san = vec![common_name.to_owned()];
     let dn = vec![(DnType::CommonName, common_name)];
     let csr = Csr::new(&key_pair, &san, dn).unwrap();
     let cert = ca
@@ -313,13 +325,14 @@ pub(crate) async fn setup_ca(pool: &PgPool) {
 /// Override the global license cache with an Enterprise-tier license.
 pub(crate) fn set_enterprise_license() {
     set_cached_license(Some(License::new(
-        "test_customer".to_string(),
+        "test_customer".to_owned(),
         false,
         None,
         None,
         None,
         LicenseTier::Enterprise,
         SupportType::Basic,
+        vec![],
     )));
 }
 

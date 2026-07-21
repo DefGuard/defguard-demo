@@ -1,3 +1,5 @@
+pub mod gateway_conversions;
+
 use std::fmt;
 
 mod generated {
@@ -24,6 +26,11 @@ mod generated {
             pub mod firewall {
                 pub mod v2 {
                     tonic::include_proto!("defguard.enterprise.firewall.v2");
+                }
+            }
+            pub mod posture {
+                pub mod v2 {
+                    tonic::include_proto!("defguard.enterprise.posture.v2");
                 }
             }
         }
@@ -56,6 +63,9 @@ pub mod enterprise {
     pub mod firewall {
         pub use crate::generated::defguard::enterprise::firewall::v2::*;
     }
+    pub mod posture {
+        pub use crate::generated::defguard::enterprise::posture::v2::*;
+    }
 }
 
 pub mod client_types {
@@ -77,15 +87,13 @@ use defguard_common::{
             wireguard::{LocationMfaMode, ServiceLocationMode},
         },
     },
+    gateway_types::{FirewallConfig, WireguardPeer},
 };
 use proxy::CoreError;
 use serde::Serialize;
 use tonic::Status;
 
-use crate::{
-    enterprise::firewall::FirewallConfig,
-    gateway::{Configuration, Peer},
-};
+use crate::gateway::Configuration;
 
 // Client MFA methods
 impl fmt::Display for MfaMethod {
@@ -120,11 +128,11 @@ impl Serialize for MfaMethod {
 impl From<MfaMethod> for VpnClientMfaMethod {
     fn from(val: MfaMethod) -> Self {
         match val {
-            MfaMethod::Totp => VpnClientMfaMethod::Totp,
-            MfaMethod::Email => VpnClientMfaMethod::Email,
-            MfaMethod::Oidc => VpnClientMfaMethod::Oidc,
-            MfaMethod::Biometric => VpnClientMfaMethod::Biometric,
-            MfaMethod::MobileApprove => VpnClientMfaMethod::MobileApprove,
+            MfaMethod::Totp => Self::Totp,
+            MfaMethod::Email => Self::Email,
+            MfaMethod::Oidc => Self::Oidc,
+            MfaMethod::Biometric => Self::Biometric,
+            MfaMethod::MobileApprove => Self::MobileApprove,
         }
     }
 }
@@ -166,6 +174,7 @@ impl From<DeviceConfig> for client_types::DeviceConfig {
                 )
                 .into(),
             ),
+            posture_check_required: Some(config.posture_check_required),
         }
     }
 }
@@ -195,9 +204,9 @@ impl From<User<Id>> for client_types::AdminInfo {
 impl From<LocationMfaMode> for client_types::LocationMfaMode {
     fn from(value: LocationMfaMode) -> Self {
         match value {
-            LocationMfaMode::Disabled => client_types::LocationMfaMode::Disabled,
-            LocationMfaMode::Internal => client_types::LocationMfaMode::Internal,
-            LocationMfaMode::External => client_types::LocationMfaMode::External,
+            LocationMfaMode::Disabled => Self::Disabled,
+            LocationMfaMode::Internal => Self::Internal,
+            LocationMfaMode::External => Self::External,
         }
     }
 }
@@ -205,9 +214,9 @@ impl From<LocationMfaMode> for client_types::LocationMfaMode {
 impl From<ServiceLocationMode> for client_types::ServiceLocationMode {
     fn from(value: ServiceLocationMode) -> Self {
         match value {
-            ServiceLocationMode::Disabled => client_types::ServiceLocationMode::Disabled,
-            ServiceLocationMode::PreLogon => client_types::ServiceLocationMode::Prelogon,
-            ServiceLocationMode::AlwaysOn => client_types::ServiceLocationMode::Alwayson,
+            ServiceLocationMode::Disabled => Self::Disabled,
+            ServiceLocationMode::PreLogon => Self::Prelogon,
+            ServiceLocationMode::AlwaysOn => Self::Alwayson,
         }
     }
 }
@@ -215,7 +224,7 @@ impl From<ServiceLocationMode> for client_types::ServiceLocationMode {
 impl Configuration {
     pub fn new(
         location: &WireguardNetwork<Id>,
-        peers: Vec<Peer>,
+        peers: Vec<WireguardPeer>,
         maybe_firewall_config: Option<FirewallConfig>,
     ) -> Self {
         Self {
@@ -223,8 +232,8 @@ impl Configuration {
             port: location.port.cast_unsigned(),
             private_key: location.prvkey.clone(),
             addresses: location.address().iter().map(ToString::to_string).collect(),
-            peers,
-            firewall_config: maybe_firewall_config,
+            peers: peers.into_iter().map(Into::into).collect(),
+            firewall_config: maybe_firewall_config.map(Into::into),
             mtu: location.mtu.cast_unsigned(),
             fwmark: location.fwmark as u32,
         }

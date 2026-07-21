@@ -12,12 +12,15 @@ use defguard_common::{
 };
 use ldap3::SearchEntry;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use tokio::sync::broadcast::{Receiver, Sender, channel};
+use tokio::sync::{
+    broadcast::{Receiver, Sender, channel},
+    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
 
 use super::{
     model::{extract_rdn_value, get_users_without_ldap_path, user_from_searchentry},
     sync::{
-        Authority, compute_group_sync_changes, compute_user_sync_changes,
+        Authority, LdapDryRunAction, compute_group_sync_changes, compute_user_sync_changes,
         extract_intersecting_users, is_ldap_desynced, set_ldap_sync_status,
     },
     test_client::{LdapEvent, group_to_test_attrs, user_to_test_attrs},
@@ -30,7 +33,8 @@ use crate::{
         license::{License, LicenseTier, SupportType, set_cached_license},
         limits::get_counts,
     },
-    grpc::{GatewayEvent, proto::enterprise::license::LicenseLimits},
+    events::LdapSyncEventType,
+    grpc::{GatewayCommand, proto::enterprise::license::LicenseLimits},
 };
 
 const PASSWORD: &str = "test_password";
@@ -42,10 +46,10 @@ fn make_test_user(
     ldap_user_path: Option<String>,
 ) -> User {
     let mut user = User::new(
-        username.to_string(),
+        username.to_owned(),
         Some(PASSWORD),
-        "last name".to_string(),
-        "first name".to_string(),
+        "last name".to_owned(),
+        "first name".to_owned(),
         format!("{username}@example.com"),
         None,
     );
@@ -87,8 +91,23 @@ fn configure_smtp_and_ldap(settings: &mut Settings) {
 }
 
 /// Bind both halves: a dropped receiver makes `Sender::send` fail and swallow events.
-fn wg_test_channel() -> (Sender<GatewayEvent>, Receiver<GatewayEvent>) {
+fn wg_test_channel() -> (Sender<GatewayCommand>, Receiver<GatewayCommand>) {
     channel(256)
+}
+
+fn ldap_test_channel() -> (
+    UnboundedSender<LdapSyncEventType>,
+    UnboundedReceiver<LdapSyncEventType>,
+) {
+    unbounded_channel()
+}
+
+fn drain_ldap_sync_events(rx: &mut UnboundedReceiver<LdapSyncEventType>) -> Vec<LdapSyncEventType> {
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    events
 }
 
 fn set_test_license_business() {
@@ -100,6 +119,7 @@ fn set_test_license_business() {
         valid_until: None,
         version_date_limit: None,
         support_type: SupportType::Basic,
+        features: vec![],
     };
     set_cached_license(Some(license));
 }
@@ -136,11 +156,12 @@ async fn defguard_sync_snapshot(
 async fn assert_incremental_sync_converges(
     ldap_conn: &mut super::LDAPConnection,
     pool: &PgPool,
-    wg_tx: &Sender<GatewayEvent>,
+    wg_tx: &Sender<GatewayCommand>,
 ) {
     let before = defguard_sync_snapshot(pool).await;
     ldap_conn.test_client_mut().clear_events();
-    ldap_conn.sync(pool, false, wg_tx).await.unwrap();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
+    ldap_conn.sync(pool, false, wg_tx, &ldap_tx).await.unwrap();
     let events = ldap_conn.test_client.get_events();
     assert!(
         events.is_empty(),
@@ -161,7 +182,7 @@ fn test_get_rdn_attr() {
 
     // Custom RDN attribute should be respected
     let config = LDAPConfig {
-        ldap_user_rdn_attr: Some("uid".to_string()),
+        ldap_user_rdn_attr: Some("uid".to_owned()),
         ..LDAPConfig::default()
     };
     assert_eq!(config.get_rdn_attr(), "uid");
@@ -175,14 +196,14 @@ fn test_get_rdn_attr() {
 
     // Whitespace-only string should also fall back to default 'cn'
     let config = LDAPConfig {
-        ldap_user_rdn_attr: Some("   ".to_string()),
+        ldap_user_rdn_attr: Some("   ".to_owned()),
         ..LDAPConfig::default()
     };
     assert_eq!(config.get_rdn_attr(), "cn");
 
     // Leading/trailing whitespace should be trimmed from valid attributes
     let config = LDAPConfig {
-        ldap_user_rdn_attr: Some("  uid  ".to_string()),
+        ldap_user_rdn_attr: Some("  uid  ".to_owned()),
         ..LDAPConfig::default()
     };
     assert_eq!(config.get_rdn_attr(), "uid");
@@ -198,7 +219,7 @@ fn test_user_dn() {
 
     // Using 'uid' instead of 'cn' for RDN construction
     let config = LDAPConfig {
-        ldap_user_rdn_attr: Some("uid".to_string()),
+        ldap_user_rdn_attr: Some("uid".to_owned()),
         ..LDAPConfig::default()
     };
     let dn = config.user_dn("testuser2", "ou=people,dc=test,dc=org");
@@ -217,8 +238,8 @@ fn test_user_dn_for_user() {
     // User with stored RDN and path uses the stored path instead of default
     let user = make_test_user(
         "testuser",
-        Some("testuser".to_string()),
-        Some("ou=admins,dc=example,dc=com".to_string()),
+        Some("testuser".to_owned()),
+        Some("ou=admins,dc=example,dc=com".to_owned()),
     );
     let dn = config.user_dn_for_user(&user);
     assert_eq!(dn, "cn=testuser,ou=admins,dc=example,dc=com");
@@ -226,18 +247,18 @@ fn test_user_dn_for_user() {
     // RDN value takes precedence over username when available
     let user = make_test_user(
         "user3",
-        Some("testuser3".to_string()),
-        Some("ou=people,dc=example,dc=com".to_string()),
+        Some("testuser3".to_owned()),
+        Some("ou=people,dc=example,dc=com".to_owned()),
     );
     let dn = config.user_dn_for_user(&user);
     assert_eq!(dn, "cn=testuser3,ou=people,dc=example,dc=com");
 
     // Custom RDN attribute affects the final DN format
     let config = LDAPConfig {
-        ldap_user_rdn_attr: Some("uid".to_string()),
+        ldap_user_rdn_attr: Some("uid".to_owned()),
         ..LDAPConfig::default()
     };
-    let user = make_test_user("user4", Some("testuser4".to_string()), None);
+    let user = make_test_user("user4", Some("testuser4".to_owned()), None);
     let dn = config.user_dn_for_user(&user);
     assert_eq!(dn, "uid=testuser4,ou=users,dc=example,dc=com");
 }
@@ -252,7 +273,7 @@ fn test_group_dn() {
 
     // Alternative naming attribute can be configured for groups
     let config = LDAPConfig {
-        ldap_groupname_attr: "ou".to_string(),
+        ldap_groupname_attr: "ou".to_owned(),
         ..LDAPConfig::default()
     };
     let dn = config.group_dn("users");
@@ -260,7 +281,7 @@ fn test_group_dn() {
 
     // Different search base location can be configured for groups
     let config = LDAPConfig {
-        ldap_group_search_base: "ou=roles,dc=test,dc=org".to_string(),
+        ldap_group_search_base: "ou=roles,dc=test,dc=org".to_owned(),
         ..LDAPConfig::default()
     };
     let dn = config.group_dn("admin");
@@ -271,7 +292,7 @@ fn test_group_dn() {
 fn test_get_all_user_obj_classes() {
     // Base class plus one auxiliary class
     let config = LDAPConfig {
-        ldap_user_auxiliary_obj_classes: vec!["simpleSecurityObject".to_string()],
+        ldap_user_auxiliary_obj_classes: vec!["simpleSecurityObject".to_owned()],
         ..LDAPConfig::default()
     };
     let obj_classes = config.get_all_user_obj_classes();
@@ -290,7 +311,7 @@ fn test_get_all_user_obj_classes() {
 
     // Single auxiliary class should be combined with base class
     let config = LDAPConfig {
-        ldap_user_auxiliary_obj_classes: vec!["customUser".to_string()],
+        ldap_user_auxiliary_obj_classes: vec!["customUser".to_owned()],
         ..LDAPConfig::default()
     };
     let obj_classes = config.get_all_user_obj_classes();
@@ -301,9 +322,9 @@ fn test_get_all_user_obj_classes() {
     // Multiple auxiliary classes
     let config = LDAPConfig {
         ldap_user_auxiliary_obj_classes: vec![
-            "posixAccount".to_string(),
-            "mailUser".to_string(),
-            "customAttribute".to_string(),
+            "posixAccount".to_owned(),
+            "mailUser".to_owned(),
+            "customAttribute".to_owned(),
         ],
         ..LDAPConfig::default()
     };
@@ -323,14 +344,14 @@ fn test_using_username_as_rdn() {
 
     // Explicitly setting RDN to 'cn' should match username behavior
     let config = LDAPConfig {
-        ldap_user_rdn_attr: Some("cn".to_string()),
+        ldap_user_rdn_attr: Some("cn".to_owned()),
         ..LDAPConfig::default()
     };
     assert!(config.using_username_as_rdn());
 
     // Using different RDN attribute means username != RDN value
     let config = LDAPConfig {
-        ldap_user_rdn_attr: Some("uid".to_string()),
+        ldap_user_rdn_attr: Some("uid".to_owned()),
         ..LDAPConfig::default()
     };
     assert!(!config.using_username_as_rdn());
@@ -344,16 +365,16 @@ fn test_using_username_as_rdn() {
 
     // Active Directory scenario: username and RDN both use sAMAccountName
     let config = LDAPConfig {
-        ldap_username_attr: "sAMAccountName".to_string(),
-        ldap_user_rdn_attr: Some("sAMAccountName".to_string()),
+        ldap_username_attr: "sAMAccountName".to_owned(),
+        ldap_user_rdn_attr: Some("sAMAccountName".to_owned()),
         ..LDAPConfig::default()
     };
     assert!(config.using_username_as_rdn());
 
     // Mixed AD scenario: username from sAMAccountName but RDN uses CN
     let config = LDAPConfig {
-        ldap_username_attr: "sAMAccountName".to_string(),
-        ldap_user_rdn_attr: Some("cn".to_string()),
+        ldap_username_attr: "sAMAccountName".to_owned(),
+        ldap_user_rdn_attr: Some("cn".to_owned()),
         ..LDAPConfig::default()
     };
     assert!(!config.using_username_as_rdn());
@@ -364,25 +385,26 @@ async fn test_update_users_state(_: PgPoolOptions, options: PgConnectOptions) {
     let mut ldap_conn = LDAPConnection::create().await.unwrap();
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
     let config = ldap_conn.config.clone();
 
     // active user missing from LDAP, inactive user in LDAP, active user in LDAP
     let mut active_user_not_in_ldap =
-        make_test_user("active_user", Some("active_user".to_string()), None)
+        make_test_user("active_user", Some("active_user".to_owned()), None)
             .save(&pool)
             .await
             .unwrap();
 
     let mut inactive_user_in_ldap =
-        make_test_user("inactive_user", Some("inactive_user".to_string()), None)
+        make_test_user("inactive_user", Some("inactive_user".to_owned()), None)
             .save(&pool)
             .await
             .unwrap();
     inactive_user_in_ldap.is_active = false;
 
     let mut active_user_in_ldap =
-        make_test_user("existing_user", Some("existing_user".to_string()), None)
+        make_test_user("existing_user", Some("existing_user".to_owned()), None)
             .save(&pool)
             .await
             .unwrap();
@@ -416,6 +438,7 @@ async fn test_update_users_state(_: PgPoolOptions, options: PgConnectOptions) {
             ],
             &pool,
             &wg_tx,
+            &ldap_tx,
         )
         .await
         .unwrap();
@@ -448,7 +471,7 @@ async fn test_update_users_state(_: PgPoolOptions, options: PgConnectOptions) {
         .unwrap();
 
     ldap_conn
-        .update_users_state(vec![&mut active_user_in_ldap], &pool, &wg_tx)
+        .update_users_state(vec![&mut active_user_in_ldap], &pool, &wg_tx, &ldap_tx)
         .await
         .unwrap();
 
@@ -475,7 +498,7 @@ async fn test_update_users_state(_: PgPoolOptions, options: PgConnectOptions) {
 
     active_user_in_ldap.is_active = false;
     ldap_conn
-        .update_users_state(vec![&mut active_user_in_ldap], &pool, &wg_tx)
+        .update_users_state(vec![&mut active_user_in_ldap], &pool, &wg_tx, &ldap_tx)
         .await
         .unwrap();
 
@@ -497,7 +520,7 @@ async fn test_update_users_state(_: PgPoolOptions, options: PgConnectOptions) {
     // Test partial group membership removal when other members remain
     let mut another_active_user_in_ldap = make_test_user(
         "another_active_user",
-        Some("another_active_user".to_string()),
+        Some("another_active_user".to_owned()),
         None,
     )
     .save(&pool)
@@ -517,7 +540,7 @@ async fn test_update_users_state(_: PgPoolOptions, options: PgConnectOptions) {
     active_user_in_ldap.is_active = false;
 
     ldap_conn
-        .update_users_state(vec![&mut active_user_in_ldap], &pool, &wg_tx)
+        .update_users_state(vec![&mut active_user_in_ldap], &pool, &wg_tx, &ldap_tx)
         .await
         .unwrap();
 
@@ -552,7 +575,12 @@ async fn test_update_users_state(_: PgPoolOptions, options: PgConnectOptions) {
         .remove_test_user(&active_user_in_ldap.clone().as_noid(), &config);
 
     ldap_conn
-        .update_users_state(vec![&mut another_active_user_in_ldap], &pool, &wg_tx)
+        .update_users_state(
+            vec![&mut another_active_user_in_ldap],
+            &pool,
+            &wg_tx,
+            &ldap_tx,
+        )
         .await
         .unwrap();
 
@@ -579,7 +607,7 @@ async fn test_get_user() {
     let mut ldap_conn = LDAPConnection::create().await.unwrap();
 
     ldap_conn.config = LDAPConfig {
-        ldap_user_auxiliary_obj_classes: vec![UserObjectClass::InetOrgPerson.name().to_string()],
+        ldap_user_auxiliary_obj_classes: vec![UserObjectClass::InetOrgPerson.name().to_owned()],
         ..ldap_conn.config
     };
 
@@ -600,7 +628,7 @@ async fn test_get_user() {
         assert!(result.from_ldap);
         assert_eq!(
             result.ldap_rdn.as_ref(),
-            Some(&test_user.ldap_rdn_value().to_string())
+            Some(&test_user.ldap_rdn_value().to_owned())
         );
         assert_eq!(result.ldap_user_path.as_ref(), Some(&search_base));
     };
@@ -643,7 +671,7 @@ async fn test_user_in_ldap_sync_groups() {
     // User that doesn't exist in LDAP cannot be in any sync groups
     {
         let mut ldap_conn = LDAPConnection::create().await.unwrap();
-        ldap_conn.config.ldap_sync_groups = vec!["group1".to_string(), "group2".to_string()];
+        ldap_conn.config.ldap_sync_groups = vec!["group1".to_owned(), "group2".to_owned()];
         let test_user = make_test_user("nonexistent", None, None);
 
         let result = ldap_conn
@@ -657,7 +685,7 @@ async fn test_user_in_ldap_sync_groups() {
     {
         let mut ldap_conn = LDAPConnection::create().await.unwrap();
         let config = ldap_conn.config.clone();
-        ldap_conn.config.ldap_sync_groups = vec!["developers".to_string(), "admins".to_string()];
+        ldap_conn.config.ldap_sync_groups = vec!["developers".to_owned(), "admins".to_owned()];
 
         let test_user = make_test_user("user2", None, None);
         ldap_conn
@@ -692,7 +720,7 @@ async fn test_user_in_ldap_sync_groups() {
     {
         let mut ldap_conn = LDAPConnection::create().await.unwrap();
         let config = ldap_conn.config.clone();
-        ldap_conn.config.ldap_sync_groups = vec!["developers".to_string(), "admins".to_string()];
+        ldap_conn.config.ldap_sync_groups = vec!["developers".to_owned(), "admins".to_owned()];
 
         let test_user = make_test_user("user3", None, None);
         ldap_conn
@@ -728,9 +756,9 @@ async fn test_user_in_ldap_sync_groups() {
         let mut ldap_conn = LDAPConnection::create().await.unwrap();
         let config = ldap_conn.config.clone();
         ldap_conn.config.ldap_sync_groups = vec![
-            "developers".to_string(),
-            "admins".to_string(),
-            "qa".to_string(),
+            "developers".to_owned(),
+            "admins".to_owned(),
+            "qa".to_owned(),
         ];
 
         let test_user = make_test_user("user4", None, None);
@@ -773,7 +801,7 @@ async fn test_user_in_ldap_sync_groups() {
     {
         let mut ldap_conn = LDAPConnection::create().await.unwrap();
         let config = ldap_conn.config.clone();
-        ldap_conn.config.ldap_sync_groups = vec!["developers".to_string(), "admins".to_string()];
+        ldap_conn.config.ldap_sync_groups = vec!["developers".to_owned(), "admins".to_owned()];
 
         let test_user = make_test_user("user5", None, None);
         ldap_conn
@@ -1013,7 +1041,7 @@ fn test_ldap_authority_add_group_to_defguard() {
     let mut ldap_memberships = HashMap::new();
     let test_user = make_test_user("user1", None, None);
     ldap_memberships.insert(
-        "test_group".to_string(),
+        "test_group".to_owned(),
         HashSet::from_iter(vec![&test_user]),
     );
 
@@ -1043,7 +1071,7 @@ fn test_ldap_authority_delete_group_from_defguard(_: PgPoolOptions, options: PgC
         .await
         .unwrap();
     defguard_memberships.insert(
-        "test_group".to_string(),
+        "test_group".to_owned(),
         HashSet::from_iter(vec![test_user.clone()]),
     );
     let ldap_memberships = HashMap::new();
@@ -1074,7 +1102,7 @@ fn test_defguard_authority_add_group_to_ldap(_: PgPoolOptions, options: PgConnec
         .await
         .unwrap();
     defguard_memberships.insert(
-        "test_group".to_string(),
+        "test_group".to_owned(),
         HashSet::from_iter(vec![test_user.clone()]),
     );
     let ldap_memberships = HashMap::new();
@@ -1102,7 +1130,7 @@ fn test_defguard_authority_delete_group_from_ldap() {
     let mut ldap_memberships = HashMap::new();
     let test_user = make_test_user("user1", None, None);
     ldap_memberships.insert(
-        "test_group".to_string(),
+        "test_group".to_owned(),
         HashSet::from_iter(vec![&test_user]),
     );
 
@@ -1130,12 +1158,12 @@ fn test_matching_groups_no_changes(_: PgPoolOptions, options: PgConnectOptions) 
     let test_user = make_test_user("user1", None, None);
     let test_user_id = test_user.clone().save(&pool).await.unwrap();
     defguard_memberships.insert(
-        "test_group".to_string(),
+        "test_group".to_owned(),
         HashSet::from_iter(vec![test_user_id]),
     );
     let mut ldap_memberships = HashMap::new();
     ldap_memberships.insert(
-        "test_group".to_string(),
+        "test_group".to_owned(),
         HashSet::from_iter(vec![&test_user]),
     );
 
@@ -1192,12 +1220,12 @@ fn test_ldap_authority_add_users_to_group(_: PgPoolOptions, options: PgConnectOp
     let test_user2 = make_test_user("user2", None, None);
     let mut defguard_memberships = HashMap::new();
     defguard_memberships.insert(
-        "test_group".to_string(),
+        "test_group".to_owned(),
         HashSet::from_iter(vec![test_user_id]),
     );
     let mut ldap_memberships = HashMap::new();
     ldap_memberships.insert(
-        "test_group".to_string(),
+        "test_group".to_owned(),
         HashSet::from_iter(vec![&test_user, &test_user2]),
     );
 
@@ -1228,12 +1256,12 @@ fn test_ldap_authority_remove_users_from_group(_: PgPoolOptions, options: PgConn
         .unwrap();
     let user1_noid = user1.clone().as_noid();
     defguard_memberships.insert(
-        "test_group".to_string(),
+        "test_group".to_owned(),
         HashSet::from_iter(vec![user1, user2.clone()]),
     );
     let mut ldap_memberships = HashMap::new();
     ldap_memberships.insert(
-        "test_group".to_string(),
+        "test_group".to_owned(),
         HashSet::from_iter(vec![&user1_noid]),
     );
 
@@ -1271,21 +1299,18 @@ fn test_multiple_groups_ldap_authority(_: PgPoolOptions, options: PgConnectOptio
     let user1_noid = user1.clone().as_noid();
     let mut defguard_memberships = HashMap::new();
     defguard_memberships.insert(
-        "group1".to_string(),
+        "group1".to_owned(),
         HashSet::from_iter(vec![user1.clone(), user2.clone()]),
     );
-    defguard_memberships.insert(
-        "group2".to_string(),
-        HashSet::from_iter(vec![user3.clone()]),
-    );
+    defguard_memberships.insert("group2".to_owned(), HashSet::from_iter(vec![user3.clone()]));
 
     let mut ldap_memberships = HashMap::new();
     ldap_memberships.insert(
-        "group1".to_string(),
+        "group1".to_owned(),
         HashSet::from_iter(vec![&user1_noid, &user4]),
     );
     ldap_memberships.insert(
-        "group3".to_string(),
+        "group3".to_owned(),
         HashSet::from_iter(vec![&user5, &user6]),
     );
 
@@ -1345,20 +1370,20 @@ fn test_multiple_groups_defguard_authority(_: PgPoolOptions, options: PgConnectO
     let user3 = make_test_user("user3", None, None);
     let mut defguard_memberships = HashMap::new();
     defguard_memberships.insert(
-        "group1".to_string(),
+        "group1".to_owned(),
         HashSet::from_iter(vec![user1.clone(), user2.clone()]),
     );
     defguard_memberships.insert(
-        "group3".to_string(),
+        "group3".to_owned(),
         HashSet::from_iter(vec![user5.clone(), user6.clone()]),
     );
 
     let mut ldap_memberships = HashMap::new();
     ldap_memberships.insert(
-        "group1".to_string(),
+        "group1".to_owned(),
         HashSet::from_iter(vec![&user1_noid, &user4]),
     );
-    ldap_memberships.insert("group2".to_string(), HashSet::from_iter(vec![&user3]));
+    ldap_memberships.insert("group2".to_owned(), HashSet::from_iter(vec![&user3]));
 
     let changes = compute_group_sync_changes(
         &defguard_memberships,
@@ -1393,10 +1418,10 @@ fn test_multiple_groups_defguard_authority(_: PgPoolOptions, options: PgConnectO
 #[test]
 fn test_empty_groups() {
     let mut defguard_memberships = HashMap::new();
-    defguard_memberships.insert("empty_group1".to_string(), HashSet::new());
+    defguard_memberships.insert("empty_group1".to_owned(), HashSet::new());
 
     let mut ldap_memberships = HashMap::new();
-    ldap_memberships.insert("empty_group2".to_string(), HashSet::new());
+    ldap_memberships.insert("empty_group2".to_owned(), HashSet::new());
 
     let changes = compute_group_sync_changes(
         &defguard_memberships,
@@ -1442,29 +1467,29 @@ fn test_complex_group_memberships(_: PgPoolOptions, options: PgConnectOptions) {
 
     let mut defguard_memberships = HashMap::new();
     defguard_memberships.insert(
-        "group1".to_string(),
+        "group1".to_owned(),
         HashSet::from_iter(vec![user1.clone(), user2.clone()]),
     );
     defguard_memberships.insert(
-        "group2".to_string(),
+        "group2".to_owned(),
         HashSet::from_iter(vec![user1.clone(), user2.clone(), user3.clone()]),
     );
     defguard_memberships.insert(
-        "group3".to_string(),
+        "group3".to_owned(),
         HashSet::from_iter(vec![user1.clone(), user5.clone()]),
     );
 
     let mut ldap_memberships = HashMap::new();
     ldap_memberships.insert(
-        "group1".to_string(),
+        "group1".to_owned(),
         HashSet::from_iter(vec![&user1_noid, &user4]),
     );
     ldap_memberships.insert(
-        "group2".to_string(),
+        "group2".to_owned(),
         HashSet::from_iter(vec![&user1_noid, &user2_noid, &user4]),
     );
     ldap_memberships.insert(
-        "group4".to_string(),
+        "group4".to_owned(),
         HashSet::from_iter(vec![&user2_noid, &user3_noid]),
     );
 
@@ -1699,13 +1724,13 @@ async fn test_fix_missing_user_path(_: PgPoolOptions, options: PgConnectOptions)
             "user1@example.com",
             None,
         );
-        user1.ldap_rdn = Some("user1".to_string());
+        user1.ldap_rdn = Some("user1".to_owned());
         user1.ldap_user_path = None;
         user1.from_ldap = true;
         let user1 = user1.save(&pool).await.unwrap();
 
         let mut ldap_user = user1.clone().as_noid();
-        ldap_user.ldap_user_path = Some("ou=users,dc=example,dc=com".to_string());
+        ldap_user.ldap_user_path = Some("ou=users,dc=example,dc=com".to_owned());
         ldap_conn
             .test_client_mut()
             .add_test_user(&ldap_user, &config);
@@ -1715,7 +1740,7 @@ async fn test_fix_missing_user_path(_: PgPoolOptions, options: PgConnectOptions)
         let updated_user = User::find_by_id(&pool, user1.id).await.unwrap().unwrap();
         assert_eq!(
             updated_user.ldap_user_path,
-            Some("ou=users,dc=example,dc=com".to_string())
+            Some("ou=users,dc=example,dc=com".to_owned())
         );
     }
 
@@ -1732,7 +1757,7 @@ async fn test_fix_missing_user_path(_: PgPoolOptions, options: PgConnectOptions)
             "user2@example.com",
             None,
         );
-        user2.ldap_rdn = Some("user2_defguard".to_string());
+        user2.ldap_rdn = Some("user2_defguard".to_owned());
         user2.ldap_user_path = None;
         user2.from_ldap = true;
         let user2 = user2.save(&pool).await.unwrap();
@@ -1745,8 +1770,8 @@ async fn test_fix_missing_user_path(_: PgPoolOptions, options: PgConnectOptions)
             "user2@example.com",
             None,
         );
-        ldap_user.ldap_rdn = Some("user2_ldap".to_string());
-        ldap_user.ldap_user_path = Some("ou=users,dc=example,dc=com".to_string());
+        ldap_user.ldap_rdn = Some("user2_ldap".to_owned());
+        ldap_user.ldap_user_path = Some("ou=users,dc=example,dc=com".to_owned());
         ldap_conn
             .test_client_mut()
             .add_test_user(&ldap_user, &config);
@@ -1770,7 +1795,7 @@ async fn test_fix_missing_user_path(_: PgPoolOptions, options: PgConnectOptions)
             "user3@example.com",
             None,
         );
-        user3.ldap_rdn = Some("user3".to_string());
+        user3.ldap_rdn = Some("user3".to_owned());
         user3.ldap_user_path = None; // Missing path
         user3.from_ldap = true;
         let user3 = user3.save(&pool).await.unwrap();
@@ -1794,13 +1819,13 @@ async fn test_fix_missing_user_path(_: PgPoolOptions, options: PgConnectOptions)
             "user4@example.com",
             None,
         );
-        user4.ldap_rdn = Some("user4".to_string());
-        user4.ldap_user_path = Some("ou=existing,dc=example,dc=com".to_string());
+        user4.ldap_rdn = Some("user4".to_owned());
+        user4.ldap_user_path = Some("ou=existing,dc=example,dc=com".to_owned());
         user4.from_ldap = true;
         let user4 = user4.save(&pool).await.unwrap();
 
         let mut ldap_user = user4.clone().as_noid();
-        ldap_user.ldap_user_path = Some("ou=different,dc=example,dc=com".to_string());
+        ldap_user.ldap_user_path = Some("ou=different,dc=example,dc=com".to_owned());
         ldap_conn
             .test_client_mut()
             .add_test_user(&ldap_user, &config);
@@ -1810,10 +1835,197 @@ async fn test_fix_missing_user_path(_: PgPoolOptions, options: PgConnectOptions)
         let updated_user = User::find_by_id(&pool, user4.id).await.unwrap().unwrap();
         assert_eq!(
             updated_user.ldap_user_path,
-            Some("ou=existing,dc=example,dc=com".to_string())
+            Some("ou=existing,dc=example,dc=com".to_owned())
         );
         assert_eq!(updated_user.id, user4.id);
     }
+}
+
+/// A dry run must preview the additions/removals a full sync would make while writing nothing
+/// to LDAP or the Defguard database. This guards the hard "no import" requirement of the LDAP
+/// setup preview.
+#[sqlx::test]
+async fn test_ldap_dry_run_previews_changes_without_writing(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let _ = initialize_current_settings(&pool).await;
+    set_test_license_business();
+
+    let mut ldap_conn = super::LDAPConnection::create().await.unwrap();
+    let config = ldap_conn.config.clone();
+
+    // Present only in Defguard: a full sync with LDAP authority would remove this user.
+    make_test_user("defguard_only", Some("defguard_only".to_owned()), None)
+        .save(&pool)
+        .await
+        .unwrap();
+
+    // Present only in LDAP: a full sync with LDAP authority would import this user.
+    let ldap_only = make_test_user("ldap_only", Some("ldap_only".to_owned()), None);
+    ldap_conn
+        .test_client_mut()
+        .add_test_user(&ldap_only, &config);
+
+    let before = defguard_sync_snapshot(&pool).await;
+    ldap_conn.test_client_mut().clear_events();
+
+    let result = ldap_conn.dry_run(&pool, Authority::LDAP).await.unwrap();
+
+    let added: Vec<_> = result
+        .defguard
+        .iter()
+        .filter(|u| matches!(u.action, LdapDryRunAction::Add))
+        .map(|u| u.username.as_str())
+        .collect();
+    let removed: Vec<_> = result
+        .defguard
+        .iter()
+        .filter(|u| matches!(u.action, LdapDryRunAction::Remove))
+        .map(|u| u.username.as_str())
+        .collect();
+    assert_eq!(added, vec!["ldap_only"]);
+    assert_eq!(removed, vec!["defguard_only"]);
+
+    // The dry run must not touch LDAP or the Defguard database.
+    assert!(
+        ldap_conn.test_client.get_events().is_empty(),
+        "dry run emitted LDAP operations: {:?}",
+        ldap_conn.test_client.get_events()
+    );
+    assert_eq!(
+        before,
+        defguard_sync_snapshot(&pool).await,
+        "dry run mutated Defguard state"
+    );
+}
+
+/// A Defguard user that exists in LDAP but has no stored LDAP path must not be previewed as
+/// both removed and re-added. A real full sync backfills the missing path first (so the DNs
+/// match and the user is treated as unchanged); the dry run replicates that in memory.
+#[sqlx::test]
+async fn test_ldap_dry_run_does_not_double_list_user_with_missing_path(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let _ = initialize_current_settings(&pool).await;
+    set_test_license_business();
+
+    let mut ldap_conn = super::LDAPConnection::create().await.unwrap();
+    let config = ldap_conn.config.clone();
+
+    // Locally-created user with no LDAP path yet, same RDN as the LDAP entry.
+    make_test_user("shared_user", Some("shared_user".to_owned()), None)
+        .save(&pool)
+        .await
+        .unwrap();
+
+    // Same user in LDAP, living in an OU (so its DN differs until the path is reconciled).
+    let mut ldap_user = make_test_user("shared_user", Some("shared_user".to_owned()), None);
+    ldap_user.ldap_user_path = Some("ou=people,dc=example,dc=com".to_owned());
+    ldap_conn
+        .test_client_mut()
+        .add_test_user(&ldap_user, &config);
+
+    let result = ldap_conn.dry_run(&pool, Authority::LDAP).await.unwrap();
+
+    let mentions: Vec<_> = result
+        .defguard
+        .iter()
+        .chain(result.ldap.iter())
+        .filter(|u| u.username == "shared_user")
+        .collect();
+    assert!(
+        mentions.is_empty(),
+        "user with a missing path was listed as a change: {mentions:?}"
+    );
+}
+
+/// A disabled Defguard user that also exists in LDAP is outside the sync scope, so the change
+/// computation sees them as missing from Defguard. A real sync skips such additions because
+/// the username already exists in the database; the dry run must not preview them as "to be
+/// added" either.
+#[sqlx::test]
+async fn test_ldap_dry_run_skips_disabled_users_existing_in_defguard(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let _ = initialize_current_settings(&pool).await;
+    set_test_license_business();
+
+    let mut ldap_conn = super::LDAPConnection::create().await.unwrap();
+    let config = ldap_conn.config.clone();
+
+    let mut disabled_user = make_test_user("disabled_user", Some("disabled_user".to_owned()), None);
+    disabled_user.is_active = false;
+    disabled_user.save(&pool).await.unwrap();
+
+    let ldap_user = make_test_user("disabled_user", Some("disabled_user".to_owned()), None);
+    ldap_conn
+        .test_client_mut()
+        .add_test_user(&ldap_user, &config);
+
+    let result = ldap_conn.dry_run(&pool, Authority::LDAP).await.unwrap();
+
+    let mentions: Vec<_> = result
+        .defguard
+        .iter()
+        .chain(result.ldap.iter())
+        .filter(|u| u.username == "disabled_user")
+        .collect();
+    assert!(
+        mentions.is_empty(),
+        "disabled user already present in Defguard was listed as a change: {mentions:?}"
+    );
+}
+
+/// The dry run previews not yet saved settings, so user scoping must follow the connection's
+/// config (built from the submitted form values) instead of the globally saved settings.
+/// Here the saved settings have no sync group restriction, while the submitted config limits
+/// the sync to one group: only members of that group may appear in the preview.
+#[sqlx::test]
+async fn test_ldap_dry_run_scopes_users_by_submitted_settings(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let _ = initialize_current_settings(&pool).await;
+    set_test_license_business();
+
+    let mut ldap_conn = super::LDAPConnection::create().await.unwrap();
+    // Mirrors a dry run request whose form values restrict the sync to one group.
+    ldap_conn.config.ldap_sync_groups = vec!["ldap_sync_group".to_owned()];
+
+    let sync_group = Group::new("ldap_sync_group").save(&pool).await.unwrap();
+
+    // Both users exist only in Defguard, so with LDAP authority any in-scope user is
+    // previewed as removed.
+    let synced_user = make_test_user("synced_user", Some("synced_user".to_owned()), None)
+        .save(&pool)
+        .await
+        .unwrap();
+    synced_user.add_to_group(&pool, &sync_group).await.unwrap();
+    make_test_user("outside_user", Some("outside_user".to_owned()), None)
+        .save(&pool)
+        .await
+        .unwrap();
+
+    let result = ldap_conn.dry_run(&pool, Authority::LDAP).await.unwrap();
+
+    let removed: Vec<_> = result
+        .defguard
+        .iter()
+        .filter(|u| matches!(u.action, LdapDryRunAction::Remove))
+        .map(|u| u.username.as_str())
+        .collect();
+    assert_eq!(
+        removed,
+        vec!["synced_user"],
+        "preview must scope users by the submitted sync groups, not the saved settings"
+    );
 }
 
 #[sqlx::test]
@@ -1823,6 +2035,7 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
 ) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
     set_test_license_business();
 
@@ -1840,7 +2053,7 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
             "user1@example.com",
             None,
         );
-        user1.ldap_rdn = Some("user1".to_string());
+        user1.ldap_rdn = Some("user1".to_owned());
         user1.ldap_user_path = None; // Empty path initially
         user1.from_ldap = true;
         let user1 = user1.save(&pool).await.unwrap();
@@ -1848,19 +2061,22 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
 
         let mut ldap_user = user1.clone().as_noid();
         ldap_user.ldap_user_path =
-            Some("ou=developers,ou=engineering,ou=users,dc=example,dc=com".to_string());
+            Some("ou=developers,ou=engineering,ou=users,dc=example,dc=com".to_owned());
         ldap_conn
             .test_client_mut()
             .add_test_user(&ldap_user, &config);
 
-        ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+        ldap_conn
+            .sync(&pool, false, &wg_tx, &ldap_tx)
+            .await
+            .unwrap();
 
         // verify that the user path was updated and ID remains the same
         let updated_user = User::find_by_id(&pool, original_id).await.unwrap().unwrap();
         assert_eq!(updated_user.id, original_id);
         assert_eq!(
             updated_user.ldap_user_path,
-            Some("ou=developers,ou=engineering,ou=users,dc=example,dc=com".to_string())
+            Some("ou=developers,ou=engineering,ou=users,dc=example,dc=com".to_owned())
         );
         assert_eq!(updated_user.username, "user1");
         assert!(ldap_conn.test_client.get_events().is_empty());
@@ -1877,7 +2093,7 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
             "user2@example.com",
             None,
         );
-        user2.ldap_rdn = Some("user2".to_string());
+        user2.ldap_rdn = Some("user2".to_owned());
         user2.ldap_user_path = None;
         user2.from_ldap = true;
         let user2 = user2.save(&pool).await.unwrap();
@@ -1885,18 +2101,21 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
 
         let mut ldap_user = user2.clone().as_noid();
         ldap_user.ldap_user_path =
-            Some("ou=qa,ou=testers,ou=internal,ou=company,ou=users,dc=example,dc=com".to_string());
+            Some("ou=qa,ou=testers,ou=internal,ou=company,ou=users,dc=example,dc=com".to_owned());
         ldap_conn
             .test_client_mut()
             .add_test_user(&ldap_user, &config);
 
-        ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+        ldap_conn
+            .sync(&pool, false, &wg_tx, &ldap_tx)
+            .await
+            .unwrap();
 
         let updated_user = User::find_by_id(&pool, original_id).await.unwrap().unwrap();
         assert_eq!(updated_user.id, original_id);
         assert_eq!(
             updated_user.ldap_user_path,
-            Some("ou=qa,ou=testers,ou=internal,ou=company,ou=users,dc=example,dc=com".to_string())
+            Some("ou=qa,ou=testers,ou=internal,ou=company,ou=users,dc=example,dc=com".to_owned())
         );
         assert_eq!(updated_user.username, "user2");
         assert!(ldap_conn.test_client.get_events().is_empty());
@@ -1913,27 +2132,30 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
             "user3@example.com",
             None,
         );
-        user3.ldap_rdn = Some("user3".to_string());
-        user3.ldap_user_path = Some("ou=users,dc=example,dc=com".to_string());
+        user3.ldap_rdn = Some("user3".to_owned());
+        user3.ldap_user_path = Some("ou=users,dc=example,dc=com".to_owned());
         user3.from_ldap = true;
         let user3 = user3.save(&pool).await.unwrap();
         let original_id = user3.id;
 
         let mut ldap_user = user3.clone().as_noid();
-        ldap_user.ldap_user_path = Some("ou=users,dc=example,dc=com".to_string());
-        ldap_user.email = "updated3@example.com".to_string();
+        ldap_user.ldap_user_path = Some("ou=users,dc=example,dc=com".to_owned());
+        ldap_user.email = "updated3@example.com".to_owned();
         ldap_conn
             .test_client_mut()
             .add_test_user(&ldap_user, &config);
 
-        ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+        ldap_conn
+            .sync(&pool, false, &wg_tx, &ldap_tx)
+            .await
+            .unwrap();
 
         // verify user still exists with same ID and path remains consistent
         let updated_user = User::find_by_id(&pool, original_id).await.unwrap().unwrap();
         assert_eq!(updated_user.id, original_id);
         assert_eq!(
             updated_user.ldap_user_path,
-            Some("ou=users,dc=example,dc=com".to_string())
+            Some("ou=users,dc=example,dc=com".to_owned())
         );
         assert_eq!(updated_user.username, "user3");
         assert_eq!(updated_user.email, "updated3@example.com");
@@ -1951,7 +2173,7 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
             "user4@example.com",
             None,
         );
-        user4.ldap_rdn = Some("user4".to_string());
+        user4.ldap_rdn = Some("user4".to_owned());
         user4.ldap_user_path = None; // Empty path
         user4.from_ldap = true;
         let user4 = user4.save(&pool).await.unwrap();
@@ -1965,26 +2187,29 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
             "user5@example.com",
             None,
         );
-        user5.ldap_rdn = Some("user5".to_string());
+        user5.ldap_rdn = Some("user5".to_owned());
         user5.ldap_user_path = None; // Empty path
         user5.from_ldap = true;
         let user5 = user5.save(&pool).await.unwrap();
         let original_id5 = user5.id;
 
         let mut ldap_user4 = user4.clone().as_noid();
-        ldap_user4.ldap_user_path = Some("ou=admins,ou=it,ou=users,dc=example,dc=com".to_string());
+        ldap_user4.ldap_user_path = Some("ou=admins,ou=it,ou=users,dc=example,dc=com".to_owned());
         ldap_conn
             .test_client_mut()
             .add_test_user(&ldap_user4, &config);
 
         let mut ldap_user5 = user5.clone().as_noid();
         ldap_user5.ldap_user_path =
-            Some("ou=support,ou=helpdesk,ou=users,dc=example,dc=com".to_string());
+            Some("ou=support,ou=helpdesk,ou=users,dc=example,dc=com".to_owned());
         ldap_conn
             .test_client_mut()
             .add_test_user(&ldap_user5, &config);
 
-        ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+        ldap_conn
+            .sync(&pool, false, &wg_tx, &ldap_tx)
+            .await
+            .unwrap();
 
         let updated_user4 = User::find_by_id(&pool, original_id4)
             .await
@@ -1993,7 +2218,7 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
         assert_eq!(updated_user4.id, original_id4);
         assert_eq!(
             updated_user4.ldap_user_path,
-            Some("ou=admins,ou=it,ou=users,dc=example,dc=com".to_string())
+            Some("ou=admins,ou=it,ou=users,dc=example,dc=com".to_owned())
         );
         assert_eq!(updated_user4.username, "user4");
 
@@ -2004,7 +2229,7 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
         assert_eq!(updated_user5.id, original_id5);
         assert_eq!(
             updated_user5.ldap_user_path,
-            Some("ou=support,ou=helpdesk,ou=users,dc=example,dc=com".to_string())
+            Some("ou=support,ou=helpdesk,ou=users,dc=example,dc=com".to_owned())
         );
         assert_eq!(updated_user5.username, "user5");
         assert!(ldap_conn.test_client.get_events().is_empty());
@@ -2021,27 +2246,29 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
             "user6@example.com",
             None,
         );
-        user6.ldap_rdn = Some("user6".to_string());
-        user6.ldap_user_path =
-            Some("ou=support,ou=helpdesk,ou=users,dc=example,dc=com".to_string());
+        user6.ldap_rdn = Some("user6".to_owned());
+        user6.ldap_user_path = Some("ou=support,ou=helpdesk,ou=users,dc=example,dc=com".to_owned());
         user6.from_ldap = true;
         let user6 = user6.save(&pool).await.unwrap();
         let original_id = user6.id;
 
         let mut ldap_user = user6.clone().as_noid();
-        ldap_user.first_name = "UpdatedFirst".to_string(); // Updated attribute
+        ldap_user.first_name = "UpdatedFirst".to_owned(); // Updated attribute
         ldap_conn
             .test_client_mut()
             .add_test_user(&ldap_user, &config);
 
-        ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+        ldap_conn
+            .sync(&pool, false, &wg_tx, &ldap_tx)
+            .await
+            .unwrap();
 
         // verify user still exists with same ID and correct path
         let updated_user = User::find_by_id(&pool, original_id).await.unwrap().unwrap();
         assert_eq!(updated_user.id, original_id);
         assert_eq!(
             updated_user.ldap_user_path,
-            Some("ou=support,ou=helpdesk,ou=users,dc=example,dc=com".to_string())
+            Some("ou=support,ou=helpdesk,ou=users,dc=example,dc=com".to_owned())
         );
         assert_eq!(updated_user.username, "user6");
         assert_eq!(updated_user.first_name, "UpdatedFirst");
@@ -2059,9 +2286,9 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
             "ldap_only@example.com",
             None,
         );
-        ldap_only_user.ldap_rdn = Some("ldap_only_user".to_string());
+        ldap_only_user.ldap_rdn = Some("ldap_only_user".to_owned());
         ldap_only_user.ldap_user_path =
-            Some("ou=dev-team,ou=project-alpha,ou=r&d,ou=users,dc=example,dc=com".to_string());
+            Some("ou=dev-team,ou=project-alpha,ou=r&d,ou=users,dc=example,dc=com".to_owned());
         ldap_conn
             .test_client_mut()
             .add_test_user(&ldap_only_user, &config);
@@ -2069,7 +2296,10 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
         let users_before = User::all(&pool).await.unwrap();
         let count_before = users_before.len();
 
-        ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+        ldap_conn
+            .sync(&pool, false, &wg_tx, &ldap_tx)
+            .await
+            .unwrap();
 
         let users_after = User::all(&pool).await.unwrap();
         assert_eq!(users_after.len(), count_before + 1);
@@ -2081,7 +2311,7 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
 
         assert_eq!(
             added_user.ldap_user_path,
-            Some("ou=dev-team,ou=project-alpha,ou=r&d,ou=users,dc=example,dc=com".to_string())
+            Some("ou=dev-team,ou=project-alpha,ou=r&d,ou=users,dc=example,dc=com".to_owned())
         );
         assert_eq!(added_user.username, "ldap_only_user");
         assert!(added_user.from_ldap);
@@ -2093,6 +2323,7 @@ async fn test_sync_users_with_empty_paths_and_nested_ous(
 async fn test_sync_simple_nested_ou_changes(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
     set_test_license_business();
 
@@ -2102,14 +2333,14 @@ async fn test_sync_simple_nested_ou_changes(_: PgPoolOptions, options: PgConnect
     let group1 = Group::new("developers").save(&pool).await.unwrap();
 
     let mut user1 = make_test_user("user1", None, None);
-    user1.ldap_user_path = Some("ou=engineering,ou=dept,dc=example,dc=com".to_string());
-    user1.ldap_rdn = Some("user1".to_string());
+    user1.ldap_user_path = Some("ou=engineering,ou=dept,dc=example,dc=com".to_owned());
+    user1.ldap_rdn = Some("user1".to_owned());
     user1.from_ldap = true;
     let user1 = user1.save(&pool).await.unwrap();
     user1.add_to_group(&pool, &group1).await.unwrap();
 
     let mut ldap_user1 = user1.clone().as_noid();
-    ldap_user1.first_name = "UpdatedFirst1".to_string();
+    ldap_user1.first_name = "UpdatedFirst1".to_owned();
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_user1, &config);
@@ -2121,7 +2352,7 @@ async fn test_sync_simple_nested_ou_changes(_: PgPoolOptions, options: PgConnect
 
     let mut ldap_only_user = make_test_user("user2", None, None);
     ldap_only_user.ldap_user_path =
-        Some("ou=contractors,ou=external,ou=projects,ou=temp,dc=example,dc=com".to_string());
+        Some("ou=contractors,ou=external,ou=projects,ou=temp,dc=example,dc=com".to_owned());
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_only_user, &config);
@@ -2134,7 +2365,10 @@ async fn test_sync_simple_nested_ou_changes(_: PgPoolOptions, options: PgConnect
         &config,
     );
 
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     // user1 should be updated
     let updated_user1 = User::find_by_id(&pool, user1.id).await.unwrap().unwrap();
@@ -2142,7 +2376,7 @@ async fn test_sync_simple_nested_ou_changes(_: PgPoolOptions, options: PgConnect
     assert_eq!(updated_user1.id, user1.id);
     assert_eq!(
         updated_user1.ldap_user_path,
-        Some("ou=engineering,ou=dept,dc=example,dc=com".to_string())
+        Some("ou=engineering,ou=dept,dc=example,dc=com".to_owned())
     );
 
     // user2 should be added
@@ -2152,15 +2386,15 @@ async fn test_sync_simple_nested_ou_changes(_: PgPoolOptions, options: PgConnect
         .unwrap();
     assert_eq!(
         added_user.ldap_user_path,
-        Some("ou=contractors,ou=external,ou=projects,ou=temp,dc=example,dc=com".to_string())
+        Some("ou=contractors,ou=external,ou=projects,ou=temp,dc=example,dc=com".to_owned())
     );
     assert!(added_user.from_ldap);
 
     let user1_groups = updated_user1.member_of_names(&pool).await.unwrap();
-    assert!(user1_groups.contains(&"developers".to_string()));
+    assert!(user1_groups.contains(&"developers".to_owned()));
 
     let user2_groups = added_user.member_of_names(&pool).await.unwrap();
-    assert!(user2_groups.contains(&"developers".to_string()));
+    assert!(user2_groups.contains(&"developers".to_owned()));
 
     assert!(ldap_conn.test_client.get_events().is_empty());
 
@@ -2174,6 +2408,7 @@ async fn test_sync_incremental_with_nested_ou_conflicts(
 ) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
     set_test_license_business();
 
@@ -2181,61 +2416,64 @@ async fn test_sync_incremental_with_nested_ou_conflicts(
     let config = ldap_conn.config.clone();
 
     let mut user1 = make_test_user("user1", None, None);
-    user1.ldap_user_path = Some("ou=dept,dc=example,dc=com".to_string());
-    user1.ldap_rdn = Some("user1".to_string());
+    user1.ldap_user_path = Some("ou=dept,dc=example,dc=com".to_owned());
+    user1.ldap_rdn = Some("user1".to_owned());
     user1.from_ldap = true;
     let user1 = user1.save(&pool).await.unwrap();
 
     let mut user2 = make_test_user("user2", None, None);
     user2.ldap_user_path = None;
-    user2.ldap_rdn = Some("user2".to_string());
+    user2.ldap_rdn = Some("user2".to_owned());
     user2.from_ldap = true;
     let user2 = user2.save(&pool).await.unwrap();
 
     let mut user3 = make_test_user("user3", None, None);
-    user3.ldap_user_path = Some("ou=wrong,ou=path,dc=example,dc=com".to_string());
-    user3.ldap_rdn = Some("different_rdn".to_string());
+    user3.ldap_user_path = Some("ou=wrong,ou=path,dc=example,dc=com".to_owned());
+    user3.ldap_rdn = Some("different_rdn".to_owned());
     user3.from_ldap = true;
     let user3 = user3.save(&pool).await.unwrap();
 
     let mut ldap_user1 = user1.clone().as_noid();
-    ldap_user1.ldap_user_path = Some("ou=dept,dc=example,dc=com".to_string());
-    ldap_user1.email = "updated1@example.com".to_string();
+    ldap_user1.ldap_user_path = Some("ou=dept,dc=example,dc=com".to_owned());
+    ldap_user1.email = "updated1@example.com".to_owned();
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_user1, &config);
 
     let mut ldap_user2 = user2.clone().as_noid();
     ldap_user2.ldap_user_path =
-        Some("ou=found,ou=department,ou=division,dc=example,dc=com".to_string());
-    ldap_user2.first_name = "FoundFirst".to_string();
+        Some("ou=found,ou=department,ou=division,dc=example,dc=com".to_owned());
+    ldap_user2.first_name = "FoundFirst".to_owned();
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_user2, &config);
 
     let mut ldap_user3 = user3.clone().as_noid();
-    ldap_user3.ldap_rdn = Some("different_rdn".to_string());
-    ldap_user3.ldap_user_path = Some("ou=correct,ou=path,dc=example,dc=com".to_string());
-    ldap_user3.last_name = "UpdatedLast".to_string();
+    ldap_user3.ldap_rdn = Some("different_rdn".to_owned());
+    ldap_user3.ldap_user_path = Some("ou=correct,ou=path,dc=example,dc=com".to_owned());
+    ldap_user3.last_name = "UpdatedLast".to_owned();
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_user3, &config);
 
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     // user1: should get updated attributes and path from intersecting users
     let updated_user1 = User::find_by_id(&pool, user1.id).await.unwrap().unwrap();
     assert_eq!(updated_user1.email, "updated1@example.com");
     assert_eq!(
         updated_user1.ldap_user_path,
-        Some("ou=dept,dc=example,dc=com".to_string())
+        Some("ou=dept,dc=example,dc=com".to_owned())
     );
 
     let updated_user2 = User::find_by_id(&pool, user2.id).await.unwrap().unwrap();
     assert_eq!(updated_user2.first_name, "FoundFirst");
     assert_eq!(
         updated_user2.ldap_user_path,
-        Some("ou=found,ou=department,ou=division,dc=example,dc=com".to_string())
+        Some("ou=found,ou=department,ou=division,dc=example,dc=com".to_owned())
     );
 
     // user3 should be re-created as it has a different path
@@ -2252,7 +2490,7 @@ async fn test_sync_incremental_with_nested_ou_conflicts(
     assert_eq!(created_user3.last_name, "UpdatedLast");
     assert_eq!(
         created_user3.ldap_user_path,
-        Some("ou=correct,ou=path,dc=example,dc=com".to_string())
+        Some("ou=correct,ou=path,dc=example,dc=com".to_owned())
     );
     assert!(ldap_conn.test_client.get_events().is_empty());
 }
@@ -2264,6 +2502,7 @@ async fn test_sync_defguard_authority_with_complex_nested_ous(
 ) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, mut ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
 
     let mut settings = Settings::get_current_settings();
@@ -2278,23 +2517,23 @@ async fn test_sync_defguard_authority_with_complex_nested_ous(
 
     let mut user1 = make_test_user("user1", None, None);
     user1.ldap_user_path =
-        Some("ou=backend,ou=engineering,ou=product,ou=company,dc=example,dc=com".to_string());
-    user1.ldap_rdn = Some("user1".to_string());
+        Some("ou=backend,ou=engineering,ou=product,ou=company,dc=example,dc=com".to_owned());
+    user1.ldap_rdn = Some("user1".to_owned());
     user1.from_ldap = true;
     let user1 = user1.save(&pool).await.unwrap();
     user1.add_to_group(&pool, &group1).await.unwrap();
 
     let mut user2 = make_test_user("user2", None, None);
     user2.ldap_user_path =
-        Some("ou=frontend,ou=ui-ux,ou=design,ou=creative,dc=example,dc=com".to_string());
-    user2.ldap_rdn = Some("user2".to_string());
+        Some("ou=frontend,ou=ui-ux,ou=design,ou=creative,dc=example,dc=com".to_owned());
+    user2.ldap_rdn = Some("user2".to_owned());
     user2.from_ldap = true;
     let user2 = user2.save(&pool).await.unwrap();
     user2.add_to_group(&pool, &group2).await.unwrap();
 
     let mut defguard_only_user = make_test_user("user3", None, None);
     defguard_only_user.ldap_user_path =
-        Some("ou=devops,ou=infrastructure,ou=operations,dc=example,dc=com".to_string());
+        Some("ou=devops,ou=infrastructure,ou=operations,dc=example,dc=com".to_owned());
     defguard_only_user.from_ldap = false; // Not from LDAP initially
     let defguard_only_user = defguard_only_user.save(&pool).await.unwrap();
     defguard_only_user
@@ -2307,7 +2546,7 @@ async fn test_sync_defguard_authority_with_complex_nested_ous(
         .unwrap();
 
     let mut ldap_user1 = user1.clone().as_noid();
-    ldap_user1.email = "old1@example.com".to_string();
+    ldap_user1.email = "old1@example.com".to_owned();
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_user1, &config);
@@ -2318,14 +2557,14 @@ async fn test_sync_defguard_authority_with_complex_nested_ous(
     );
 
     let mut ldap_user2 = user2.clone().as_noid();
-    ldap_user2.first_name = "OldFirst".to_string();
+    ldap_user2.first_name = "OldFirst".to_owned();
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_user2, &config);
 
     let mut ldap_only_user = make_test_user("user4", None, None);
     ldap_only_user.ldap_user_path =
-        Some("ou=temp,ou=contractors,ou=external,dc=example,dc=com".to_string());
+        Some("ou=temp,ou=contractors,ou=external,dc=example,dc=com".to_owned());
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_only_user, &config);
@@ -2338,14 +2577,14 @@ async fn test_sync_defguard_authority_with_complex_nested_ous(
     let initial_ldap_users = ldap_conn.get_all_users().await.unwrap();
     let initial_count = initial_ldap_users.len();
 
-    ldap_conn.sync(&pool, true, &wg_tx).await.unwrap();
+    ldap_conn.sync(&pool, true, &wg_tx, &ldap_tx).await.unwrap();
 
     // intersecting users still exist in Defguard with same IDs
     let updated_user1 = User::find_by_id(&pool, user1.id).await.unwrap().unwrap();
     assert_eq!(updated_user1.id, user1.id);
     assert_eq!(
         updated_user1.ldap_user_path,
-        Some("ou=backend,ou=engineering,ou=product,ou=company,dc=example,dc=com".to_string())
+        Some("ou=backend,ou=engineering,ou=product,ou=company,dc=example,dc=com".to_owned())
     );
     assert_ne!(updated_user1.email, "old1@example.com"); // Should not be overridden by LDAP with Defguard authority
 
@@ -2353,7 +2592,7 @@ async fn test_sync_defguard_authority_with_complex_nested_ous(
     assert_eq!(updated_user2.id, user2.id);
     assert_eq!(
         updated_user2.ldap_user_path,
-        Some("ou=frontend,ou=ui-ux,ou=design,ou=creative,dc=example,dc=com".to_string())
+        Some("ou=frontend,ou=ui-ux,ou=design,ou=creative,dc=example,dc=com".to_owned())
     );
     assert_ne!(updated_user2.first_name, "OldFirst"); // Should not be overridden by LDAP with Defguard authority
 
@@ -2364,7 +2603,7 @@ async fn test_sync_defguard_authority_with_complex_nested_ous(
     assert_eq!(updated_defguard_only.id, defguard_only_user.id);
     assert_eq!(
         updated_defguard_only.ldap_user_path,
-        Some("ou=devops,ou=infrastructure,ou=operations,dc=example,dc=com".to_string())
+        Some("ou=devops,ou=infrastructure,ou=operations,dc=example,dc=com".to_owned())
     );
 
     // LDAP-only user was deleted from Defguard (with Defguard authority)
@@ -2379,21 +2618,34 @@ async fn test_sync_defguard_authority_with_complex_nested_ous(
 
     // group memberships were pushed to LDAP from Defguard
     let user1_groups = updated_user1.member_of_names(&pool).await.unwrap();
-    assert!(user1_groups.contains(&"backend-devs".to_string()));
+    assert!(user1_groups.contains(&"backend-devs".to_owned()));
 
     let user2_groups = updated_user2.member_of_names(&pool).await.unwrap();
-    assert!(user2_groups.contains(&"frontend-devs".to_string()));
+    assert!(user2_groups.contains(&"frontend-devs".to_owned()));
 
     let user3_groups = updated_defguard_only.member_of_names(&pool).await.unwrap();
-    assert!(user3_groups.contains(&"backend-devs".to_string()));
-    assert!(user3_groups.contains(&"frontend-devs".to_string()));
+    assert!(user3_groups.contains(&"backend-devs".to_owned()));
+    assert!(user3_groups.contains(&"frontend-devs".to_owned()));
     assert!(!ldap_conn.test_client.get_events().is_empty());
+
+    let events = drain_ldap_sync_events(&mut ldap_rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LdapSyncEventType::OutboundUserCreated { user }
+            if user.username == "user3"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LdapSyncEventType::OutboundUserDeleted { username }
+            if username == "user4"
+    )));
 }
 
 #[sqlx::test]
 async fn test_sync_with_ou_path_edge_cases(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
     let mut ldap_conn = super::LDAPConnection::create().await.unwrap();
     let config = ldap_conn.config.clone();
@@ -2401,13 +2653,13 @@ async fn test_sync_with_ou_path_edge_cases(_: PgPoolOptions, options: PgConnectO
     // user with missing path and special characters in OU names
     let mut user2 = make_test_user("user2", None, None);
     user2.ldap_user_path = None;
-    user2.ldap_rdn = Some("user2".to_string());
+    user2.ldap_rdn = Some("user2".to_owned());
     user2.from_ldap = true;
     let user2 = user2.save(&pool).await.unwrap();
 
     let mut ldap_user2 = user2.clone().as_noid();
     ldap_user2.ldap_user_path =
-        Some("ou=r&d,ou=research-development,ou=company-name,dc=example,dc=com".to_string());
+        Some("ou=r&d,ou=research-development,ou=company-name,dc=example,dc=com".to_owned());
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_user2, &config);
@@ -2415,46 +2667,49 @@ async fn test_sync_with_ou_path_edge_cases(_: PgPoolOptions, options: PgConnectO
     // user with missing path and minimal OU structure
     let mut user3 = make_test_user("user3", None, None);
     user3.ldap_user_path = None;
-    user3.ldap_rdn = Some("user3".to_string());
+    user3.ldap_rdn = Some("user3".to_owned());
     user3.from_ldap = true;
     let user3 = user3.save(&pool).await.unwrap();
 
     let mut ldap_user3 = user3.clone().as_noid();
-    ldap_user3.ldap_user_path = Some("ou=users,dc=example,dc=com".to_string());
+    ldap_user3.ldap_user_path = Some("ou=users,dc=example,dc=com".to_owned());
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_user3, &config);
 
     // user with different DN structure - will be deleted and recreated
     let mut user4 = make_test_user("user4", None, None);
-    user4.ldap_user_path = Some("ou=old-structure,dc=example,dc=com".to_string());
-    user4.ldap_rdn = Some("user4".to_string());
+    user4.ldap_user_path = Some("ou=old-structure,dc=example,dc=com".to_owned());
+    user4.ldap_rdn = Some("user4".to_owned());
     user4.from_ldap = true;
     let user4 = user4.save(&pool).await.unwrap();
 
     let mut ldap_user4 = make_test_user("user4", None, None);
     ldap_user4.ldap_user_path =
-        Some("ou=new-structure,ou=reorganized,dc=example,dc=com".to_string());
-    ldap_user4.ldap_rdn = Some("user4".to_string());
-    ldap_user4.email = "updated4@example.com".to_string();
+        Some("ou=new-structure,ou=reorganized,dc=example,dc=com".to_owned());
+    ldap_user4.ldap_rdn = Some("user4".to_owned());
+    ldap_user4.email = "updated4@example.com".to_owned();
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_user4, &config);
 
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     let updated_user2 = User::find_by_id(&pool, user2.id).await.unwrap().unwrap();
     assert_eq!(updated_user2.id, user2.id); // Same user
     assert_eq!(
         updated_user2.ldap_user_path,
-        Some("ou=r&d,ou=research-development,ou=company-name,dc=example,dc=com".to_string())
+        Some("ou=r&d,ou=research-development,ou=company-name,dc=example,dc=com".to_owned())
     );
 
     let updated_user3 = User::find_by_id(&pool, user3.id).await.unwrap().unwrap();
     assert_eq!(updated_user3.id, user3.id); // Same user
     assert_eq!(
         updated_user3.ldap_user_path,
-        Some("ou=users,dc=example,dc=com".to_string())
+        Some("ou=users,dc=example,dc=com".to_owned())
     );
 
     // The old user should be deleted and a new one created
@@ -2472,7 +2727,7 @@ async fn test_sync_with_ou_path_edge_cases(_: PgPoolOptions, options: PgConnectO
     assert_eq!(new_user4.email, "updated4@example.com");
     assert_eq!(
         new_user4.ldap_user_path,
-        Some("ou=new-structure,ou=reorganized,dc=example,dc=com".to_string())
+        Some("ou=new-structure,ou=reorganized,dc=example,dc=com".to_owned())
     );
     assert!(ldap_conn.test_client.get_events().is_empty());
 }
@@ -2484,6 +2739,7 @@ async fn test_sync_group_membership_with_intersecting_users(
 ) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, mut ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
     set_test_license_business();
 
@@ -2494,15 +2750,15 @@ async fn test_sync_group_membership_with_intersecting_users(
     let group2 = Group::new("management").save(&pool).await.unwrap();
 
     let mut user1 = make_test_user("user1", None, None);
-    user1.ldap_user_path = Some("ou=backend,ou=engineering,dc=example,dc=com".to_string());
-    user1.ldap_rdn = Some("user1".to_string());
+    user1.ldap_user_path = Some("ou=backend,ou=engineering,dc=example,dc=com".to_owned());
+    user1.ldap_rdn = Some("user1".to_owned());
     user1.from_ldap = true;
     let user1 = user1.save(&pool).await.unwrap();
     user1.add_to_group(&pool, &group1).await.unwrap();
 
     let mut user2 = make_test_user("user2", None, None);
-    user2.ldap_user_path = Some("ou=frontend,ou=engineering,dc=example,dc=com".to_string());
-    user2.ldap_rdn = Some("user2".to_string());
+    user2.ldap_user_path = Some("ou=frontend,ou=engineering,dc=example,dc=com".to_owned());
+    user2.ldap_rdn = Some("user2".to_owned());
     user2.from_ldap = true;
     let user2 = user2.save(&pool).await.unwrap();
     user2.add_to_group(&pool, &group1).await.unwrap();
@@ -2532,20 +2788,23 @@ async fn test_sync_group_membership_with_intersecting_users(
         &config,
     );
 
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     let updated_user1 = User::find_by_id(&pool, user1.id).await.unwrap().unwrap();
     assert_eq!(updated_user1.id, user1.id);
     assert_eq!(
         updated_user1.ldap_user_path,
-        Some("ou=backend,ou=engineering,dc=example,dc=com".to_string())
+        Some("ou=backend,ou=engineering,dc=example,dc=com".to_owned())
     );
 
     let updated_user2 = User::find_by_id(&pool, user2.id).await.unwrap().unwrap();
     assert_eq!(updated_user2.id, user2.id);
     assert_eq!(
         updated_user2.ldap_user_path,
-        Some("ou=frontend,ou=engineering,dc=example,dc=com".to_string())
+        Some("ou=frontend,ou=engineering,dc=example,dc=com".to_owned())
     );
 
     let user1_groups = updated_user1.member_of_names(&pool).await.unwrap();
@@ -2556,6 +2815,18 @@ async fn test_sync_group_membership_with_intersecting_users(
     assert!(user2_groups.iter().any(|e| e == "management"));
     assert!(!user2_groups.iter().any(|e| e == "engineering")); // Removed from LDAP
     assert!(ldap_conn.test_client.get_events().is_empty());
+
+    let events = drain_ldap_sync_events(&mut ldap_rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LdapSyncEventType::GroupMemberAdded { group, user }
+            if group.name == "management" && user.username == "user1"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LdapSyncEventType::GroupMemberRemoved { group, user }
+            if group.name == "engineering" && user.username == "user2"
+    )));
 }
 
 #[sqlx::test]
@@ -2565,12 +2836,13 @@ async fn test_sync_ldap_to_defguard_does_not_exceed_user_license_limit(
 ) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, mut ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
 
     let user_limit = 1;
     // set license with some limits
     let license = License::new(
-        "test".to_string(),
+        "test".to_owned(),
         false,
         None,
         Some(LicenseLimits {
@@ -2582,6 +2854,7 @@ async fn test_sync_ldap_to_defguard_does_not_exceed_user_license_limit(
         None,
         LicenseTier::Business,
         SupportType::Basic,
+        vec![],
     );
     set_cached_license(Some(license));
 
@@ -2596,13 +2869,16 @@ async fn test_sync_ldap_to_defguard_does_not_exceed_user_license_limit(
     let config = ldap_conn.config.clone();
 
     let mut ldap_only_user = make_test_user("ldap_only_user_limit", None, None);
-    ldap_only_user.ldap_rdn = Some("ldap_only_user_limit".to_string());
-    ldap_only_user.ldap_user_path = Some("ou=users,dc=example,dc=com".to_string());
+    ldap_only_user.ldap_rdn = Some("ldap_only_user_limit".to_owned());
+    ldap_only_user.ldap_user_path = Some("ou=users,dc=example,dc=com".to_owned());
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_only_user, &config);
 
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     let user_count_after_sync = get_counts().user();
 
@@ -2615,6 +2891,13 @@ async fn test_sync_ldap_to_defguard_does_not_exceed_user_license_limit(
         .await
         .unwrap();
     assert!(skipped_user.is_none());
+
+    let events = drain_ldap_sync_events(&mut ldap_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        LdapSyncEventType::UserCreated { user }
+            if user.username == "ldap_only_user_limit"
+    )));
 }
 
 #[sqlx::test]
@@ -2627,7 +2910,7 @@ async fn test_ldap_login_does_not_create_user_when_user_license_limit_is_reached
 
     let user_limit = 1;
     let license = License::new(
-        "test".to_string(),
+        "test".to_owned(),
         false,
         None,
         Some(LicenseLimits {
@@ -2639,6 +2922,7 @@ async fn test_ldap_login_does_not_create_user_when_user_license_limit_is_reached
         None,
         LicenseTier::Business,
         SupportType::Basic,
+        vec![],
     );
     set_cached_license(Some(license));
 
@@ -2652,8 +2936,8 @@ async fn test_ldap_login_does_not_create_user_when_user_license_limit_is_reached
     let config = ldap_conn.config.clone();
 
     let mut ldap_only_user = make_test_user("ldap_login_only_user_limit", None, None);
-    ldap_only_user.ldap_rdn = Some("ldap_login_only_user_limit".to_string());
-    ldap_only_user.ldap_user_path = Some("ou=users,dc=example,dc=com".to_string());
+    ldap_only_user.ldap_rdn = Some("ldap_login_only_user_limit".to_owned());
+    ldap_only_user.ldap_user_path = Some("ou=users,dc=example,dc=com".to_owned());
     ldap_conn
         .test_client_mut()
         .add_test_user(&ldap_only_user, &config);
@@ -2697,15 +2981,15 @@ async fn test_get_empty_user_path(_: PgPoolOptions, options: PgConnectOptions) {
 fn test_extract_dn_value() {
     assert_eq!(
         extract_rdn_value("cn=testuser,dc=example,dc=com"),
-        Some("testuser".to_string())
+        Some("testuser".to_owned())
     );
     assert_eq!(
         extract_rdn_value("cn=Test User,dc=example,dc=com"),
-        Some("Test User".to_string())
+        Some("Test User".to_owned())
     );
     assert_eq!(
         extract_rdn_value("cn=user.name+123,dc=example,dc=com"),
-        Some("user.name+123".to_string())
+        Some("user.name+123".to_owned())
     );
     assert_eq!(extract_rdn_value("invalid-dn"), None);
     assert_eq!(extract_rdn_value("cn=onlyvalue"), None);
@@ -2721,13 +3005,13 @@ fn test_from_searchentry() {
     // all attributes
     {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname1".to_string()]);
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
-        attrs.insert("mobile".to_string(), vec!["1234567890".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname1".to_owned()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
+        attrs.insert("mobile".to_owned(), vec!["1234567890".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "cn=user1,dc=example,dc=com".to_string(),
+            dn: "cn=user1,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2740,19 +3024,19 @@ fn test_from_searchentry() {
         assert_eq!(user.last_name, "lastname1");
         assert_eq!(user.first_name, "firstname1");
         assert_eq!(user.email, "user1@example.com");
-        assert_eq!(user.phone, Some("1234567890".to_string()));
+        assert_eq!(user.phone, Some("1234567890".to_owned()));
         assert!(user.from_ldap);
     }
 
     // without mobile
     {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname1".to_string()]);
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname1".to_owned()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "cn=user1,dc=example,dc=com".to_string(),
+            dn: "cn=user1,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2770,11 +3054,11 @@ fn test_from_searchentry() {
     // missing givenName attribute
     {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "cn=user1,dc=example,dc=com".to_string(),
+            dn: "cn=user1,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2790,11 +3074,11 @@ fn test_from_searchentry() {
     // missing sn attribute
     {
         let mut attrs = HashMap::new();
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "cn=user1,dc=example,dc=com".to_string(),
+            dn: "cn=user1,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2810,11 +3094,11 @@ fn test_from_searchentry() {
     // missing mail attribute
     {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname1".to_string()]);
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname1".to_owned()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "cn=user1,dc=example,dc=com".to_string(),
+            dn: "cn=user1,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2830,12 +3114,12 @@ fn test_from_searchentry() {
     // empty attribute values
     {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), Vec::new());
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
+        attrs.insert("sn".to_owned(), Vec::new());
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "cn=user1,dc=example,dc=com".to_string(),
+            dn: "cn=user1,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2851,12 +3135,12 @@ fn test_from_searchentry() {
     // invalid DN
     {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname1".to_string()]);
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname1".to_owned()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "cn=user1".to_string(), // No comma, invalid DN
+            dn: "cn=user1".to_owned(), // No comma, invalid DN
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2869,12 +3153,12 @@ fn test_from_searchentry() {
         ));
 
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname1".to_string()]);
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname1".to_owned()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "user1,dc=example,dc=com".to_string(), // No equals sign in RDN
+            dn: "user1,dc=example,dc=com".to_owned(), // No equals sign in RDN
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2890,12 +3174,12 @@ fn test_from_searchentry() {
     // invalid username
     {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname1".to_string()]);
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname1".to_owned()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "cn=user1,dc=example,dc=com".to_string(),
+            dn: "cn=user1,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2912,13 +3196,13 @@ fn test_from_searchentry() {
     // complex DN
     {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname1".to_string()]);
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
-        attrs.insert("mobile".to_string(), vec!["1234567890".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname1".to_owned()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
+        attrs.insert("mobile".to_owned(), vec!["1234567890".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "uid=user1,ou=People,ou=Department,dc=example,dc=com".to_string(),
+            dn: "uid=user1,ou=People,ou=Department,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2931,24 +3215,24 @@ fn test_from_searchentry() {
         assert_eq!(user.last_name, "lastname1");
         assert_eq!(user.first_name, "firstname1");
         assert_eq!(user.email, "user1@example.com");
-        assert_eq!(user.phone, Some("1234567890".to_string()));
+        assert_eq!(user.phone, Some("1234567890".to_owned()));
         assert!(user.from_ldap);
-        assert_eq!(user.ldap_rdn, Some("user1".to_string()));
+        assert_eq!(user.ldap_rdn, Some("user1".to_owned()));
         assert_eq!(
             user.ldap_user_path,
-            Some("ou=People,ou=Department,dc=example,dc=com".to_string())
+            Some("ou=People,ou=Department,dc=example,dc=com".to_owned())
         );
     }
 
     // with password
     {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname1".to_string()]);
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname1".to_owned()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "cn=user1,dc=example,dc=com".to_string(),
+            dn: "cn=user1,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2966,27 +3250,24 @@ fn test_from_searchentry() {
     {
         let mut attrs = HashMap::new();
         attrs.insert(
-            "sn".to_string(),
-            vec!["lastname1".to_string(), "lastname2".to_string()],
+            "sn".to_owned(),
+            vec!["lastname1".to_owned(), "lastname2".to_owned()],
         );
         attrs.insert(
-            "givenName".to_string(),
-            vec!["firstname1".to_string(), "firstname2".to_string()],
+            "givenName".to_owned(),
+            vec!["firstname1".to_owned(), "firstname2".to_owned()],
         );
         attrs.insert(
-            "mail".to_string(),
-            vec![
-                "user1@example.com".to_string(),
-                "user1@other.com".to_string(),
-            ],
+            "mail".to_owned(),
+            vec!["user1@example.com".to_owned(), "user1@other.com".to_owned()],
         );
         attrs.insert(
-            "mobile".to_string(),
-            vec!["1234567890".to_string(), "0987654321".to_string()],
+            "mobile".to_owned(),
+            vec!["1234567890".to_owned(), "0987654321".to_owned()],
         );
 
         let entry = SearchEntry {
-            dn: "cn=user1,dc=example,dc=com".to_string(),
+            dn: "cn=user1,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -2997,19 +3278,19 @@ fn test_from_searchentry() {
         assert_eq!(user.last_name, "lastname1");
         assert_eq!(user.first_name, "firstname1");
         assert_eq!(user.email, "user1@example.com");
-        assert_eq!(user.phone, Some("1234567890".to_string()));
+        assert_eq!(user.phone, Some("1234567890".to_owned()));
         assert!(user.from_ldap);
     }
 
     // fields properly set
     {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname1".to_string()]);
-        attrs.insert("givenName".to_string(), vec!["firstname1".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user1@example.com".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname1".to_owned()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname1".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user1@example.com".to_owned()]);
 
         let entry = SearchEntry {
-            dn: "cn=testuser,ou=users,dc=example,dc=com".to_string(),
+            dn: "cn=testuser,ou=users,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         };
@@ -3018,10 +3299,10 @@ fn test_from_searchentry() {
 
         // Verify LDAP-specific fields are properly set
         assert!(user.from_ldap);
-        assert_eq!(user.ldap_rdn, Some("testuser".to_string()));
+        assert_eq!(user.ldap_rdn, Some("testuser".to_owned()));
         assert_eq!(
             user.ldap_user_path,
-            Some("ou=users,dc=example,dc=com".to_string())
+            Some("ou=users,dc=example,dc=com".to_owned())
         );
     }
 }
@@ -3029,12 +3310,12 @@ fn test_from_searchentry() {
 #[test]
 fn test_as_ldap_attrs() {
     let user = User::new(
-        "testuser".to_string(),
+        "testuser".to_owned(),
         Some("password123"),
-        "Smith".to_string(),
-        "John".to_string(),
-        "john.smith@example.com".to_string(),
-        Some("5551234".to_string()),
+        "Smith".to_owned(),
+        "John".to_owned(),
+        "john.smith@example.com".to_owned(),
+        Some("5551234".to_owned()),
     );
 
     // Basic test with InetOrgPerson
@@ -3102,11 +3383,11 @@ fn test_as_ldap_attrs() {
 
     // Test with empty phone
     let user_no_phone = User::new(
-        "testuser".to_string(),
+        "testuser".to_owned(),
         Some("password123"),
-        "Smith".to_string(),
-        "John".to_string(),
-        "john.smith@example.com".to_string(),
+        "Smith".to_owned(),
+        "John".to_owned(),
+        "john.smith@example.com".to_owned(),
         Some(String::new()),
     );
 
@@ -3130,151 +3411,139 @@ fn test_as_ldap_attrs() {
 #[test]
 fn test_as_ldap_mod_inetorgperson() {
     let user = User::new(
-        "testuser".to_string(),
+        "testuser".to_owned(),
         Some("password123"),
-        "Smith".to_string(),
-        "John".to_string(),
-        "john.smith@example.com".to_string(),
-        Some("5551234".to_string()),
+        "Smith".to_owned(),
+        "John".to_owned(),
+        "john.smith@example.com".to_owned(),
+        Some("5551234".to_owned()),
     );
 
     let config = LDAPConfig {
-        ldap_user_rdn_attr: Some("cn".to_string()),
-        ldap_username_attr: "uid".to_string(),
+        ldap_user_rdn_attr: Some("cn".to_owned()),
+        ldap_username_attr: "uid".to_owned(),
         ..Default::default()
     };
 
     let mods = user_as_ldap_mod(&user, &config);
+    assert!(mods.contains(&Mod::Replace("sn".to_owned(), hashset!["Smith".to_owned()],)));
     assert!(mods.contains(&Mod::Replace(
-        "sn".to_string(),
-        hashset!["Smith".to_string()],
+        "givenName".to_owned(),
+        hashset!["John".to_owned()],
     )));
     assert!(mods.contains(&Mod::Replace(
-        "givenName".to_string(),
-        hashset!["John".to_string()],
+        "mail".to_owned(),
+        hashset!["john.smith@example.com".to_owned()],
     )));
     assert!(mods.contains(&Mod::Replace(
-        "mail".to_string(),
-        hashset!["john.smith@example.com".to_string()],
-    )));
-    assert!(mods.contains(&Mod::Replace(
-        "mobile".to_string(),
-        hashset!["5551234".to_string()],
+        "mobile".to_owned(),
+        hashset!["5551234".to_owned()],
     )));
 }
 
 #[test]
 fn test_as_ldap_mod_with_empty_phone() {
     let user = User::new(
-        "testuser".to_string(),
+        "testuser".to_owned(),
         Some("password123"),
-        "Smith".to_string(),
-        "John".to_string(),
-        "john.smith@example.com".to_string(),
+        "Smith".to_owned(),
+        "John".to_owned(),
+        "john.smith@example.com".to_owned(),
         Some(String::new()),
     );
 
     let config = LDAPConfig {
-        ldap_user_rdn_attr: Some("cn".to_string()),
-        ldap_username_attr: "uid".to_string(),
+        ldap_user_rdn_attr: Some("cn".to_owned()),
+        ldap_username_attr: "uid".to_owned(),
         ..Default::default()
     };
 
     let mods = user_as_ldap_mod(&user, &config);
 
+    assert!(mods.contains(&Mod::Replace("sn".to_owned(), hashset!["Smith".to_owned()],)));
     assert!(mods.contains(&Mod::Replace(
-        "sn".to_string(),
-        hashset!["Smith".to_string()],
+        "givenName".to_owned(),
+        hashset!["John".to_owned()],
     )));
     assert!(mods.contains(&Mod::Replace(
-        "givenName".to_string(),
-        hashset!["John".to_string()],
+        "mail".to_owned(),
+        hashset!["john.smith@example.com".to_owned()],
     )));
-    assert!(mods.contains(&Mod::Replace(
-        "mail".to_string(),
-        hashset!["john.smith@example.com".to_string()],
-    )));
-    assert!(mods.contains(&Mod::Replace("mobile".to_string(), HashSet::new(),)));
+    assert!(mods.contains(&Mod::Replace("mobile".to_owned(), HashSet::new(),)));
 }
 
 #[test]
 fn test_as_ldap_mod_with_active_directory() {
     let user = User::new(
-        "testuser".to_string(),
+        "testuser".to_owned(),
         Some("password123"),
-        "Smith".to_string(),
-        "John".to_string(),
-        "john.smith@example.com".to_string(),
-        Some("5551234".to_string()),
+        "Smith".to_owned(),
+        "John".to_owned(),
+        "john.smith@example.com".to_owned(),
+        Some("5551234".to_owned()),
     );
 
     let config = LDAPConfig {
-        ldap_user_obj_class: "user".to_string(),
-        ldap_user_rdn_attr: Some("cn".to_string()),
-        ldap_username_attr: "sAMAccountName".to_string(),
+        ldap_user_obj_class: "user".to_owned(),
+        ldap_user_rdn_attr: Some("cn".to_owned()),
+        ldap_username_attr: "sAMAccountName".to_owned(),
         ldap_uses_ad: true,
         ..Default::default()
     };
 
     let mods = user_as_ldap_mod(&user, &config);
 
+    assert!(mods.contains(&Mod::Replace("sn".to_owned(), hashset!["Smith".to_owned()],)));
     assert!(mods.contains(&Mod::Replace(
-        "sn".to_string(),
-        hashset!["Smith".to_string()],
+        "givenName".to_owned(),
+        hashset!["John".to_owned()],
     )));
     assert!(mods.contains(&Mod::Replace(
-        "givenName".to_string(),
-        hashset!["John".to_string()],
+        "mail".to_owned(),
+        hashset!["john.smith@example.com".to_owned()],
     )));
     assert!(mods.contains(&Mod::Replace(
-        "mail".to_string(),
-        hashset!["john.smith@example.com".to_string()],
-    )));
-    assert!(mods.contains(&Mod::Replace(
-        "sAMAccountName".to_string(),
-        hashset!["testuser".to_string()],
+        "sAMAccountName".to_owned(),
+        hashset!["testuser".to_owned()],
     )));
 }
 
 #[test]
 fn test_as_ldap_mod_with_custom_rdn() {
     let user = User::new(
-        "testuser".to_string(),
+        "testuser".to_owned(),
         Some("password123"),
-        "Smith".to_string(),
-        "John".to_string(),
-        "john.smith@example.com".to_string(),
-        Some("5551234".to_string()),
+        "Smith".to_owned(),
+        "John".to_owned(),
+        "john.smith@example.com".to_owned(),
+        Some("5551234".to_owned()),
     );
 
     let config = LDAPConfig {
-        ldap_user_rdn_attr: Some("customRDN".to_string()),
-        ldap_username_attr: "uid".to_string(),
+        ldap_user_rdn_attr: Some("customRDN".to_owned()),
+        ldap_username_attr: "uid".to_owned(),
         ldap_uses_ad: true,
         ..Default::default()
     };
 
     let mods = user_as_ldap_mod(&user, &config);
 
+    assert!(mods.contains(&Mod::Replace("sn".to_owned(), hashset!["Smith".to_owned()],)));
     assert!(mods.contains(&Mod::Replace(
-        "sn".to_string(),
-        hashset!["Smith".to_string()],
+        "givenName".to_owned(),
+        hashset!["John".to_owned()],
     )));
     assert!(mods.contains(&Mod::Replace(
-        "givenName".to_string(),
-        hashset!["John".to_string()],
+        "mail".to_owned(),
+        hashset!["john.smith@example.com".to_owned()],
     )));
     assert!(mods.contains(&Mod::Replace(
-        "mail".to_string(),
-        hashset!["john.smith@example.com".to_string()],
+        "cn".to_owned(),
+        hashset!["testuser".to_owned()],
     )));
     assert!(mods.contains(&Mod::Replace(
-        "cn".to_string(),
-        hashset!["testuser".to_string()],
-    )));
-    assert!(mods.contains(&Mod::Replace(
-        "sAMAccountName".to_string(),
-        hashset!["testuser".to_string()],
+        "sAMAccountName".to_owned(),
+        hashset!["testuser".to_owned()],
     )));
 }
 
@@ -3282,19 +3551,19 @@ fn test_as_ldap_mod_with_custom_rdn() {
 fn test_extract_dn_path_various_cases() {
     assert_eq!(
         extract_dn_path("cn=testuser,dc=example,dc=com"),
-        Some("dc=example,dc=com".to_string())
+        Some("dc=example,dc=com".to_owned())
     );
     assert_eq!(
         extract_dn_path("uid=abc,ou=users,dc=example,dc=org"),
-        Some("ou=users,dc=example,dc=org".to_string())
+        Some("ou=users,dc=example,dc=org".to_owned())
     );
     assert_eq!(
         extract_dn_path("cn=Test User,dc=example,dc=com"),
-        Some("dc=example,dc=com".to_string())
+        Some("dc=example,dc=com".to_owned())
     );
     assert_eq!(
         extract_dn_path("cn=user.name+123,ou=group,dc=example,dc=com"),
-        Some("ou=group,dc=example,dc=com".to_string())
+        Some("ou=group,dc=example,dc=com".to_owned())
     );
 
     assert_eq!(extract_dn_path("invalid-dn"), None);
@@ -3306,7 +3575,7 @@ fn test_extract_dn_path_various_cases() {
 
     assert_eq!(
         extract_dn_path("uid=cde,ou=users,ou=staff,dc=example,dc=org"),
-        Some("ou=users,ou=staff,dc=example,dc=org".to_string())
+        Some("ou=users,ou=staff,dc=example,dc=org".to_owned())
     );
 
     assert_eq!(extract_dn_path("cn=abc"), None);
@@ -3315,17 +3584,17 @@ fn test_extract_dn_path_various_cases() {
 
     assert_eq!(
         extract_dn_path("cn=,dc=example,dc=com"),
-        Some("dc=example,dc=com".to_string())
+        Some("dc=example,dc=com".to_owned())
     );
 
     assert_eq!(
         extract_dn_path("cn=abc=cde,dc=example,dc=com"),
-        Some("dc=example,dc=com".to_string())
+        Some("dc=example,dc=com".to_owned())
     );
 
     assert_eq!(
         extract_dn_path(" cn=abc ,dc=example,dc=com "),
-        Some("dc=example,dc=com ".to_string())
+        Some("dc=example,dc=com ".to_owned())
     );
 }
 
@@ -3340,7 +3609,7 @@ async fn test_ldap_sync_allowed_with_empty_sync_groups(
 
     let mut user = make_test_user("testuser", None, None);
     user.is_active = true;
-    user.password_hash = Some("hash".to_string());
+    user.password_hash = Some("hash".to_owned());
     let user = user.save(&pool).await.unwrap();
 
     let result = ldap_sync_allowed_for_user(&user, &pool).await.unwrap();
@@ -3354,7 +3623,7 @@ async fn test_ldap_sync_allowed_with_inactive_user(_: PgPoolOptions, options: Pg
 
     let mut user = make_test_user("testuser", None, None);
     user.is_active = false;
-    user.password_hash = Some("hash".to_string());
+    user.password_hash = Some("hash".to_owned());
     let user = user.save(&pool).await.unwrap();
 
     let result = ldap_sync_allowed_for_user(&user, &pool).await.unwrap();
@@ -3387,14 +3656,14 @@ async fn test_ldap_sync_allowed_with_sync_groups_user_in_group(
 
     let mut user = make_test_user("testuser", None, None);
     user.is_active = true;
-    user.password_hash = Some("hash".to_string());
+    user.password_hash = Some("hash".to_owned());
     let user = user.save(&pool).await.unwrap();
 
     let group = Group::new("ldap_sync_group").save(&pool).await.unwrap();
     user.add_to_group(&pool, &group).await.unwrap();
 
     let mut settings = Settings::get_current_settings();
-    settings.ldap_sync_groups = vec!["ldap_sync_group".to_string()];
+    settings.ldap_sync_groups = vec!["ldap_sync_group".to_owned()];
     update_current_settings(&pool, settings).await.unwrap();
 
     let result = ldap_sync_allowed_for_user(&user, &pool).await.unwrap();
@@ -3411,7 +3680,7 @@ async fn test_ldap_sync_allowed_with_sync_groups_user_not_in_group(
 
     let mut user = make_test_user("testuser", None, None);
     user.is_active = true;
-    user.password_hash = Some("hash".to_string());
+    user.password_hash = Some("hash".to_owned());
     let user = user.save(&pool).await.unwrap();
 
     let _group = Group::new("ldap_sync_group").save(&pool).await.unwrap();
@@ -3419,7 +3688,7 @@ async fn test_ldap_sync_allowed_with_sync_groups_user_not_in_group(
     user.add_to_group(&pool, &other_group).await.unwrap();
 
     let mut settings = Settings::get_current_settings();
-    settings.ldap_sync_groups = vec!["ldap_sync_group".to_string()];
+    settings.ldap_sync_groups = vec!["ldap_sync_group".to_owned()];
     update_current_settings(&pool, settings).await.unwrap();
 
     let result = ldap_sync_allowed_for_user(&user, &pool).await.unwrap();
@@ -3436,7 +3705,7 @@ async fn test_ldap_sync_allowed_with_multiple_sync_groups(
 
     let mut user = make_test_user("testuser", None, None);
     user.is_active = true;
-    user.password_hash = Some("hash".to_string());
+    user.password_hash = Some("hash".to_owned());
     let user = user.save(&pool).await.unwrap();
 
     let _group1 = Group::new("group1").save(&pool).await.unwrap();
@@ -3447,9 +3716,9 @@ async fn test_ldap_sync_allowed_with_multiple_sync_groups(
 
     let mut settings = Settings::get_current_settings();
     settings.ldap_sync_groups = vec![
-        "group1".to_string(),
-        "group2".to_string(),
-        "group3".to_string(),
+        "group1".to_owned(),
+        "group2".to_owned(),
+        "group3".to_owned(),
     ];
     update_current_settings(&pool, settings).await.unwrap();
 
@@ -3466,7 +3735,7 @@ async fn test_ldap_sync_allowed_enrolled_via_openid(_: PgPoolOptions, options: P
     let mut user = make_test_user("testuser", None, None);
     user.is_active = true;
     user.password_hash = None;
-    user.openid_sub = Some("openid_sub".to_string());
+    user.openid_sub = Some("openid_sub".to_owned());
     user.from_ldap = false;
     let user = user.save(&pool).await.unwrap();
 
@@ -3548,7 +3817,7 @@ async fn test_ldap_sync_allowed_all_conditions_false(_: PgPoolOptions, options: 
     let _group = Group::new("ldap_sync_group").save(&pool).await.unwrap();
 
     let mut settings = Settings::get_current_settings();
-    settings.ldap_sync_groups = vec!["ldap_sync_group".to_string()];
+    settings.ldap_sync_groups = vec!["ldap_sync_group".to_owned()];
     update_current_settings(&pool, settings).await.unwrap();
 
     let result = ldap_sync_allowed_for_user(&user, &pool).await.unwrap();
@@ -3564,6 +3833,7 @@ async fn test_sync_does_not_send_invite_when_flags_disabled(
 ) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, mut ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
 
     // Create an admin so find_admins() would have something to return - we want to prove
@@ -3580,13 +3850,23 @@ async fn test_sync_does_not_send_invite_when_flags_disabled(
         .test_client_mut()
         .add_test_user(&ldap_user, &config);
 
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     // User must be saved to Defguard.
     let saved = User::find_by_username(&pool, "sync_invite_disabled_user")
         .await
         .unwrap();
     assert!(saved.is_some(), "User should have been synced to Defguard");
+
+    let events = drain_ldap_sync_events(&mut ldap_rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LdapSyncEventType::UserCreated { user }
+            if user.username == "sync_invite_disabled_user"
+    )));
 
     // No enrollment token should have been created.
     let tokens = Token::fetch_all(&pool).await.unwrap();
@@ -3605,6 +3885,7 @@ async fn test_sync_invite_skipped_when_send_invite_flag_disabled(
 ) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
 
     let mut settings = Settings::get_current_settings();
@@ -3625,7 +3906,10 @@ async fn test_sync_invite_skipped_when_send_invite_flag_disabled(
         .test_client_mut()
         .add_test_user(&ldap_user, &config);
 
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     let saved = User::find_by_username(&pool, "sync_invite_sendoff_user")
         .await
@@ -3649,6 +3933,7 @@ async fn test_sync_invite_skipped_when_send_invite_flag_disabled(
 async fn test_sync_sends_invite_when_flags_enabled(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
 
     let mut settings = Settings::get_current_settings();
@@ -3671,7 +3956,10 @@ async fn test_sync_sends_invite_when_flags_enabled(_: PgPoolOptions, options: Pg
         .test_client_mut()
         .add_test_user(&ldap_user, &config);
 
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     let saved = User::find_by_username(&pool, "sync_invite_user")
         .await
@@ -3695,7 +3983,10 @@ async fn test_sync_sends_invite_when_flags_enabled(_: PgPoolOptions, options: Pg
     );
 
     // Second sync: user already exists in Defguard - must NOT create a second token.
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     let tokens = Token::fetch_all(&pool).await.unwrap();
     assert_eq!(
@@ -3714,6 +4005,7 @@ async fn test_sync_invite_skipped_when_no_admin_exists(
 ) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
 
     let mut settings = Settings::get_current_settings();
@@ -3736,7 +4028,10 @@ async fn test_sync_invite_skipped_when_no_admin_exists(
         .add_test_user(&ldap_user, &config);
 
     // Sync must succeed even with no admins.
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     // User must still be created.
     let saved = User::find_by_username(&pool, "sync_invite_noadmin_user")
@@ -3890,6 +4185,7 @@ async fn test_sync_ad_account_status_disable_and_reenable(
 ) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, mut ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
     set_test_license_business();
 
@@ -3906,8 +4202,8 @@ async fn test_sync_ad_account_status_disable_and_reenable(
     // Active, enrolled Defguard user that also exists in AD.
     let mut user = make_test_user(
         "ad_status_user",
-        Some("ad_status_user".to_string()),
-        Some("ou=users,dc=example,dc=com".to_string()),
+        Some("ad_status_user".to_owned()),
+        Some("ou=users,dc=example,dc=com".to_owned()),
     );
     user.from_ldap = true;
     user.is_active = true;
@@ -3920,13 +4216,23 @@ async fn test_sync_ad_account_status_disable_and_reenable(
         .test_client_mut()
         .add_test_user(&ldap_user, &config);
 
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     let synced = User::find_by_id(&pool, user.id).await.unwrap().unwrap();
     assert!(
         !synced.is_active,
         "User disabled in AD should be disabled in Defguard"
     );
+
+    let events = drain_ldap_sync_events(&mut ldap_rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LdapSyncEventType::UserDisabled { user }
+            if user.username == "ad_status_user"
+    )));
 
     // Now the user is re-enabled in AD.
     let mut ldap_user = user.clone().as_noid();
@@ -3935,13 +4241,23 @@ async fn test_sync_ad_account_status_disable_and_reenable(
         .test_client_mut()
         .add_test_user(&ldap_user, &config);
 
-    ldap_conn.sync(&pool, false, &wg_tx).await.unwrap();
+    ldap_conn
+        .sync(&pool, false, &wg_tx, &ldap_tx)
+        .await
+        .unwrap();
 
     let synced = User::find_by_id(&pool, user.id).await.unwrap().unwrap();
     assert!(
         synced.is_active,
         "User re-enabled in AD should be re-enabled in Defguard"
     );
+
+    let events = drain_ldap_sync_events(&mut ldap_rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LdapSyncEventType::UserEnabled { user }
+            if user.username == "ad_status_user"
+    )));
 
     assert_incremental_sync_converges(&mut ldap_conn, &pool, &wg_tx).await;
 }
@@ -3954,6 +4270,7 @@ async fn test_sync_ad_account_status_disable_and_reenable(
 async fn test_enable_in_defguard_pushes_status_to_ad(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
     set_test_license_business();
 
@@ -3974,8 +4291,8 @@ async fn test_enable_in_defguard_pushes_status_to_ad(_: PgPoolOptions, options: 
     // Active, enrolled Defguard user that also exists in AD.
     let mut user = make_test_user(
         "FirstName",
-        Some("FirstName".to_string()),
-        Some("ou=users,dc=example,dc=com".to_string()),
+        Some("FirstName".to_owned()),
+        Some("ou=users,dc=example,dc=com".to_owned()),
     );
     user.from_ldap = true;
     user.is_active = true;
@@ -3989,7 +4306,7 @@ async fn test_enable_in_defguard_pushes_status_to_ad(_: PgPoolOptions, options: 
         .add_test_user(&ldap_user, &config);
 
     ldap_conn
-        .update_users_state(vec![&mut user], &pool, &wg_tx)
+        .update_users_state(vec![&mut user], &pool, &wg_tx, &ldap_tx)
         .await
         .unwrap();
 
@@ -4018,6 +4335,7 @@ async fn test_sync_failure_marks_desynced_and_recovers(
 ) {
     let pool = setup_pool(options).await;
     let (wg_tx, _wg_rx) = wg_test_channel();
+    let (ldap_tx, _ldap_rx) = ldap_test_channel();
     let _ = initialize_current_settings(&pool).await;
     set_test_license_business();
 
@@ -4041,7 +4359,7 @@ async fn test_sync_failure_marks_desynced_and_recovers(
     // Simulate a transient LDAP outage hitting the next write operation.
     ldap_conn.test_client_mut().fail_next_writes(1);
 
-    let result = ldap_conn.sync(&pool, true, &wg_tx).await;
+    let result = ldap_conn.sync(&pool, true, &wg_tx, &ldap_tx).await;
     assert!(
         result.is_err(),
         "sync should fail when an LDAP write operation fails"
@@ -4058,7 +4376,7 @@ async fn test_sync_failure_marks_desynced_and_recovers(
 
     // LDAP has recovered: the follow-up full sync (triggered by the desync) must now succeed.
     ldap_conn
-        .sync(&pool, is_ldap_desynced(), &wg_tx)
+        .sync(&pool, is_ldap_desynced(), &wg_tx, &ldap_tx)
         .await
         .unwrap();
     set_ldap_sync_status(LdapSyncStatus::InSync, &pool)

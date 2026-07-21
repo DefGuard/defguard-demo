@@ -5,7 +5,10 @@ use sqlx::{PgExecutor, query, query_as};
 use thiserror::Error;
 
 use crate::{
-    db::{Id, NoId},
+    db::{
+        Id, NoId,
+        models::device::{Device, DeviceType},
+    },
     random::gen_alphanumeric,
 };
 
@@ -70,6 +73,29 @@ impl BiometricAuth<Id> {
         .await
     }
 
+    /// Returns the device owning the given biometric auth public key, scoped to
+    /// the provided user. `None` if no such device exists.
+    pub async fn find_device<'e, E>(
+        executor: E,
+        user_id: Id,
+        pub_key: &str,
+    ) -> sqlx::Result<Option<Device<Id>>>
+    where
+        E: PgExecutor<'e>,
+    {
+        query_as!(
+            Device,
+            "SELECT d.id, d.name, d.wireguard_pubkey, d.user_id, d.created, d.description, \
+            d.device_type \"device_type: DeviceType\", d.configured \
+            FROM biometric_auth as b JOIN device d ON b.device_id = d.id \
+            WHERE d.user_id = $1 AND b.pub_key = $2",
+            user_id,
+            pub_key
+        )
+        .fetch_optional(executor)
+        .await
+    }
+
     pub async fn verify_owner<'e, E>(executor: E, user_id: Id, pub_key: &str) -> sqlx::Result<bool>
     where
         E: PgExecutor<'e>,
@@ -124,7 +150,7 @@ impl BiometricChallenge {
     pub fn new_with_owner(pub_key: &str) -> Result<Self, BiometricAuthError> {
         let _ = decode_pub_key(pub_key)?;
         let mut res = Self::new();
-        res.auth_pub_key = Some(pub_key.to_string());
+        res.auth_pub_key = Some(pub_key.to_owned());
         Ok(res)
     }
 

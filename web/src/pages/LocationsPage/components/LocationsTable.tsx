@@ -9,13 +9,18 @@ import {
 import { useMemo, useState } from 'react';
 import { m } from '../../../paraglide/messages';
 import api from '../../../shared/api/api';
-import type { NetworkLocation } from '../../../shared/api/types';
+import {
+  LicenseFeature,
+  LocationServiceMode,
+  type NetworkLocation,
+} from '../../../shared/api/types';
 import { GatewaysStatusBadge } from '../../../shared/components/GatewaysStatusBadge/GatewaysStatusBadge';
 import { TableValuesListCell } from '../../../shared/components/TableValuesListCell/TableValuesListCell';
 import { Badge } from '../../../shared/defguard-ui/components/Badge/Badge';
 import { Button } from '../../../shared/defguard-ui/components/Button/Button';
 import type { ButtonProps } from '../../../shared/defguard-ui/components/Button/types';
 import { EmptyStateFlexible } from '../../../shared/defguard-ui/components/EmptyStateFlexible/EmptyStateFlexible';
+import { Helper } from '../../../shared/defguard-ui/components/Helper/Helper';
 import { Icon } from '../../../shared/defguard-ui/components/Icon';
 import { Search } from '../../../shared/defguard-ui/components/Search/Search';
 import { SizedBox } from '../../../shared/defguard-ui/components/SizedBox/SizedBox';
@@ -81,8 +86,21 @@ export const LocationsTable = () => {
     [license],
   );
 
-  const columns = useMemo(
-    () => [
+  const columns = useMemo(() => {
+    const isServiceLocationLocked = (location: NetworkLocation) =>
+      location.service_location_mode !== LocationServiceMode.Disabled &&
+      !canUseEnterpriseFeature(license, LicenseFeature.ServiceLocations).result;
+
+    const navigateToEdit = (location: NetworkLocation) => {
+      navigate({
+        to: '/locations/$locationId/edit',
+        params: {
+          locationId: location.id.toString(),
+        },
+      });
+    };
+
+    return [
       columnHelper.accessor('name', {
         header: m.form_label_name(),
         enableSorting: true,
@@ -93,6 +111,11 @@ export const LocationsTable = () => {
         },
         cell: (info) => (
           <TableCell>
+            {isServiceLocationLocked(info.row.original) && (
+              <Helper icon="lock-closed" color={null}>
+                <p>{m.location_service_location_missing_license()}</p>
+              </Helper>
+            )}
             <span>{info.getValue()}</span>
           </TableCell>
         ),
@@ -257,12 +280,25 @@ export const LocationsTable = () => {
                       icon: 'edit',
                       text: m.controls_edit(),
                       onClick: () => {
-                        navigate({
-                          to: '/locations/$locationId/edit',
-                          params: {
-                            locationId: row.id.toString(),
-                          },
-                        });
+                        if (!isServiceLocationLocked(row)) {
+                          navigateToEdit(row);
+                          return;
+                        }
+
+                        if (license?.expired) {
+                          openModal(ModalName.LicenseExpired, {
+                            licenseTier: license.tier,
+                          });
+                          return;
+                        }
+
+                        licenseActionCheck(
+                          canUseEnterpriseFeature(
+                            license,
+                            LicenseFeature.ServiceLocations,
+                          ),
+                          () => navigateToEdit(row),
+                        );
                       },
                     },
                     {
@@ -277,7 +313,10 @@ export const LocationsTable = () => {
                           });
                         };
                         if (row.gateways.length >= 1) {
-                          licenseActionCheck(canUseEnterpriseFeature(license), action);
+                          licenseActionCheck(
+                            canUseEnterpriseFeature(license, LicenseFeature.ComponentHa),
+                            action,
+                          );
                         } else {
                           action();
                         }
@@ -296,7 +335,7 @@ export const LocationsTable = () => {
                           title: m.modal_delete_location_title(),
                           contentMd: m.modal_delete_location_body({ name: row.name }),
                           actionPromise: () => api.location.deleteLocation(row.id),
-                          invalidateKeys: [['network'], ['enterprise_info']],
+                          invalidateKeys: [['network'], ['gateway'], ['enterprise_info']],
                           submitProps: { text: m.controls_delete(), variant: 'critical' },
                           onSuccess: () => Snackbar.default(m.location_delete_success()),
                           onError: () => Snackbar.error(m.location_delete_failed()),
@@ -310,9 +349,8 @@ export const LocationsTable = () => {
           );
         },
       }),
-    ],
-    [navigate, license],
-  );
+    ];
+  }, [navigate, license]);
 
   const table = useReactTable({
     data: transformedData,

@@ -1,3 +1,4 @@
+use defguard_core::device_access::join_device_to_all_networks;
 use defguard_proto::{
     client_types::InstanceInfoRequest,
     proxy::{CoreRequest, core_request, core_response},
@@ -90,7 +91,7 @@ async fn test_polling_invalid_token_returns_error(_: PgPoolOptions, options: PgC
         id: 12,
         device_info: None,
         payload: Some(core_request::Payload::InstanceInfo(InstanceInfoRequest {
-            token: "this-token-does-not-exist-00000000".to_string(),
+            token: "this-token-does-not-exist-00000000".to_owned(),
         })),
     });
 
@@ -173,8 +174,7 @@ async fn test_polling_reflects_network_changes(_: PgPoolOptions, options: PgConn
     // Re-run add_to_all_networks so the device gets a WireguardNetworkDevice
     // row for the newly created network (required for config-building).
     let mut conn = context.pool.acquire().await.expect("acquire connection");
-    device
-        .add_to_all_networks(&mut conn)
+    join_device_to_all_networks(&mut conn, &device, &_user)
         .await
         .expect("add device to all networks");
 

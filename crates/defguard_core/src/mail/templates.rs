@@ -15,7 +15,7 @@ use tera::{Context, Function, Tera};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use super::{Attachment, MailMessage};
+use super::{Attachment, MailError, MailMessage};
 
 pub(crate) const DEFAULT_LANG: &str = "en_US";
 
@@ -39,6 +39,8 @@ pub enum TemplateError {
     MrmlParserError(#[from] mrml::prelude::parser::Error),
     #[error(transparent)]
     MrmlRenderError(#[from] mrml::prelude::render::Error),
+    #[error(transparent)]
+    Mail(#[from] MailError),
 }
 
 struct NoOp(&'static str);
@@ -117,9 +119,7 @@ pub async fn test_mail(
 
     let message = MailMessage::Test;
     message.fill_context(conn, &mut context).await?;
-    if let Err(err) = message.mail(&mut tera, &context, to)?.send().await {
-        warn!("Failed to send test email: {err}");
-    }
+    message.mail(&mut tera, &context, to)?.send().await?;
 
     Ok(())
 }
@@ -388,6 +388,9 @@ pub async fn new_device_added_mail(
     Ok(())
 }
 
+/// Intentionally fire-and-forget: MFA is already durably enabled by the time this
+/// runs, so a failed confirmation email is a low-stakes notification, unlike
+/// `mfa_activation_mail`/`mfa_code_mail` which the user is actively blocked on.
 pub async fn mfa_configured_mail(
     to: &str,
     conn: &mut PgConnection,
@@ -535,7 +538,7 @@ pub async fn mfa_activation_mail(
 
     let message = MailMessage::MFAActivation;
     message.fill_context(conn, &mut context).await?;
-    message.mail(&mut tera, &context, to)?.send_and_forget();
+    message.mail(&mut tera, &context, to)?.send().await?;
 
     Ok(())
 }
@@ -562,7 +565,7 @@ pub async fn mfa_code_mail(
 
     let message = MailMessage::MFACode;
     message.fill_context(conn, &mut context).await?;
-    message.mail(&mut tera, &context, to)?.send_and_forget();
+    message.mail(&mut tera, &context, to)?.send().await?;
 
     Ok(())
 }
@@ -608,6 +611,23 @@ pub async fn password_reset_success_mail(
         get_base_tera_mjml(Context::new(), None, ip_address, device_info)?;
 
     let message = MailMessage::PasswordResetDone;
+    message.fill_context(conn, &mut context).await?;
+    message.mail(&mut tera, &context, to)?.send_and_forget();
+
+    Ok(())
+}
+
+/// Notification that password reset has been disabled for this user.
+pub async fn password_reset_disabled_mail(
+    to: &str,
+    conn: &mut PgConnection,
+    ip_address: Option<&str>,
+    device_info: Option<&str>,
+) -> Result<(), TemplateError> {
+    let (mut tera, mut context) =
+        get_base_tera_mjml(Context::new(), None, ip_address, device_info)?;
+
+    let message = MailMessage::PasswordResetDisabled;
     message.fill_context(conn, &mut context).await?;
     message.mail(&mut tera, &context, to)?.send_and_forget();
 

@@ -1,6 +1,6 @@
 use axum::{extract::State, http::StatusCode};
 use defguard_common::{
-    VERSION,
+    REPORTED_VERSION,
     config::server_config,
     db::models::{Settings, WireguardNetwork},
 };
@@ -37,16 +37,16 @@ pub async fn get_app_info(State(appstate): State<AppState>, _session: SessionInf
     let external_openid_enabled = OpenIdProvider::get_current(&appstate.pool).await?.is_some();
 
     let settings = Settings::get_current_settings();
-    let mut smtp_enabled = settings.smtp.is_configured();
+    let mut smtp_enabled = settings.smtp_configured();
     // XOAUTH2 is only for the business licence.
-    if settings.smtp.is_xoauth2() & !is_business_license_active() {
+    if settings.smtp.is_xoauth2() && !is_business_license_active() {
         smtp_enabled = false;
     }
 
     let res = AppInfo {
         network_present: !networks.is_empty(),
         smtp_enabled,
-        version: VERSION.into(),
+        version: REPORTED_VERSION.into(),
         ldap_info: LdapInfo {
             enabled: settings.ldap_enabled,
             ad: settings.ldap_uses_ad,

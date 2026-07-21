@@ -1,7 +1,7 @@
 import './style.scss';
 
 import { useMutation, useQuery, useSuspenseQuery } from '@tanstack/react-query';
-import { useNavigate, useParams } from '@tanstack/react-router';
+import { Link, useNavigate, useParams } from '@tanstack/react-router';
 import { cloneDeep, omit } from 'lodash-es';
 import { useMemo } from 'react';
 import z from 'zod';
@@ -9,6 +9,7 @@ import { m } from '../../paraglide/messages';
 import api from '../../shared/api/api';
 import {
   type EditNetworkLocation,
+  LicenseFeature,
   LocationMfaMode,
   LocationServiceMode,
   type NetworkLocation,
@@ -16,9 +17,17 @@ import {
 import { EditPage } from '../../shared/components/EditPage/EditPage';
 import { EditPageControls } from '../../shared/components/EditPageControls/EditPageControls';
 import { EditPageFormSection } from '../../shared/components/EditPageFormSection/EditPageFormSection';
-import type { SelectionOption } from '../../shared/components/SelectionSection/type';
+import { useSelectionModal } from '../../shared/components/modals/SelectionModal/useSelectionModal';
+import { renderPostureCheckSelectionItem } from '../../shared/components/PostureCheckSelectionItem/PostureCheckSelectionItem';
+import type {
+  SelectionOption,
+  SelectionSectionCustomRender,
+} from '../../shared/components/SelectionSection/type';
+import { SelectMultiple } from '../../shared/components/SelectMultiple/SelectMultiple';
 import { externalLink } from '../../shared/constants';
-
+import { Button } from '../../shared/defguard-ui/components/Button/Button';
+import { Helper } from '../../shared/defguard-ui/components/Helper/Helper';
+import { IconKind } from '../../shared/defguard-ui/components/Icon';
 import { InfoBanner } from '../../shared/defguard-ui/components/InfoBanner/InfoBanner';
 import { SizedBox } from '../../shared/defguard-ui/components/SizedBox/SizedBox';
 import { Snackbar } from '../../shared/defguard-ui/providers/snackbar/snackbar';
@@ -35,6 +44,8 @@ import {
 } from '../../shared/utils/license';
 import { smallestNetworkCapacity } from '../../shared/utils/network';
 import { Validate } from '../../shared/validate';
+import postureCheckShield from './assets/posture_check_shield.png';
+import { getPostureChecksSectionState } from './postureChecksSection';
 
 export const EditLocationPage = () => {
   const { locationId: paramsId } = useParams({
@@ -153,6 +164,7 @@ const formSchema = z
     location_mfa_mode: z.enum(LocationMfaMode),
     service_location_mode: z.enum(LocationServiceMode),
     firewall: z.enum(LocationFirewall),
+    allowed_ips_from_acl: z.boolean(),
   })
   .superRefine((value, context) => {
     if (value.location_mfa_mode !== LocationMfaMode.Disabled) {
@@ -333,16 +345,62 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
   const navigate = useNavigate();
 
   const { data: licenseInfo } = useQuery(getLicenseInfoQueryOptions);
-  const canUseEnterprise = useMemo(() => {
+  const canUseDevicePosture = useMemo(() => {
     if (licenseInfo === undefined) return undefined;
-    return canUseEnterpriseFeature(licenseInfo).result;
+    return canUseEnterpriseFeature(licenseInfo, LicenseFeature.DevicePosture).result;
+  }, [licenseInfo]);
+  const canUseServiceLocations = useMemo(() => {
+    if (licenseInfo === undefined) return undefined;
+    return canUseEnterpriseFeature(licenseInfo, LicenseFeature.ServiceLocations).result;
+  }, [licenseInfo]);
+  const canUseAllowedIpsFromAcl = useMemo(() => {
+    if (licenseInfo === undefined) return undefined;
+    return canUseEnterpriseFeature(licenseInfo, LicenseFeature.AclAllowedIps).result;
   }, [licenseInfo]);
   const canUseBusiness = useMemo(() => {
     if (licenseInfo === undefined) return undefined;
     return canUseBusinessFeature(licenseInfo).result;
   }, [licenseInfo]);
-  const serviceLocationLocked = isPresent(canUseEnterprise) && !canUseEnterprise;
+  const { data: postureChecks = [] } = useQuery({
+    queryKey: ['device-posture'],
+    queryFn: api.devicePosture.getDevicePostures,
+    enabled: canUseDevicePosture === true,
+  });
+  const serviceLocationLocked =
+    isPresent(canUseServiceLocations) && !canUseServiceLocations;
+  const postureChecksSectionState = useMemo(
+    () =>
+      getPostureChecksSectionState({
+        assignedPostureChecksCount: location.posture_checks.length,
+        canUseEnterprise: canUseDevicePosture,
+        postureChecksCount: postureChecks.length,
+      }),
+    [canUseDevicePosture, location.posture_checks.length, postureChecks.length],
+  );
   const firewallLocked = isPresent(canUseBusiness) && !canUseBusiness;
+
+  const postureCheckOptions = useMemo(
+    () =>
+      postureChecks.map(
+        (postureCheck): SelectionOption<number> => ({
+          id: postureCheck.id,
+          label: postureCheck.name,
+          meta: postureCheck,
+        }),
+      ),
+    [postureChecks],
+  );
+
+  const assignedPostureChecks = useMemo(() => {
+    const labelsById = new Map(
+      postureChecks.map((postureCheck) => [postureCheck.id, postureCheck.name]),
+    );
+
+    return location.posture_checks.map((id) => ({
+      id,
+      label: labelsById.get(id) ?? String(id),
+    }));
+  }, [location.posture_checks, postureChecks]);
 
   const serviceLocationLabelContent = useMemo(() => {
     if (!serviceLocationLocked) return undefined;
@@ -368,6 +426,18 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
     );
   }, [firewallLocked]);
 
+  const postureChecksLabelContent = useMemo(() => {
+    if (!postureChecksSectionState.locked) return undefined;
+    return (
+      <>
+        <p>{m.license_enterprise_required()}</p>
+        <a href={externalLink.defguard.pricing} target="_blank" rel="noreferrer">
+          {m.license_upgrade_to_unlock()}
+        </a>
+      </>
+    );
+  }, [postureChecksSectionState.locked]);
+
   const { data: devices } = useQuery({
     queryKey: ['device', 'all'],
     queryFn: api.device.getDevices,
@@ -389,7 +459,7 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
   const { mutateAsync: editLocation } = useMutation({
     mutationFn: api.location.editLocation,
     meta: {
-      invalidate: ['network'],
+      invalidate: [['network'], ['gateway']],
     },
     onSuccess: () => {
       navigate({
@@ -401,6 +471,41 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
       Snackbar.error(m.location_edit_failed());
     },
   });
+
+  const { mutate: setLocationPostures, isPending: isUpdatingLocationPostures } =
+    useMutation({
+      mutationFn: (data: { postures: number[] }) =>
+        api.devicePosture.setLocationPostures(location.id, data),
+      meta: {
+        invalidate: [['device-posture'], ['network'], ['activity-log']],
+      },
+      onError: () => {
+        Snackbar.error(m.location_posture_checks_update_failed());
+      },
+    });
+
+  const openPostureChecksSelection = () => {
+    useSelectionModal.setState({
+      isOpen: true,
+      contentClassName: 'posture-check-assignment-modal',
+      title: m.location_posture_checks_select(),
+      enableDividers: true,
+      itemGap: 12,
+      options: postureCheckOptions,
+      renderItem: renderPostureCheckSelectionItem as SelectionSectionCustomRender<
+        string | number,
+        unknown
+      >,
+      searchPlaceholder: m.controls_search(),
+      selected: new Set(location.posture_checks),
+      visibleItemsLimit: 4,
+      onSubmit: (values) => {
+        setLocationPostures({
+          postures: values.filter((value): value is number => typeof value === 'number'),
+        });
+      },
+    });
+  };
 
   const defaultValues = useMemo(
     (): FormFields => ({
@@ -419,6 +524,7 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
       port: location.port,
       service_location_mode: location.service_location_mode,
       firewall: locationToFirewall(location),
+      allowed_ips_from_acl: location.allowed_ips_from_acl,
     }),
     [location],
   );
@@ -538,6 +644,15 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
             )}
           </form.AppField>
           <SizedBox height={ThemeSpacing.Xl2} />
+          <form.AppField name="dns">
+            {(field) => (
+              <field.FormInput
+                label={m.add_location_internal_vpn_label_dns()}
+                helper={m.add_location_internal_vpn_helper_dns()}
+              />
+            )}
+          </form.AppField>
+          <SizedBox height={ThemeSpacing.Xl2} />
           <form.AppField name="allowed_ips">
             {(field) => (
               <field.FormInput
@@ -547,11 +662,31 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
             )}
           </form.AppField>
           <SizedBox height={ThemeSpacing.Xl2} />
-          <form.AppField name="dns">
+          {isPresent(canUseAllowedIpsFromAcl) && !canUseAllowedIpsFromAcl && (
+            <>
+              <p className="acl-upsell-text">
+                <a href={externalLink.defguard.pricing} target="_blank" rel="noreferrer">
+                  {m.add_location_internal_vpn_allowed_ips_from_firewall_rules_upsell_link()}
+                </a>
+                <span>
+                  {m.add_location_internal_vpn_allowed_ips_from_firewall_rules_upsell()}
+                </span>
+              </p>
+              <SizedBox height={ThemeSpacing.Md} />
+            </>
+          )}
+          <form.AppField name="allowed_ips_from_acl">
             {(field) => (
-              <field.FormInput
-                label={m.add_location_internal_vpn_label_dns()}
-                helper={m.add_location_internal_vpn_helper_dns()}
+              <field.FormCheckbox
+                text={m.add_location_internal_vpn_allowed_ips_from_firewall_rules()}
+                disabled={isPresent(canUseAllowedIpsFromAcl) && !canUseAllowedIpsFromAcl}
+                helperBlock={
+                  <Helper>
+                    <p>
+                      {m.add_location_internal_vpn_allowed_ips_from_firewall_rules_tooltip()}
+                    </p>
+                  </Helper>
+                }
               />
             )}
           </form.AppField>
@@ -588,6 +723,142 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
             )}
           </form.AppField>
         </EditPageFormSection>
+        <form.Subscribe selector={(state) => state.values.allow_all_groups}>
+          {(allowAllGroups) => (
+            <EditPageFormSection label={m.location_access_section_label()}>
+              {isPresent(groupsOptions) && (
+                <form.AppField name="allowed_groups">
+                  {(field) => (
+                    <field.FormSelectMultiple
+                      options={groupsOptions}
+                      counterText={getSelectedGroupsCounterText}
+                      editText={m.location_access_edit_groups()}
+                      modalTitle={m.location_access_select_allowed_groups()}
+                      toggleText={m.location_access_all_groups_have_access()}
+                      toggleValue={allowAllGroups}
+                      onToggleChange={(value) => {
+                        form.setFieldValue('allow_all_groups', value);
+                      }}
+                    />
+                  )}
+                </form.AppField>
+              )}
+            </EditPageFormSection>
+          )}
+        </form.Subscribe>
+        <EditPageFormSection
+          label={m.add_location_step_firewall_label()}
+          labelContent={firewallLabelContent}
+        >
+          <form.AppField name="firewall">
+            {(field) => (
+              <field.FormRadio
+                value={LocationFirewall.Disabled}
+                text={m.location_firewall_option_disabled()}
+                disabled={firewallLocked}
+              />
+            )}
+          </form.AppField>
+          <SizedBox height={ThemeSpacing.Md} />
+          <form.AppField name="firewall">
+            {(field) => (
+              <field.FormRadio
+                value={LocationFirewall.Allow}
+                text={m.location_firewall_option_default_allow()}
+                disabled={firewallLocked}
+              />
+            )}
+          </form.AppField>
+          <SizedBox height={ThemeSpacing.Md} />
+          <form.AppField name="firewall">
+            {(field) => (
+              <field.FormRadio
+                value={LocationFirewall.Deny}
+                text={m.location_firewall_option_default_deny()}
+                disabled={firewallLocked}
+              />
+            )}
+          </form.AppField>
+        </EditPageFormSection>
+        <form.Subscribe
+          selector={(s) => s.values.location_mfa_mode !== LocationMfaMode.Disabled}
+        >
+          {(mfaEnabled) => (
+            <form.AppField
+              name="service_location_mode"
+              validators={{ onChangeListenTo: ['location_mfa_mode'] }}
+              listeners={{
+                onChange: ({ value, fieldApi }) => {
+                  const mfa = fieldApi.form.getFieldValue('location_mfa_mode');
+                  if (
+                    value !== LocationServiceMode.Disabled &&
+                    mfa !== LocationMfaMode.Disabled
+                  ) {
+                    fieldApi.form.setFieldValue(
+                      'location_mfa_mode',
+                      LocationMfaMode.Disabled,
+                    );
+                  }
+                },
+              }}
+            >
+              {(field) => {
+                return (
+                  <>
+                    {mfaEnabled && (
+                      <InfoBanner
+                        variant="warning"
+                        icon="info-outlined"
+                        text={m.location_service_mode_mfa_warning()}
+                      />
+                    )}
+                    {postureChecksSectionState.hasAssignedPostureChecks && (
+                      <InfoBanner
+                        variant="warning"
+                        icon="info-outlined"
+                        text={m.location_service_mode_postures_warning()}
+                      />
+                    )}
+                    <EditPageFormSection
+                      label={m.location_edit_section_location_type()}
+                      labelContent={serviceLocationLabelContent}
+                    >
+                      <field.FormRadio
+                        value={LocationServiceMode.Disabled}
+                        text={m.location_service_mode_regular()}
+                        disabled={
+                          mfaEnabled ||
+                          serviceLocationLocked ||
+                          postureChecksSectionState.hasAssignedPostureChecks
+                        }
+                      />
+                      <SizedBox height={ThemeSpacing.Md} />
+                      <field.FormRadio
+                        value={LocationServiceMode.Prelogon}
+                        text={m.location_service_mode_prelogon()}
+                        disabled={
+                          mfaEnabled ||
+                          serviceLocationLocked ||
+                          postureChecksSectionState.hasAssignedPostureChecks
+                        }
+                      />
+                      <SizedBox height={ThemeSpacing.Md} />
+                      <field.FormRadio
+                        value={LocationServiceMode.Alwayson}
+                        text={m.location_service_mode_always_on()}
+                        disabled={
+                          mfaEnabled ||
+                          serviceLocationLocked ||
+                          postureChecksSectionState.hasAssignedPostureChecks
+                        }
+                      />
+                    </EditPageFormSection>
+                  </>
+                );
+              }}
+            </form.AppField>
+          )}
+        </form.Subscribe>
         <form.Subscribe
           selector={(s) =>
             s.values.service_location_mode !== LocationServiceMode.Disabled
@@ -675,122 +946,97 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
           )}
         </form.Subscribe>
         <form.Subscribe
-          selector={(s) => s.values.location_mfa_mode !== LocationMfaMode.Disabled}
+          selector={(s) =>
+            s.values.service_location_mode !== LocationServiceMode.Disabled
+          }
         >
-          {(mfaEnabled) => (
-            <form.AppField
-              name="service_location_mode"
-              validators={{ onChangeListenTo: ['location_mfa_mode'] }}
-              listeners={{
-                onChange: ({ value, fieldApi }) => {
-                  const mfa = fieldApi.form.getFieldValue('location_mfa_mode');
-                  if (
-                    value !== LocationServiceMode.Disabled &&
-                    mfa !== LocationMfaMode.Disabled
-                  ) {
-                    fieldApi.form.setFieldValue(
-                      'location_mfa_mode',
-                      LocationMfaMode.Disabled,
-                    );
-                  }
-                },
-              }}
-            >
-              {(field) => {
-                return (
-                  <>
-                    {mfaEnabled && (
-                      <InfoBanner
-                        variant="warning"
-                        icon="info-outlined"
-                        text={m.location_service_mode_mfa_warning()}
-                      />
-                    )}
-                    <EditPageFormSection
-                      label={m.location_edit_section_location_type()}
-                      labelContent={serviceLocationLabelContent}
-                    >
-                      <field.FormRadio
-                        value={LocationServiceMode.Disabled}
-                        text={m.location_service_mode_regular()}
-                        disabled={mfaEnabled || serviceLocationLocked}
-                      />
-                      <SizedBox height={ThemeSpacing.Md} />
-                      <field.FormRadio
-                        value={LocationServiceMode.Prelogon}
-                        text={m.location_service_mode_prelogon()}
-                        disabled={mfaEnabled || serviceLocationLocked}
-                      />
-                      <SizedBox height={ThemeSpacing.Md} />
-                      <field.FormRadio
-                        value={LocationServiceMode.Alwayson}
-                        text={m.location_service_mode_always_on()}
-                        disabled={mfaEnabled || serviceLocationLocked}
-                      />
-                    </EditPageFormSection>
-                  </>
-                );
-              }}
-            </form.AppField>
-          )}
-        </form.Subscribe>
-        <form.Subscribe selector={(state) => state.values.allow_all_groups}>
-          {(allowAllGroups) => (
-            <EditPageFormSection label={m.location_access_section_label()}>
-              {isPresent(groupsOptions) && (
-                <form.AppField name="allowed_groups">
-                  {(field) => (
-                    <field.FormSelectMultiple
-                      options={groupsOptions}
-                      counterText={getSelectedGroupsCounterText}
-                      editText={m.location_access_edit_groups()}
-                      modalTitle={m.location_access_select_allowed_groups()}
-                      toggleText={m.location_access_all_groups_have_access()}
-                      toggleValue={allowAllGroups}
-                      onToggleChange={(value) => {
-                        form.setFieldValue('allow_all_groups', value);
+          {(isServiceLocation) => (
+            <>
+              {isServiceLocation && (
+                <InfoBanner
+                  icon="info-outlined"
+                  variant="warning"
+                  text={m.location_posture_service_location_warning()}
+                />
+              )}
+              <EditPageFormSection
+                label={m.cmp_nav_item_posture_checks()}
+                labelContent={postureChecksLabelContent}
+              >
+                {postureChecksSectionState.showEmptyState && (
+                  <div className="posture-checks-empty-state">
+                    <img
+                      src={postureCheckShield}
+                      alt=""
+                      className="posture-check-shield"
+                    />
+                    <p>
+                      {m.location_posture_checks_empty_state_before_link()}{' '}
+                      <Link to="/acl/posture-checks">
+                        {m.cmp_nav_item_posture_checks()}
+                      </Link>{' '}
+                      {m.location_posture_checks_empty_state_after_link()}
+                    </p>
+                  </div>
+                )}
+                {postureChecksSectionState.showAssignedPostureChecks && (
+                  <div className="posture-checks-assigned-state">
+                    <SelectMultiple
+                      options={postureCheckOptions}
+                      selected={
+                        new Set(
+                          assignedPostureChecks.map((postureCheck) => postureCheck.id),
+                        )
+                      }
+                      modalTitle={m.location_posture_checks_select()}
+                      editText={m.location_posture_checks_edit()}
+                      editIcon={IconKind.Edit}
+                      toggleValue={false}
+                      counterText={() => ''}
+                      disabled={isServiceLocation}
+                      onSelectionChange={(values) => {
+                        setLocationPostures({
+                          postures: values.filter(
+                            (value): value is number => typeof value === 'number',
+                          ),
+                        });
+                      }}
+                      onToggleChange={() => {}}
+                      selectionCustomItemRender={renderPostureCheckSelectionItem}
+                      selectionModalProps={{
+                        contentClassName: 'posture-check-assignment-modal',
+                        enableDividers: true,
+                        itemGap: 12,
+                        searchPlaceholder: m.controls_search(),
+                        visibleItemsLimit: 6,
                       }}
                     />
-                  )}
-                </form.AppField>
-              )}
-            </EditPageFormSection>
+                  </div>
+                )}
+                {postureChecksSectionState.showAssignButton && (
+                  <Button
+                    variant="outlined"
+                    iconLeft={IconKind.ConnectedDevices}
+                    loading={isUpdatingLocationPostures}
+                    text={m.posture_checks_wizard_title()}
+                    onClick={openPostureChecksSelection}
+                    disabled={isServiceLocation}
+                  />
+                )}
+                {postureChecksSectionState.showLockedButton && (
+                  <div className="posture-checks-locked-state">
+                    <Button
+                      variant="primary"
+                      disabled
+                      iconLeft={IconKind.ConnectedDevices}
+                      text={m.posture_checks_wizard_title()}
+                    />
+                  </div>
+                )}
+              </EditPageFormSection>
+            </>
           )}
         </form.Subscribe>
-        <EditPageFormSection
-          label={m.add_location_step_firewall_label()}
-          labelContent={firewallLabelContent}
-        >
-          <form.AppField name="firewall">
-            {(field) => (
-              <field.FormRadio
-                value={LocationFirewall.Disabled}
-                text={m.location_firewall_option_disabled()}
-                disabled={firewallLocked}
-              />
-            )}
-          </form.AppField>
-          <SizedBox height={ThemeSpacing.Md} />
-          <form.AppField name="firewall">
-            {(field) => (
-              <field.FormRadio
-                value={LocationFirewall.Allow}
-                text={m.location_firewall_option_default_allow()}
-                disabled={firewallLocked}
-              />
-            )}
-          </form.AppField>
-          <SizedBox height={ThemeSpacing.Md} />
-          <form.AppField name="firewall">
-            {(field) => (
-              <field.FormRadio
-                value={LocationFirewall.Deny}
-                text={m.location_firewall_option_default_deny()}
-                disabled={firewallLocked}
-              />
-            )}
-          </form.AppField>
-        </EditPageFormSection>
         <form.Subscribe
           selector={(form) => ({
             isSubmitting: form.isSubmitting,
@@ -806,7 +1052,7 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
                     title: m.modal_delete_location_title(),
                     contentMd: m.modal_delete_location_body({ name: location.name }),
                     actionPromise: () => api.location.deleteLocation(location.id),
-                    invalidateKeys: [['network'], ['enterprise_info']],
+                    invalidateKeys: [['network'], ['gateway'], ['enterprise_info']],
                     submitProps: { text: m.controls_delete(), variant: 'critical' },
                     onSuccess: () => {
                       Snackbar.default(m.location_delete_success());

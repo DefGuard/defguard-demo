@@ -1,8 +1,8 @@
-FROM public.ecr.aws/docker/library/node:26 AS web
+FROM public.ecr.aws/docker/library/node:26-alpine AS web
 
 WORKDIR /app
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
-RUN npm i -g pnpm
+RUN npm i -g pnpm@11
 RUN pnpm install --ignore-scripts --frozen-lockfile
 COPY web/ .
 RUN pnpm build
@@ -25,6 +25,14 @@ COPY migrations migrations
 RUN cargo chef prepare --bin defguard --recipe-path recipe.json
 
 FROM chef AS builder
+ARG DEFGUARD_BUILD_VERSION
+ENV DEFGUARD_BUILD_VERSION=$DEFGUARD_BUILD_VERSION
+
+# Force BuildKit cache invalidation when the build version changes.
+# Without this, the ENV layer gets cached with a stale value and
+# the compiled binary won't pick up the correct DEFGUARD_BUILD_VERSION.
+RUN echo "Building Defguard version: ${DEFGUARD_BUILD_VERSION}"
+
 # build deps from recipe & cache as docker layer
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --bin defguard --release --recipe-path recipe.json

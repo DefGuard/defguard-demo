@@ -36,7 +36,7 @@ impl EditAclAlias {
             && self.protocols.is_empty()
         {
             return Err(WebError::BadRequest(
-                "Must provide alias addresses, ports, or protocols".to_string(),
+                "Must provide alias addresses, ports, or protocols".to_owned(),
             ));
         }
         Ok(())
@@ -411,7 +411,8 @@ pub(crate) async fn apply_acl_aliases(
         &data.aliases,
         AliasKind::Component,
         &session.user.username,
-        &appstate,
+        &appstate.pool,
+        &appstate.gateway_tx,
     )
     .await
     .map_err(|err| {

@@ -59,7 +59,7 @@ use tracing::Instrument;
 use crate::{
     auth::{AdminOrSetupRole, SessionInfo},
     cert_settings::ensure_https,
-    enterprise::is_enterprise_license_active,
+    enterprise::{LicenseFeature, has_enterprise_access},
     error::WebError,
     letsencrypt::{ACME_TIMEOUT, acme_step_name, call_proxy_trigger_acme, parse_cert_expiry},
     setup_logs::scope_setup_logs,
@@ -159,7 +159,7 @@ fn error_message(message: &str, last_step: SetupStep, logs: Option<Vec<String>>)
     let response = SetupResponse {
         step: last_step,
         version: None,
-        message: Some(message.to_string()),
+        message: Some(message.to_owned()),
         logs,
         error: true,
     };
@@ -245,7 +245,7 @@ pub async fn setup_proxy_tls_stream(
         let mut flow = SetupFlow::new(log_rx, inner_log_buffer.clone());
 
         // check if tries to connect more then 1 proxy without active enterprise license
-        if !is_enterprise_license_active() {
+        if !has_enterprise_access(Some(LicenseFeature::ComponentHa)) {
             match Proxy::list(&pool).await {
                 Ok(current_proxies) => {
                     if !current_proxies.is_empty() {
@@ -430,7 +430,7 @@ pub async fn setup_proxy_tls_stream(
         let token = match Claims::new(
             defguard_common::auth::claims::ClaimsType::Gateway,
             url.to_string(),
-            TOKEN_CLIENT_ID.to_string(),
+            TOKEN_CLIENT_ID.to_owned(),
             SETUP_TOKEN_EXPIRY_SECS,
         )
         .to_jwt()
@@ -577,7 +577,7 @@ pub async fn setup_proxy_tls_stream(
             return;
         };
 
-        let csr_response = match client.get_csr(CertificateInfo { cert_hostname: hostname.to_string() }).await {
+        let csr_response = match client.get_csr(CertificateInfo { cert_hostname: hostname.to_owned() }).await {
             Ok(r) => r.into_inner(),
             Err(e) => {
                 yield Ok(flow.error(&format!("Failed to obtain CSR: {e}")));
@@ -767,16 +767,16 @@ async fn perform_gateway_adoption(
 
     // `u16` covers the expected port range, so we just have to check for 0
     if grpc_port == 0 {
-        return Err("grpc_port must not be 0".to_string());
+        return Err("grpc_port must not be 0".to_owned());
     }
 
     // License check: non-enterprise installs are limited to one gateway per network.
-    if !is_enterprise_license_active() {
+    if !has_enterprise_access(Some(LicenseFeature::ComponentHa)) {
         let gateways = Gateway::find_by_location_id(pool, network_id)
             .await
             .map_err(|e| format!("Failed to query existing Gateways: {e}"))?;
         if !gateways.is_empty() {
-            return Err("Enterprise license is required.".to_string());
+            return Err("Enterprise license is required.".to_owned());
         }
     }
 
@@ -836,13 +836,13 @@ async fn perform_gateway_adoption(
 
     let certs = match Certificates::get(pool).await {
         Ok(Some(c)) => c,
-        Ok(None) => return Err("CA certificate not found".to_string()),
+        Ok(None) => return Err("CA certificate not found".to_owned()),
         Err(e) => return Err(format!("Failed to load certificates: {e}")),
     };
 
     let ca_cert_der = certs
         .ca_cert_der
-        .ok_or_else(|| "CA certificate not found in settings".to_string())?;
+        .ok_or_else(|| "CA certificate not found in settings".to_owned())?;
 
     let cert_pem = der_to_pem(&ca_cert_der, defguard_certs::PemLabel::Certificate)
         .map_err(|e| format!("Failed to convert CA cert DER to PEM: {e}"))?;
@@ -865,7 +865,7 @@ async fn perform_gateway_adoption(
     let token = Claims::new(
         ClaimsType::Gateway,
         url.to_string(),
-        TOKEN_CLIENT_ID.to_string(),
+        TOKEN_CLIENT_ID.to_owned(),
         SETUP_TOKEN_EXPIRY_SECS,
     )
     .to_jwt()
@@ -973,7 +973,7 @@ async fn perform_gateway_adoption(
     let hostname = url
         .host_str()
         .ok_or("URL does not have a valid host")?
-        .to_string();
+        .to_owned();
 
     let csr_response = client
         .get_csr(CertificateInfo {
@@ -996,7 +996,7 @@ async fn perform_gateway_adoption(
 
     let ca_key_pair = certs
         .ca_key_der
-        .ok_or_else(|| "CA key pair not found in settings".to_string())?;
+        .ok_or_else(|| "CA key pair not found in settings".to_owned())?;
 
     let ca =
         defguard_certs::CertificateAuthority::from_cert_der_key_pair(&ca_cert_der, &ca_key_pair)
@@ -1288,8 +1288,7 @@ pub async fn stream_proxy_acme(
             yield Ok(acme_error_event(
                 "Connecting",
                 "No Edge found in database. Please complete the edge adoption step \
-                 first."
-                    .to_string(),
+                 first.".to_owned(),
                 None,
             ));
             return;
@@ -1417,7 +1416,7 @@ pub async fn stream_proxy_acme(
             Err(_) => {
                 yield Ok(acme_error_event(
                     current_step,
-                    "ACME task terminated unexpectedly.".to_string(),
+                    "ACME task terminated unexpectedly.".to_owned(),
                     None,
                 ));
             }

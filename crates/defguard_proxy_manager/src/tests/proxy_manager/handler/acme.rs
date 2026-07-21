@@ -34,18 +34,19 @@ fn make_acme_certificate_request(
         id: 9000,
         device_info: None,
         payload: Some(core_request::Payload::AcmeCertificate(AcmeCertPayload {
-            cert_pem: cert_pem.to_string(),
-            key_pem: key_pem.to_string(),
-            account_credentials_json: account_credentials_json.to_string(),
+            cert_pem: cert_pem.to_owned(),
+            key_pem: key_pem.to_owned(),
+            account_credentials_json: account_credentials_json.to_owned(),
         })),
     }
 }
 
 /// Complete the manager-level handshake: wait for the proxy to connect then
-/// consume the `InitialInfo` response.
+/// consume the `InitialInfo` and `PublicSettings` responses.
 async fn complete_manager_handshake(mock_proxy: &mut MockProxyHarness) {
     mock_proxy.wait_connected().await;
     mock_proxy.recv_initial_info().await;
+    mock_proxy.recv_public_settings().await;
 }
 
 /// Sending `AcmeCertificate` causes the handler to persist the certificate
@@ -104,9 +105,9 @@ async fn test_acme_certificate_overwrites_existing(_: PgPoolOptions, options: Pg
 
     // Seed the DB with an earlier certificate.
     let initial_certs = Certificates {
-        proxy_http_cert_pem: Some(ALT_CERT_PEM.to_string()),
-        proxy_http_cert_key_pem: Some(ALT_KEY_PEM.to_string()),
-        acme_account_credentials: Some(ALT_ACCOUNT_JSON.to_string()),
+        proxy_http_cert_pem: Some(ALT_CERT_PEM.to_owned()),
+        proxy_http_cert_key_pem: Some(ALT_KEY_PEM.to_owned()),
+        acme_account_credentials: Some(ALT_ACCOUNT_JSON.to_owned()),
         proxy_http_cert_source: ProxyCertSource::LetsEncrypt,
         ..Default::default()
     };

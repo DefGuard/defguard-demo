@@ -16,15 +16,18 @@ use axum::{
     response::Json,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use defguard_common::db::{
-    Id, NoId,
-    models::{
-        proxy::Proxy,
-        settings::{Settings, initialize_current_settings},
+use defguard_common::{
+    db::{
+        Id, NoId,
+        models::{
+            proxy::Proxy,
+            settings::{Settings, initialize_current_settings},
+        },
+        setup_pool,
     },
-    setup_pool,
+    gateway_event::GatewayCommand,
 };
-use defguard_core::{events::BidiStreamEvent, grpc::GatewayEvent};
+use defguard_core::events::{ApiEvent, BidiStreamEvent};
 use defguard_proto::proxy::{
     AcmeChallenge, AcmeIssueEvent, CoreRequest, CoreResponse, InitialInfo, core_response,
     proxy_server,
@@ -352,6 +355,20 @@ impl MockProxyHarness {
         }
     }
 
+    /// Receive the `PublicSettings` message that follows `InitialInfo` on connect.
+    pub(crate) async fn recv_public_settings(&mut self) -> core_response::Payload {
+        let response = self.recv_outbound().await;
+        match response.payload {
+            Some(core_response::Payload::PublicSettings(s)) => {
+                core_response::Payload::PublicSettings(s)
+            }
+            other => panic!(
+                "expected PublicSettings as second message from handler, got: {:?}",
+                other.as_ref().map(std::mem::discriminant)
+            ),
+        }
+    }
+
     pub(crate) async fn expect_server_finished(mut self) {
         let server_task = assert_some!(
             self.server_task.take(),
@@ -381,8 +398,9 @@ impl Drop for MockProxyHarness {
 pub(crate) struct HandlerTestContext {
     pub(crate) pool: PgPool,
     pub(crate) proxy: Proxy<Id>,
-    pub(crate) wireguard_tx: broadcast::Sender<GatewayEvent>,
+    pub(crate) gateway_tx: broadcast::Sender<GatewayCommand>,
     pub(crate) bidi_events_rx: UnboundedReceiver<BidiStreamEvent>,
+    pub(crate) event_rx: UnboundedReceiver<ApiEvent>,
     pub(crate) mock_proxy: Option<MockProxyHarness>,
     handler_task: Option<JoinHandle<Result<(), crate::error::ProxyError>>>,
     /// Keep-alive handle: holds the sender so the handler's shutdown receiver
@@ -406,9 +424,18 @@ impl HandlerTestContext {
 
         let proxy = create_proxy(&pool).await;
 
-        let (wireguard_tx, _) = broadcast::channel(16);
+        let (gateway_tx, _) = broadcast::channel(16);
         let (bidi_events_tx, bidi_events_rx) = mpsc::unbounded_channel::<BidiStreamEvent>();
-        let tx_set = ProxyTxSet::new(wireguard_tx.clone(), bidi_events_tx);
+        let (ldap_tx, _ldap_rx) = mpsc::unbounded_channel();
+        let (dirsync_tx, _dirsync_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let tx_set = ProxyTxSet::new(
+            gateway_tx.clone(),
+            bidi_events_tx,
+            ldap_tx,
+            dirsync_tx,
+            event_tx,
+        );
 
         let (_, certs_rx) = watch::channel(Arc::new(HashMap::new()));
         let incompatible_components = Arc::new(std::sync::RwLock::new(
@@ -450,8 +477,9 @@ impl HandlerTestContext {
         Self {
             pool,
             proxy,
-            wireguard_tx,
+            gateway_tx,
             bidi_events_rx,
+            event_rx,
             mock_proxy: Some(mock_proxy),
             handler_task: Some(handler_task),
             _shutdown_tx: Some(shutdown_tx),
@@ -586,9 +614,12 @@ impl ManagerTestContext {
     pub(crate) async fn start(&mut self) {
         assert!(self.manager_task.is_none(), "proxy manager already started");
 
-        let (wireguard_tx, _) = broadcast::channel(16);
+        let (gateway_tx, _) = broadcast::channel(16);
         let (bidi_events_tx, _bidi_events_rx) = mpsc::unbounded_channel::<BidiStreamEvent>();
-        let tx_set = ProxyTxSet::new(wireguard_tx, bidi_events_tx);
+        let (ldap_tx, _ldap_rx) = mpsc::unbounded_channel();
+        let (dirsync_tx, _dirsync_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let tx_set = ProxyTxSet::new(gateway_tx, bidi_events_tx, ldap_tx, dirsync_tx, event_tx);
 
         let incompatible_components = Arc::new(std::sync::RwLock::new(
             defguard_core::version::IncompatibleComponents::default(),
@@ -688,9 +719,9 @@ pub(crate) fn build_proxy_with_enabled(enabled: bool) -> Proxy<NoId> {
     let port = 50051 + i32::from(port_number);
     let mut proxy = Proxy::new(
         format!("proxy-{port_number}"),
-        "127.0.0.1".to_string(),
+        "127.0.0.1".to_owned(),
         port,
-        "test-admin".to_string(),
+        "test-admin".to_owned(),
     );
     proxy.enabled = enabled;
     proxy
@@ -761,8 +792,8 @@ impl MockOidcProvider {
             .expect("failed to bind mock OIDC server");
         let addr = tcp_listener.local_addr().expect("no local addr");
         let base_url = format!("http://{addr}");
-        let client_id = "test-client".to_string();
-        let client_secret = "test-secret".to_string();
+        let client_id = "test-client".to_owned();
+        let client_secret = "test-secret".to_owned();
 
         let state = OidcProviderState {
             encoding_key: Arc::new(encoding_key),
@@ -840,9 +871,9 @@ async fn oidc_token(
     let code = params.get("code").cloned().unwrap_or_default();
     // code format: "{sub}:{email}:{nonce}"
     let mut parts = code.splitn(3, ':');
-    let sub = parts.next().unwrap_or("unknown-sub").to_string();
-    let email = parts.next().unwrap_or("unknown@example.com").to_string();
-    let nonce = parts.next().unwrap_or("").to_string();
+    let sub = parts.next().unwrap_or("unknown-sub").to_owned();
+    let email = parts.next().unwrap_or("unknown@example.com").to_owned();
+    let nonce = parts.next().unwrap_or("").to_owned();
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

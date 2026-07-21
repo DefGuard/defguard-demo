@@ -17,15 +17,304 @@ use defguard_core::{
             UserMetadata, UserMfaDisabledMetadata, VpnClientMetadata, VpnClientMfaMetadata,
         },
     },
-    events::ClientMFAMethod,
+    events::{ApiEventType, ClientMFAMethod, EnrollmentEvent as CoreEnrollmentEvent},
 };
-use defguard_event_logger::{
-    description::{
-        get_defguard_event_description, get_enrollment_event_description, get_vpn_event_description,
-    },
-    message::{DefguardEvent, EnrollmentEvent, VpnEvent},
+use defguard_event_logger::description::{
+    get_api_event_description,
+    get_enrollment_event_description as get_core_enrollment_event_description,
 };
 use rand::{Rng, rngs::ThreadRng, seq::SliceRandom};
+
+#[allow(dead_code)]
+enum DefguardEvent {
+    UserLogin,
+    UserLoginFailed {
+        message: String,
+    },
+    UserLogout,
+    UserMfaLogin {
+        mfa_method: MFAMethod,
+    },
+    UserMfaLoginFailed {
+        mfa_method: MFAMethod,
+        message: String,
+    },
+    RecoveryCodeLoginFailed,
+    RecoveryCodeUsed,
+    PasswordChangedByAdmin {
+        user: User<Id>,
+    },
+    PasswordChanged,
+    PasswordReset {
+        user: User<Id>,
+    },
+    MfaDisabled,
+    UserMfaDisabled {
+        user: User<Id>,
+    },
+    MfaTotpDisabled,
+    MfaTotpEnabled,
+    MfaEmailDisabled,
+    MfaEmailEnabled,
+    MfaSecurityKeyAdded {
+        key: WebAuthn<Id>,
+    },
+    MfaSecurityKeyRemoved {
+        key: WebAuthn<Id>,
+    },
+    UserAdded {
+        user: User<Id>,
+    },
+    UserRemoved {
+        user: User<Id>,
+    },
+    UserModified {
+        before: User<Id>,
+        after: User<Id>,
+    },
+    UserGroupsModified {
+        user: User<Id>,
+        before: Vec<String>,
+        after: Vec<String>,
+    },
+    UserDeviceAdded {
+        owner: User<Id>,
+        device: Device<Id>,
+    },
+    UserDeviceRemoved {
+        owner: User<Id>,
+        device: Device<Id>,
+    },
+    NetworkDeviceAdded {
+        device: Device<Id>,
+        location: WireguardNetwork<Id>,
+    },
+    NetworkDeviceRemoved {
+        device: Device<Id>,
+        location: WireguardNetwork<Id>,
+    },
+    GroupMemberAdded {
+        group: Group<Id>,
+        user: User<Id>,
+    },
+    GroupMemberRemoved {
+        group: Group<Id>,
+        user: User<Id>,
+    },
+    GroupsBulkAssigned {
+        users: Vec<User<Id>>,
+        groups: Vec<Group<Id>>,
+    },
+}
+
+impl DefguardEvent {
+    fn to_api_event_type(&self) -> Option<ApiEventType> {
+        match self {
+            DefguardEvent::UserLogin => Some(ApiEventType::UserLogin),
+            DefguardEvent::UserLoginFailed { message } => Some(ApiEventType::UserLoginFailed {
+                message: message.clone(),
+            }),
+            DefguardEvent::UserLogout => Some(ApiEventType::UserLogout),
+            DefguardEvent::UserMfaLogin { mfa_method } => Some(ApiEventType::UserMfaLogin {
+                mfa_method: *mfa_method,
+            }),
+            DefguardEvent::UserMfaLoginFailed {
+                mfa_method,
+                message,
+            } => Some(ApiEventType::UserMfaLoginFailed {
+                mfa_method: *mfa_method,
+                message: message.clone(),
+            }),
+            DefguardEvent::RecoveryCodeLoginFailed => Some(ApiEventType::RecoveryCodeLoginFailed),
+            DefguardEvent::RecoveryCodeUsed => Some(ApiEventType::RecoveryCodeUsed),
+            DefguardEvent::PasswordChangedByAdmin { user } => {
+                Some(ApiEventType::PasswordChangedByAdmin { user: user.clone() })
+            }
+            DefguardEvent::PasswordChanged => Some(ApiEventType::PasswordChanged),
+            DefguardEvent::PasswordReset { user } => {
+                Some(ApiEventType::PasswordReset { user: user.clone() })
+            }
+            DefguardEvent::MfaDisabled => Some(ApiEventType::MfaDisabled),
+            DefguardEvent::UserMfaDisabled { user } => {
+                Some(ApiEventType::UserMfaDisabled { user: user.clone() })
+            }
+            DefguardEvent::MfaTotpDisabled => Some(ApiEventType::MfaTotpDisabled),
+            DefguardEvent::MfaTotpEnabled => Some(ApiEventType::MfaTotpEnabled),
+            DefguardEvent::MfaEmailDisabled => Some(ApiEventType::MfaEmailDisabled),
+            DefguardEvent::MfaEmailEnabled => Some(ApiEventType::MfaEmailEnabled),
+            DefguardEvent::MfaSecurityKeyAdded { key } => {
+                Some(ApiEventType::MfaSecurityKeyAdded { key: key.clone() })
+            }
+            DefguardEvent::MfaSecurityKeyRemoved { key } => {
+                Some(ApiEventType::MfaSecurityKeyRemoved { key: key.clone() })
+            }
+            DefguardEvent::UserAdded { user } => {
+                Some(ApiEventType::UserAdded { user: user.clone() })
+            }
+            DefguardEvent::UserRemoved { user } => {
+                Some(ApiEventType::UserRemoved { user: user.clone() })
+            }
+            DefguardEvent::UserModified { before, after } => Some(ApiEventType::UserModified {
+                before: before.clone(),
+                after: after.clone(),
+            }),
+            DefguardEvent::UserGroupsModified {
+                user,
+                before,
+                after,
+            } => Some(ApiEventType::UserGroupsModified {
+                user: user.clone(),
+                before: before.clone(),
+                after: after.clone(),
+            }),
+            DefguardEvent::UserDeviceAdded { owner, device } => {
+                Some(ApiEventType::UserDeviceAdded {
+                    owner: owner.clone(),
+                    device: device.clone(),
+                })
+            }
+            DefguardEvent::UserDeviceRemoved { owner, device } => {
+                Some(ApiEventType::UserDeviceRemoved {
+                    owner: owner.clone(),
+                    device: device.clone(),
+                })
+            }
+            DefguardEvent::NetworkDeviceAdded { device, location } => {
+                Some(ApiEventType::NetworkDeviceAdded {
+                    device: device.clone(),
+                    location: location.clone(),
+                })
+            }
+            DefguardEvent::NetworkDeviceRemoved { device, location } => {
+                Some(ApiEventType::NetworkDeviceRemoved {
+                    device: device.clone(),
+                    location: location.clone(),
+                })
+            }
+            DefguardEvent::GroupMemberAdded { group, user } => {
+                Some(ApiEventType::GroupMemberAdded {
+                    group: group.clone(),
+                    user: user.clone(),
+                })
+            }
+            DefguardEvent::GroupMemberRemoved { group, user } => {
+                Some(ApiEventType::GroupMemberRemoved {
+                    group: group.clone(),
+                    user: user.clone(),
+                })
+            }
+            DefguardEvent::GroupsBulkAssigned { users, groups } => {
+                Some(ApiEventType::GroupsBulkAssigned {
+                    users: users.clone(),
+                    groups: groups.clone(),
+                })
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+enum VpnEvent {
+    ClientMfaSuccess {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+        method: ClientMFAMethod,
+    },
+    ClientMfaFailed {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+        method: ClientMFAMethod,
+        message: String,
+    },
+    ConnectedToLocation {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+    },
+    DisconnectedFromLocation {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+    },
+    MfaConnectedToLocation {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+    },
+    MfaDisconnectedFromLocation {
+        location: WireguardNetwork<Id>,
+        device: Device<Id>,
+    },
+}
+
+#[allow(dead_code)]
+enum EnrollmentEvent {
+    EnrollmentStarted,
+    EnrollmentDeviceAdded { device: Device<Id> },
+    EnrollmentCompleted,
+    PasswordResetRequested,
+    PasswordResetStarted,
+    PasswordResetCompleted,
+    TokenAdded { user: User<Id> },
+}
+
+fn get_defguard_event_description(event: &DefguardEvent) -> Option<String> {
+    event
+        .to_api_event_type()
+        .as_ref()
+        .and_then(get_api_event_description)
+}
+
+fn get_vpn_event_description(event: &VpnEvent) -> Option<String> {
+    match event {
+        VpnEvent::ConnectedToLocation { location, device } => {
+            Some(format!("Device {device} connected to location {location}"))
+        }
+        VpnEvent::DisconnectedFromLocation { location, device } => Some(format!(
+            "Device {device} disconnected from location {location}"
+        )),
+        VpnEvent::MfaConnectedToLocation { location, device } => Some(format!(
+            "Device {device} connected to MFA location {location}"
+        )),
+        VpnEvent::MfaDisconnectedFromLocation { location, device } => Some(format!(
+            "Device {device} disconnected from MFA location {location}"
+        )),
+        VpnEvent::ClientMfaSuccess {
+            location,
+            device,
+            method,
+        } => Some(format!(
+            "Device {device} completed MFA authorization for location {location} using {method}"
+        )),
+        VpnEvent::ClientMfaFailed {
+            location,
+            device,
+            method,
+            message,
+        } => Some(format!(
+            "Device {device} failed to connect to MFA location {location} using {method} with: {message}"
+        )),
+    }
+}
+
+fn get_enrollment_event_description(event: &EnrollmentEvent) -> Option<String> {
+    match event {
+        EnrollmentEvent::TokenAdded { user } => {
+            Some(format!("Added enrollment token for user {user}"))
+        }
+        EnrollmentEvent::PasswordResetRequested
+        | EnrollmentEvent::PasswordResetStarted
+        | EnrollmentEvent::PasswordResetCompleted => None,
+        EnrollmentEvent::EnrollmentStarted => {
+            get_core_enrollment_event_description(&CoreEnrollmentEvent::EnrollmentStarted)
+        }
+        EnrollmentEvent::EnrollmentDeviceAdded { device } => {
+            get_core_enrollment_event_description(&CoreEnrollmentEvent::EnrollmentDeviceAdded {
+                device: device.clone(),
+            })
+        }
+        EnrollmentEvent::EnrollmentCompleted => {
+            get_core_enrollment_event_description(&CoreEnrollmentEvent::EnrollmentCompleted)
+        }
+    }
+}
 use sqlx::PgPool;
 use tracing::info;
 
@@ -209,7 +498,7 @@ pub async fn generate_activity_log(
         let event = ActivityLogEvent {
             id: NoId,
             timestamp,
-            user_id: user.id,
+            user_id: Some(user.id),
             username: user.username.clone(),
             location: generated.location,
             ip: None,
@@ -768,6 +1057,7 @@ fn build_vpn_event(
                     location,
                     device,
                     method,
+                    mobile_auth_device_name: None,
                 })
                 .ok(),
             )

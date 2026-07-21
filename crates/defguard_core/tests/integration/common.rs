@@ -19,6 +19,7 @@ fn set_test_license_business() {
         tier: LicenseTier::Business,
         valid_until: None,
         version_date_limit: None,
+        features: vec![],
     };
     set_cached_license(Some(license));
 }
@@ -52,8 +53,8 @@ async fn init_config_inner(
         .await
         .expect("Could not initialize current settings in the database");
     let mut settings = Settings::get_current_settings();
-    settings.defguard_url = url.to_string();
-    settings.secret_key = Some(test_secret_key.to_string());
+    settings.defguard_url = url.to_owned();
+    settings.secret_key = Some(test_secret_key.to_owned());
     update_current_settings(pool, settings)
         .await
         .expect("Could not update current settings in the database");

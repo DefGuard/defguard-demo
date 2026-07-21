@@ -14,24 +14,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: stable/2.x
+          ref: release/2.1
           fetch-depth: 0
 
-      - name: Pull in upstream stable/2.x (keep our own workflows)
+      - name: Pull in upstream release/2.1 (keep our own workflows)
         run: |
           git remote add upstream https://github.com/defguard/defguard.git
-          git fetch upstream stable/2.x
-          git reset --hard upstream/stable/2.x
+          git fetch upstream release/2.1
+          git reset --hard upstream/release/2.1
           rm -rf .github/workflows
-          git checkout origin/stable/2.x -- .github/workflows
+          git checkout origin/release/2.1 -- .github/workflows
 
       - name: Create or update pull request
         uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.SYNC_PAT }}
           branch: sync/upstream-stable-2.x
-          base: stable/2.x
-          title: "Weekly upstream sync: stable/2.x"
-          body: "Automated weekly sync from upstream defguard/defguard stable/2.x (workflows excluded). Review and merge manually."
+          base: release/2.1
+          title: "Weekly upstream sync: release/2.1"
+          body: "Automated weekly sync from upstream defguard/defguard release/2.1 (workflows excluded). Review and merge manually."

@@ -47,7 +47,7 @@ pub mod utils;
 ///
 /// This function may trigger either full and incremental sync based on the current sync status.
 /// Sets LDAP sync status to OutOfSync if any errors occur during the process.
-pub(crate) async fn do_ldap_sync(
+pub async fn do_ldap_sync(
     pool: &PgPool,
     wg_tx: &Sender<GatewayEvent>,
 ) -> Result<(), LdapError> {

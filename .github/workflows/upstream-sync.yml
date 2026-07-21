@@ -31,7 +31,7 @@ jobs:
         uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.SYNC_PAT }}
-          branch: sync/upstream-stable-2.x
+          branch: sync/upstream-release-2.1
           base: release/2.1
           title: "Weekly upstream sync: release/2.1"
           body: "Automated weekly sync from upstream defguard/defguard release/2.1 (workflows excluded). Review and merge manually."

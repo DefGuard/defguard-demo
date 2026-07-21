@@ -189,10 +189,7 @@ async fn test_demo_ldap_bind_password_not_stored(_: PgPoolOptions, options: PgCo
 }
 
 #[sqlx::test]
-async fn test_demo_openid_provider_secret_not_stored(
-    _: PgPoolOptions,
-    options: PgConnectOptions,
-) {
+async fn test_demo_openid_provider_secret_not_stored(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = setup_pool(options).await;
     let (client, _state) = make_test_client_demo(pool).await;
     login_as_admin(&client).await;
@@ -257,7 +254,9 @@ async fn test_demo_ldap_sync_job_does_not_run(_: PgPoolOptions, options: PgConne
     settings.ldap_group_obj_class = Some("groupOfNames".into());
     settings.ldap_group_member_attr = Some("member".into());
     settings.ldap_group_search_base = Some("ou=groups,dc=example,dc=org".into());
-    update_current_settings(&state.pool, settings).await.unwrap();
+    update_current_settings(&state.pool, settings)
+        .await
+        .unwrap();
 
     let (wg_tx, _wg_rx) = broadcast::channel::<GatewayEvent>(16);
     do_ldap_sync(&state.pool, &wg_tx)

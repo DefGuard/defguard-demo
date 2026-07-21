@@ -72,6 +72,9 @@ jobs:
           severity: "CRITICAL,HIGH,MEDIUM"
           scanners: "vuln"
 
+      - name: Trust repository directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install protoc
         run: apt-get update && apt-get -y install protobuf-compiler
 

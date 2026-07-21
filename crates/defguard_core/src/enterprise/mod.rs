@@ -54,6 +54,10 @@ pub fn is_business_license_active() -> bool {
 /// flag; passing `None` gates strictly on the Enterprise tier (no flag can satisfy it).
 #[must_use]
 pub fn has_enterprise_access(feature: Option<LicenseFeature>) -> bool {
+    if server_config().is_demo_mode {
+        return true;
+    }
+
     let counts = get_counts();
     let license = get_cached_license();
     let Some(license) = license.as_ref() else {

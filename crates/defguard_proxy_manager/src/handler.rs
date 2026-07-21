@@ -22,7 +22,7 @@ use defguard_core::{
     db::models::enrollment::{ENROLLMENT_TOKEN_TYPE, Token},
     enrollment_management::clear_unused_enrollment_tokens,
     enterprise::{
-        db::models::openid_provider::OpenIdProvider,
+        db::models::{enterprise_settings::EnterpriseSettings, openid_provider::OpenIdProvider},
         directory_sync::sync_user_groups_if_configured,
         grpc::polling::PollingServer,
         handlers::openid_login::{
@@ -32,18 +32,22 @@ use defguard_core::{
         ldap::utils::ldap_update_user_state,
     },
     error::WebError,
+    events::{ApiEvent, DirectorySyncEvent, LdapSyncEventType},
     grpc::{
-        GatewayEvent,
-        proxy::client_mfa::{ClientLoginSession, ClientMfaServer},
+        GatewayCommand,
+        proxy::client_mfa::{
+            ClientLoginSession, ClientMfaServer, ClientMfaStartOutcome, PostureCheckOutcome,
+        },
     },
     version::{IncompatibleComponents, IncompatibleProxyData, is_proxy_version_supported},
 };
 use defguard_grpc_tls::certs::proxy_mtls_channel;
 use defguard_proto::{
     client_types::AuthFlowType as ProtoAuthFlowType,
+    enterprise::posture::{DevicePostureCheckResponse, DevicePostureRejection},
     proxy::{
         AuthCallbackResponse, AuthInfoResponse, CoreError, CoreRequest, CoreResponse, HttpsCerts,
-        InitialInfo, core_request, core_response, proxy_client::ProxyClient,
+        InitialInfo, PublicSettings, core_request, core_response, proxy_client::ProxyClient,
     },
 };
 use defguard_version::{
@@ -217,10 +221,12 @@ impl ProxyHandler {
     fn retry_delay(&self) -> Duration {
         #[cfg(test)]
         {
-            return self.handler_retry_delay();
+            self.handler_retry_delay()
         }
-        #[cfg_attr(test, allow(unreachable_code))]
-        TEN_SECS
+        #[cfg(not(test))]
+        {
+            TEN_SECS
+        }
     }
 
     async fn connect_channel_mtls(
@@ -232,12 +238,12 @@ impl ProxyHandler {
             .map_err(ProxyError::SqlxError)?
             .ok_or_else(|| {
                 ProxyError::MissingConfiguration(
-                    "Core CA is not setup, can't create a Proxy endpoint.".to_string(),
+                    "Core CA is not setup, can't create a Proxy endpoint.".to_owned(),
                 )
             })?;
         let ca_cert_der = certs.ca_cert_der.ok_or_else(|| {
             ProxyError::MissingConfiguration(
-                "Core CA is not setup, can't create a Proxy endpoint.".to_string(),
+                "Core CA is not setup, can't create a Proxy endpoint.".to_owned(),
             )
         })?;
 
@@ -398,6 +404,18 @@ impl ProxyHandler {
                 payload: Some(core_response::Payload::InitialInfo(initial_info)),
             });
 
+            // Push public settings (Edge UI controls) to the newly-connected proxy.
+            if let Ok(settings) = EnterpriseSettings::get(&self.pool).await {
+                let public_settings = PublicSettings {
+                    display_password_reset: settings.edge_can_display_password_reset(),
+                    display_download_step: settings.display_download_step,
+                };
+                let _ = tx.send(CoreResponse {
+                    id: 0,
+                    payload: Some(core_response::Payload::PublicSettings(public_settings)),
+                });
+            }
+
             // If a certificate has already been provisioned, push it to the newly-connected
             // proxy immediately so it can start serving HTTPS without a manual trigger.
             // The active source determines which cert/key pair to send.
@@ -411,8 +429,8 @@ impl ProxyHandler {
                         let _ = tx.send(CoreResponse {
                             id: 0,
                             payload: Some(core_response::Payload::HttpsCerts(HttpsCerts {
-                                cert_pem: cert_pem.to_string(),
-                                key_pem: key_pem.to_string(),
+                                cert_pem: cert_pem.to_owned(),
+                                key_pem: key_pem.to_owned(),
                             })),
                         });
                     }
@@ -478,7 +496,7 @@ impl ProxyHandler {
     async fn message_loop(
         &mut self,
         tx: UnboundedSender<CoreResponse>,
-        wireguard_tx: Sender<GatewayEvent>,
+        gateway_tx: Sender<GatewayCommand>,
         resp_stream: &mut Streaming<CoreRequest>,
     ) -> Result<(), ProxyError> {
         let pool = self.pool.clone();
@@ -667,11 +685,18 @@ impl ProxyHandler {
                             match self
                                 .services
                                 .client_mfa
-                                .start_client_mfa_login(request)
+                                .start_client_mfa_login(request, received.device_info)
                                 .await
                             {
-                                Ok(response_payload) => {
+                                Ok(ClientMfaStartOutcome::Approved(response_payload)) => {
                                     Some(core_response::Payload::ClientMfaStart(response_payload))
+                                }
+                                Ok(ClientMfaStartOutcome::Rejected { failed_checks }) => {
+                                    Some(core_response::Payload::DevicePostureRejected(
+                                        DevicePostureRejection {
+                                            failed_posture_checks: failed_checks,
+                                        },
+                                    ))
                                 }
                                 Err(err) => {
                                     error!("client MFA start error {err}");
@@ -795,8 +820,8 @@ impl ProxyHandler {
                                                         || build_state(request.state),
                                                         Nonce::new_random,
                                                     )
-                                                    .add_scope(Scope::new("email".to_string()))
-                                                    .add_scope(Scope::new("profile".to_string()));
+                                                    .add_scope(Scope::new("email".to_owned()))
+                                                    .add_scope(Scope::new("profile".to_owned()));
 
                                                 if SELECT_ACCOUNT_SUPPORTED_PROVIDERS
                                                     .iter()
@@ -862,6 +887,9 @@ impl ProxyHandler {
                                         Nonce::new(request.nonce),
                                         code,
                                         callback_url,
+                                        None,
+                                        None,
+                                        Some(&self.services.event_tx),
                                     )
                                     .await
                                     {
@@ -870,7 +898,9 @@ impl ProxyHandler {
                                             if let Err(err) = sync_user_groups_if_configured(
                                                 &user,
                                                 &pool,
-                                                &wireguard_tx,
+                                                &gateway_tx,
+                                                &self.services.ldap,
+                                                &self.services.dirsync,
                                             )
                                             .await
                                             {
@@ -884,7 +914,8 @@ impl ProxyHandler {
                                                 ldap_update_user_state(
                                                     &mut user,
                                                     &pool,
-                                                    &wireguard_tx,
+                                                    &gateway_tx,
+                                                    &self.services.ldap,
                                                 )
                                                 .await;
                                             }
@@ -900,7 +931,7 @@ impl ProxyHandler {
                                                 Some(user.id),
                                                 Some(user.email),
                                                 settings.enrollment_token_timeout().as_secs(),
-                                                Some(ENROLLMENT_TOKEN_TYPE.to_string()),
+                                                Some(ENROLLMENT_TOKEN_TYPE.to_owned()),
                                             );
                                             debug!("Saving a new desktop configuration token...");
                                             desktop_configuration.save(&pool).await?;
@@ -933,6 +964,9 @@ impl ProxyHandler {
                                                 WebError::BadRequest(message) => {
                                                     (Code::InvalidArgument as i32, message)
                                                 }
+                                                WebError::LicenseLimitReached(message) => {
+                                                    (Code::ResourceExhausted as i32, message)
+                                                }
                                                 _ => (
                                                     Code::Internal as i32,
                                                     "OpenID authentication failed".to_owned(),
@@ -947,8 +981,8 @@ impl ProxyHandler {
                                 }
                                 Err(err) => {
                                     error!(
-                                        "Proxy requested an OpenID authentication info for a callback \
-                                    URL that couldn't be built. Details: {err}"
+                                        "Proxy requested an OpenID authentication info for a \
+                                        callback URL that couldn't be built. Details: {err}"
                                     );
                                     Some(core_response::Payload::CoreError(CoreError {
                                         status_code: Code::Internal as i32,
@@ -1003,6 +1037,26 @@ impl ProxyHandler {
                                 }
                             }
                             None
+                        }
+                        Some(core_request::Payload::DevicePostureCheck(request)) => {
+                            match self.services.client_mfa.handle_posture_check(request).await {
+                                Ok(PostureCheckOutcome::Approved { preshared_key }) => {
+                                    Some(core_response::Payload::DevicePostureCheck(
+                                        DevicePostureCheckResponse { preshared_key },
+                                    ))
+                                }
+                                Ok(PostureCheckOutcome::Rejected { failed_checks }) => {
+                                    Some(core_response::Payload::DevicePostureRejected(
+                                        DevicePostureRejection {
+                                            failed_posture_checks: failed_checks,
+                                        },
+                                    ))
+                                }
+                                Err(err) => {
+                                    error!("Posture check error: {err}");
+                                    Some(core_response::Payload::CoreError(err.into()))
+                                }
+                            }
                         }
                     };
 
@@ -1160,6 +1214,18 @@ impl ProxyHandler {
             payload: Some(core_response::Payload::InitialInfo(initial_info)),
         });
 
+        // Push public settings to the test proxy.
+        if let Ok(settings) = EnterpriseSettings::get(&self.pool).await {
+            let public_settings = PublicSettings {
+                display_password_reset: settings.edge_can_display_password_reset(),
+                display_download_step: settings.display_download_step,
+            };
+            let _ = tx.send(CoreResponse {
+                id: 0,
+                payload: Some(core_response::Payload::PublicSettings(public_settings)),
+            });
+        }
+
         let result = self
             .message_loop(tx, tx_set.wireguard.clone(), &mut resp_stream)
             .await;
@@ -1179,6 +1245,9 @@ struct ProxyServices {
     password_reset: PasswordResetServer,
     client_mfa: ClientMfaServer,
     polling: PollingServer,
+    ldap: UnboundedSender<LdapSyncEventType>,
+    dirsync: UnboundedSender<DirectorySyncEvent>,
+    event_tx: UnboundedSender<ApiEvent>,
 }
 
 impl ProxyServices {
@@ -1188,9 +1257,14 @@ impl ProxyServices {
         remote_mfa_responses: Arc<RwLock<HashMap<String, oneshot::Sender<String>>>>,
         sessions: Arc<RwLock<HashMap<String, ClientLoginSession>>>,
     ) -> Self {
-        let enrollment =
-            EnrollmentServer::new(pool.clone(), tx.wireguard.clone(), tx.bidi_events.clone());
-        let password_reset = PasswordResetServer::new(pool.clone(), tx.bidi_events.clone());
+        let enrollment = EnrollmentServer::new(
+            pool.clone(),
+            tx.wireguard.clone(),
+            tx.bidi_events.clone(),
+            tx.ldap.clone(),
+        );
+        let password_reset =
+            PasswordResetServer::new(pool.clone(), tx.bidi_events.clone(), tx.ldap.clone());
         let client_mfa = ClientMfaServer::new(
             pool.clone(),
             tx.wireguard.clone(),
@@ -1205,6 +1279,9 @@ impl ProxyServices {
             password_reset,
             client_mfa,
             polling,
+            ldap: tx.ldap.clone(),
+            dirsync: tx.dirsync.clone(),
+            event_tx: tx.event_tx.clone(),
         }
     }
 }

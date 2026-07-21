@@ -20,9 +20,13 @@ use defguard_common::{
 };
 use defguard_core::{
     db::models::enrollment::{ENROLLMENT_TOKEN_TYPE, PASSWORD_RESET_TOKEN_TYPE, Token},
+    device_access::join_device_to_all_networks,
     enterprise::{
-        db::models::openid_provider::{
-            DirectorySyncTarget, DirectorySyncUserBehavior, OpenIdProvider, OpenIdProviderKind,
+        db::models::{
+            acl::{AclRule, AclRuleNetwork, RuleState},
+            openid_provider::{
+                DirectorySyncTarget, DirectorySyncUserBehavior, OpenIdProvider, OpenIdProviderKind,
+            },
         },
         license::{License, LicenseTier, SupportType, set_cached_license},
     },
@@ -42,7 +46,12 @@ use defguard_proto::{
 };
 use ipnetwork::IpNetwork;
 use sqlx::PgPool;
-use tokio::{sync::mpsc::UnboundedReceiver, time::timeout};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
+    sync::mpsc::UnboundedReceiver,
+    time::timeout,
+};
 use tonic::Code;
 
 use crate::tests::common::{HandlerTestContext, MockOidcProvider, RECEIVE_TIMEOUT};
@@ -62,12 +71,14 @@ pub(crate) fn assert_initial_info_received(response: &CoreResponse) {
     );
 }
 
-/// Consume the `InitialInfo` message that the handler sends immediately after
-/// establishing the bidi stream.  Most lifecycle tests call this before
-/// injecting any business messages.
+/// Consume the `InitialInfo` and `PublicSettings` messages that the handler
+/// sends immediately after establishing the bidi stream.  Most lifecycle tests
+/// call this before injecting any business messages.
 pub(crate) async fn complete_proxy_handshake(context: &mut HandlerTestContext) {
     let response = context.mock_proxy_mut().recv_outbound().await;
     assert_initial_info_received(&response);
+    // PublicSettings follows InitialInfo on connect.
+    context.mock_proxy_mut().recv_public_settings().await;
 }
 
 /// Assert that a `CoreResponse` carries a `DeviceConfig` payload and return a
@@ -105,8 +116,24 @@ pub(crate) fn set_test_license_business() {
         version_date_limit: None,
         tier: LicenseTier::Business,
         support_type: SupportType::Basic,
+        features: vec![],
     };
     set_cached_license(Some(license));
+}
+
+/// Install an Enterprise-tier license into the global cache for the duration
+/// of a test.
+pub(crate) fn set_test_license_enterprise() {
+    set_cached_license(Some(License {
+        customer_id: "test-customer-id".into(),
+        subscription: false,
+        valid_until: None,
+        limits: None,
+        version_date_limit: None,
+        tier: LicenseTier::Enterprise,
+        support_type: SupportType::Basic,
+        features: vec![],
+    }));
 }
 
 /// Remove the global license (so tests that require no license can clear one
@@ -122,8 +149,8 @@ pub(crate) fn clear_test_license() {
 /// `ExistingDevice` must pass this instead of `None`.
 pub(crate) fn make_device_info() -> DeviceInfo {
     DeviceInfo {
-        ip_address: "127.0.0.1".to_string(),
-        user_agent: Some("test-client/1.0".to_string()),
+        ip_address: "127.0.0.1".to_owned(),
+        user_agent: Some("test-client/1.0".to_owned()),
         version: None,
         platform: None,
     }
@@ -137,8 +164,8 @@ pub(crate) async fn create_user(pool: &PgPool) -> User<Id> {
     User::new(
         username.clone(),
         None,
-        "Test".to_string(),
-        "User".to_string(),
+        "Test".to_owned(),
+        "User".to_owned(),
         format!("{username}@test.example"),
         None,
     )
@@ -154,12 +181,13 @@ pub(crate) async fn create_network(pool: &PgPool) -> WireguardNetwork<Id> {
     WireguardNetwork::new(
         format!("test-network-{network_number}"),
         51820 + i32::from(network_number % 10_000),
-        "10.0.0.1".to_string(),
+        "10.0.0.1".to_owned(),
         None,
         Vec::<IpNetwork>::new(),
         true,  // allow_all_groups
         false, // acl_enabled
         false, // acl_default_allow
+        false,
         LocationMfaMode::default(),
         ServiceLocationMode::default(),
     )
@@ -168,6 +196,50 @@ pub(crate) async fn create_network(pool: &PgPool) -> WireguardNetwork<Id> {
     .save(pool)
     .await
     .expect("failed to save test wireguard network")
+}
+
+/// Create a network with ACL enabled, the ACL AllowedIPs toggle on, and
+/// a manual allowed_ips entry so that the test can verify ACL-derived IPs
+/// are merged alongside the manual ones.
+pub(crate) async fn create_acl_network(pool: &PgPool) -> WireguardNetwork<Id> {
+    let mut network = create_network(pool).await;
+    network.acl_enabled = true;
+    network.allowed_ips_from_acl = true;
+    network.allowed_ips = vec!["10.100.0.0/16".parse::<IpNetwork>().unwrap()];
+    network.save(pool).await.unwrap();
+    WireguardNetwork::find_by_id(pool, network.id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Insert an applied ACL rule that allows all users and targets a specific
+/// location with the given destination address.
+pub(crate) async fn insert_acl_rule_for_network(
+    pool: &PgPool,
+    network_id: Id,
+    destination: IpNetwork,
+) {
+    let mut conn = pool.acquire().await.unwrap();
+    let rule = AclRule {
+        name: "test-acl-rule".into(),
+        state: RuleState::Applied,
+        enabled: true,
+        allow_all_users: true,
+        addresses: vec![destination],
+        any_address: false,
+        any_port: true,
+        any_protocol: true,
+        use_manual_destination_settings: true,
+        ..Default::default()
+    }
+    .save(&mut *conn)
+    .await
+    .unwrap();
+    AclRuleNetwork::new(rule.id, network_id)
+        .save(&mut *conn)
+        .await
+        .unwrap();
 }
 
 /// Pre-generated valid 32-byte WireGuard public keys (base64, 44 chars each).
@@ -248,7 +320,7 @@ pub(crate) async fn create_device_for_user(pool: &PgPool, user_id: Id) -> Device
     static DEV_CTR: AtomicU16 = AtomicU16::new(0);
     let device_number = DEV_CTR.fetch_add(1, Ordering::Relaxed);
     // Use a pre-generated valid 32-byte base64 WireGuard public key.
-    let pubkey = DEVICE_PUBKEYS[device_number as usize % DEVICE_PUBKEYS.len()].to_string();
+    let pubkey = DEVICE_PUBKEYS[device_number as usize % DEVICE_PUBKEYS.len()].to_owned();
     let mut conn = pool
         .acquire()
         .await
@@ -266,8 +338,11 @@ pub(crate) async fn create_device_for_user(pool: &PgPool, user_id: Id) -> Device
     .expect("failed to save test device");
     // Add to all networks that exist at this point so WireguardNetworkDevice
     // join rows are created (needed by build_device_config_response).
-    device
-        .add_to_all_networks(&mut conn)
+    let user = User::find_by_id(&mut *conn, user_id)
+        .await
+        .expect("failed to find user")
+        .expect("user not found");
+    join_device_to_all_networks(&mut conn, &device, &user)
         .await
         .expect("failed to add device to networks");
     device
@@ -299,7 +374,7 @@ pub(crate) async fn create_enrollment_token(
         admin_id,
         None,
         3600, // 1 hour
-        Some(ENROLLMENT_TOKEN_TYPE.to_string()),
+        Some(ENROLLMENT_TOKEN_TYPE.to_owned()),
     );
     token
         .save(pool)
@@ -336,7 +411,7 @@ pub(crate) async fn start_enrollment_session(context: &mut HandlerTestContext, t
         device_info: Some(make_device_info()),
         payload: Some(core_request::Payload::EnrollmentStart(
             EnrollmentStartRequest {
-                token: token_id.to_string(),
+                token: token_id.to_owned(),
             },
         )),
     });
@@ -367,12 +442,13 @@ pub(crate) async fn create_mfa_network(pool: &PgPool) -> WireguardNetwork<Id> {
     WireguardNetwork::new(
         format!("test-mfa-network-{network_number}"),
         41820 + i32::from(network_number % 10_000),
-        "10.1.0.1".to_string(),
+        "10.1.0.1".to_owned(),
         None,
         Vec::<IpNetwork>::new(),
         true,  // allow_all_groups
         false, // acl_enabled
         false, // acl_default_allow
+        false,
         LocationMfaMode::Internal,
         ServiceLocationMode::default(),
     )
@@ -390,12 +466,13 @@ pub(crate) async fn create_external_mfa_network(pool: &PgPool) -> WireguardNetwo
     WireguardNetwork::new(
         format!("test-ext-mfa-network-{network_number}"),
         31820 + i32::from(network_number % 10_000),
-        "10.2.0.1".to_string(),
+        "10.2.0.1".to_owned(),
         None,
         Vec::<IpNetwork>::new(),
         true,  // allow_all_groups
         false, // acl_enabled
         false, // acl_default_allow
+        false,
         LocationMfaMode::External,
         ServiceLocationMode::default(),
     )
@@ -411,6 +488,7 @@ pub(crate) async fn create_external_mfa_network(pool: &PgPool) -> WireguardNetwo
 /// The code is valid immediately and can be passed directly to
 /// `ClientMfaFinishRequest::code`.
 pub(crate) async fn setup_user_email_mfa(pool: &PgPool, user: &mut User<Id>) -> String {
+    configure_working_smtp(pool).await;
     user.new_email_secret(pool).await.expect("new_email_secret");
     user.enable_email_mfa(pool).await.expect("enable_email_mfa");
     // generate_email_mfa_code uses the in-memory secret; note that
@@ -478,8 +556,9 @@ pub(crate) async fn send_mfa_start(
         payload: Some(core_request::Payload::ClientMfaStart(
             ClientMfaStartRequest {
                 location_id,
-                pubkey: pubkey.to_string(),
+                pubkey: pubkey.to_owned(),
                 method: method as i32,
+                posture_data: None,
             },
         )),
     });
@@ -514,8 +593,8 @@ pub(crate) async fn send_mfa_finish(
         device_info: Some(make_device_info()),
         payload: Some(core_request::Payload::ClientMfaFinish(
             ClientMfaFinishRequest {
-                token: token.to_string(),
-                code: code.map(str::to_string),
+                token: token.to_owned(),
+                code: code.map(str::to_owned),
                 auth_pub_key: None,
             },
         )),
@@ -553,8 +632,8 @@ pub(crate) async fn send_mfa_finish_no_recv(
         device_info: Some(make_device_info()),
         payload: Some(core_request::Payload::ClientMfaFinish(
             ClientMfaFinishRequest {
-                token: token.to_string(),
-                code: code.map(str::to_string),
+                token: token.to_owned(),
+                code: code.map(str::to_owned),
                 auth_pub_key: None,
             },
         )),
@@ -578,8 +657,8 @@ pub(crate) async fn send_mfa_finish_raw(
         device_info: Some(make_device_info()),
         payload: Some(core_request::Payload::ClientMfaFinish(
             ClientMfaFinishRequest {
-                token: token.to_string(),
-                code: code.map(str::to_string),
+                token: token.to_owned(),
+                code: code.map(str::to_owned),
                 auth_pub_key: None,
             },
         )),
@@ -596,7 +675,7 @@ pub(crate) async fn send_token_validation(context: &mut HandlerTestContext, toke
         device_info: None,
         payload: Some(core_request::Payload::ClientMfaTokenValidation(
             ClientMfaTokenValidationRequest {
-                token: token.to_string(),
+                token: token.to_owned(),
             },
         )),
     });
@@ -654,12 +733,12 @@ pub(crate) async fn create_oidc_provider(
 ) -> OpenIdProvider<Id> {
     OpenIdProvider::<NoId> {
         id: NoId,
-        name: "test-oidc".to_string(),
+        name: "test-oidc".to_owned(),
         base_url: mock.base_url.clone(),
         kind: OpenIdProviderKind::Custom,
         client_id: mock.client_id.clone(),
         client_secret: mock.client_secret.clone(),
-        display_name: Some("Test OIDC".to_string()),
+        display_name: Some("Test OIDC".to_owned()),
         google_service_account_key: None,
         google_service_account_email: None,
         admin_email: None,
@@ -673,6 +752,7 @@ pub(crate) async fn create_oidc_provider(
         directory_sync_group_match: Vec::new(),
         jumpcloud_api_key: None,
         prefetch_users: false,
+        disable_password_management: false,
         directory_sync_user_groups: None,
     }
     .save(pool)
@@ -684,7 +764,7 @@ pub(crate) async fn create_oidc_provider(
 /// that `edge_callback_url` returns a valid URL during tests.
 pub(crate) async fn set_public_proxy_url(pool: &PgPool, url: &str) {
     let mut settings = Settings::get_current_settings();
-    settings.public_proxy_url = url.to_string();
+    settings.public_proxy_url = url.to_owned();
     update_current_settings(pool, settings)
         .await
         .expect("failed to update public_proxy_url in settings");
@@ -710,9 +790,30 @@ pub(crate) async fn send_activate_user(
         id,
         device_info: Some(make_device_info()),
         payload: Some(core_request::Payload::ActivateUser(ActivateUserRequest {
-            token: Some(token.to_string()),
-            password: password.to_string(),
-            phone_number: phone.map(str::to_string),
+            token: Some(token.to_owned()),
+            password: Some(password.to_owned()),
+            phone_number: phone.map(str::to_owned),
+        })),
+    });
+    context.mock_proxy_mut().recv_outbound().await
+}
+
+/// Send an `ActivateUser` request with no password, as the desktop client does for
+/// externally-managed users whose identity provider disabled local password management.
+pub(crate) async fn send_activate_user_without_password(
+    context: &mut HandlerTestContext,
+    token: &str,
+    phone: Option<&str>,
+) -> CoreResponse {
+    static ACT_CTR: AtomicU64 = AtomicU64::new(2500);
+    let id = ACT_CTR.fetch_add(1, Ordering::Relaxed);
+    context.mock_proxy().send_request(CoreRequest {
+        id,
+        device_info: Some(make_device_info()),
+        payload: Some(core_request::Payload::ActivateUser(ActivateUserRequest {
+            token: Some(token.to_owned()),
+            password: None,
+            phone_number: phone.map(str::to_owned),
         })),
     });
     context.mock_proxy_mut().recv_outbound().await
@@ -733,7 +834,7 @@ pub(crate) async fn send_code_mfa_setup_start(
         payload: Some(core_request::Payload::CodeMfaSetupStart(
             CodeMfaSetupStartRequest {
                 method: method as i32,
-                token: token.to_string(),
+                token: token.to_owned(),
             },
         )),
     });
@@ -747,7 +848,7 @@ pub(crate) async fn create_password_reset_token(pool: &PgPool, user: &User<Id>) 
         None,
         Some(user.email.clone()),
         3600, // 1 hour
-        Some(PASSWORD_RESET_TOKEN_TYPE.to_string()),
+        Some(PASSWORD_RESET_TOKEN_TYPE.to_owned()),
     );
     token
         .save(pool)
@@ -768,7 +869,7 @@ pub(crate) async fn send_password_reset_init(
         device_info: Some(make_device_info()),
         payload: Some(core_request::Payload::PasswordResetInit(
             PasswordResetInitializeRequest {
-                email: email.to_string(),
+                email: email.to_owned(),
             },
         )),
     });
@@ -787,7 +888,7 @@ pub(crate) async fn send_password_reset_start(
         device_info: Some(make_device_info()),
         payload: Some(core_request::Payload::PasswordResetStart(
             PasswordResetStartRequest {
-                token: token.to_string(),
+                token: token.to_owned(),
             },
         )),
     });
@@ -806,8 +907,8 @@ pub(crate) async fn send_password_reset(
         id,
         device_info: Some(make_device_info()),
         payload: Some(core_request::Payload::PasswordReset(PasswordResetRequest {
-            password: password.to_string(),
-            token: Some(token.to_string()),
+            password: password.to_owned(),
+            token: Some(token.to_owned()),
         })),
     });
     context.mock_proxy_mut().recv_outbound().await
@@ -828,8 +929,8 @@ pub(crate) async fn send_code_mfa_setup_finish(
         device_info: Some(make_device_info()),
         payload: Some(core_request::Payload::CodeMfaSetupFinish(
             CodeMfaSetupFinishRequest {
-                code: code.to_string(),
-                token: token.to_string(),
+                code: code.to_owned(),
+                token: token.to_owned(),
                 method: method as i32,
             },
         )),
@@ -842,6 +943,83 @@ pub(crate) fn configure_smtp(settings: &mut Settings) {
     settings.smtp.server = Some("smtp.example.com".into());
     settings.smtp.port = Some(587);
     settings.smtp.sender = Some("noreply@example.com".into());
+}
+
+/// Spawn a minimal in-process SMTP server that accepts any message and replies
+/// with success codes, then point `pool`'s current settings at it.
+///
+/// MFA emails (`mfa_code_mail`/`mfa_activation_mail`) are actually sent
+/// (awaited) rather than fired-and-forgotten, so tests exercising the email
+/// MFA method need a real, reachable SMTP endpoint or the send fails with
+/// `SmtpNotConfigured`/`MailSendFailed`.
+pub(crate) async fn configure_working_smtp(pool: &PgPool) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind fake SMTP listener");
+    let addr = listener.local_addr().expect("failed to get local addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let _ = writer.write_all(b"220 localhost ESMTP\r\n").await;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => return,
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                    let upper = line.trim_end().to_ascii_uppercase();
+                    if upper.starts_with("EHLO") || upper.starts_with("HELO") {
+                        let _ = writer.write_all(b"250 localhost\r\n").await;
+                    } else if upper.starts_with("MAIL FROM")
+                        || upper.starts_with("RCPT TO")
+                        || upper.starts_with("RSET")
+                    {
+                        let _ = writer.write_all(b"250 OK\r\n").await;
+                    } else if upper.starts_with("DATA") {
+                        let _ = writer
+                            .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+                            .await;
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line).await {
+                                Ok(0) => return,
+                                Ok(_) => {}
+                                Err(_) => return,
+                            }
+                            if line == ".\r\n" || line == ".\n" {
+                                break;
+                            }
+                        }
+                        let _ = writer.write_all(b"250 OK message queued\r\n").await;
+                    } else if upper.starts_with("QUIT") {
+                        let _ = writer.write_all(b"221 Bye\r\n").await;
+                        return;
+                    } else {
+                        let _ = writer.write_all(b"250 OK\r\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut settings = Settings::get_current_settings();
+    settings.smtp.server = Some(addr.ip().to_string());
+    settings.smtp.port = Some(i32::from(addr.port()));
+    settings.smtp.sender = Some("noreply@example.com".into());
+    settings.smtp.encryption = defguard_common::db::models::settings::smtp::SmtpEncryption::None;
+    settings.smtp.authentication =
+        defguard_common::db::models::settings::smtp::SmtpAuthentication::None;
+    update_current_settings(pool, settings)
+        .await
+        .expect("failed to persist fake SMTP settings");
 }
 
 /// Set minimal LDAP fields on a [`Settings`] so that `ldap_configured()` returns `true`.

@@ -11,11 +11,12 @@ import { SettingsLayout } from '../../../shared/components/SettingsLayout/Settin
 import './style.scss';
 import { useStore } from '@tanstack/react-form';
 import { useMutation, useQuery, useSuspenseQuery } from '@tanstack/react-query';
-import { Suspense, useMemo } from 'react';
+import { Suspense, useMemo, useState } from 'react';
 import Skeleton from 'react-loading-skeleton';
 import z from 'zod';
 import { m } from '../../../paraglide/messages';
 import api from '../../../shared/api/api';
+import type { LdapDryRunResult, Settings } from '../../../shared/api/types';
 import { businessBadgeProps } from '../../../shared/components/badges/BusinessBadge';
 import { Controls } from '../../../shared/components/Controls/Controls';
 import { DescriptionBlock } from '../../../shared/components/DescriptionBlock/DescriptionBlock';
@@ -23,6 +24,7 @@ import { Button } from '../../../shared/defguard-ui/components/Button/Button';
 import { Divider } from '../../../shared/defguard-ui/components/Divider/Divider';
 import { EvenSplit } from '../../../shared/defguard-ui/components/EvenSplit/EvenSplit';
 import { Fold } from '../../../shared/defguard-ui/components/Fold/Fold';
+import { Helper } from '../../../shared/defguard-ui/components/Helper/Helper';
 import { IconKind } from '../../../shared/defguard-ui/components/Icon';
 import { MarkedSection } from '../../../shared/defguard-ui/components/MarkedSection/MarkedSection';
 import { MarkedSectionHeader } from '../../../shared/defguard-ui/components/MarkedSectionHeader/MarkedSectionHeader';
@@ -43,6 +45,7 @@ import {
   getSettingsQueryOptions,
 } from '../../../shared/query';
 import { canUseBusinessFeature } from '../../../shared/utils/license';
+import { LdapDryRunModal } from './modals/LdapDryRunModal/LdapDryRunModal';
 
 const breadcrumbsLinks = [
   <Link
@@ -117,6 +120,7 @@ const formSchema = z.object({
   ),
   ldap_uses_ad: z.boolean(),
   ldap_sync_account_status: z.boolean(),
+  ldap_disable_password_management: z.boolean(),
   ldap_user_rdn_attr: z.string().trim().nullable(),
   ldap_sync_groups: z.string().trim().nullable(),
   ldap_remote_enrollment_enabled: z.boolean(),
@@ -125,8 +129,15 @@ const formSchema = z.object({
 
 type FormFields = z.infer<typeof formSchema>;
 
+const csvToArray = (value: string | null): string[] =>
+  value
+    ? value
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : [];
+
 const PageForm = () => {
-  const isAppLdapEnabled = useApp((s) => s.appInfo.ldap_info.enabled);
   const smtpEnabled = useApp((s) => s.appInfo.smtp_enabled);
   const { data: licenseInfo } = useSuspenseQuery(getLicenseInfoQueryOptions);
   const { data: settings } = useSuspenseQuery(getSettingsQueryOptions);
@@ -159,6 +170,8 @@ const PageForm = () => {
       ldap_sync_interval: settings?.ldap_sync_interval ?? 300,
       ldap_uses_ad: settings?.ldap_uses_ad ?? false,
       ldap_sync_account_status: settings?.ldap_sync_account_status ?? false,
+      ldap_disable_password_management:
+        settings?.ldap_disable_password_management ?? false,
       ldap_user_rdn_attr: settings?.ldap_user_rdn_attr ?? '',
       ldap_sync_groups: settings?.ldap_sync_groups.join(', ') || null,
       ldap_remote_enrollment_enabled: settings?.ldap_remote_enrollment_enabled ?? false,
@@ -181,16 +194,32 @@ const PageForm = () => {
     },
   });
 
-  const { mutate: handleLdapTest, isPending: testInProgress } = useMutation({
-    mutationFn: api.settings.getLdapConnectionStatus,
-    onSuccess: () => {
-      Snackbar.default(m.settings_ldap_test_success());
+  const [dryRunResult, setDryRunResult] = useState<LdapDryRunResult | null>(null);
+  const [dryRunModalOpen, setDryRunModalOpen] = useState(false);
+
+  const { mutate: handleLdapDryRun, isPending: dryRunInProgress } = useMutation({
+    mutationFn: (data: Settings) => api.settings.ldapDryRun(data),
+    onSuccess: (res) => {
+      setDryRunResult(res.data);
+      setDryRunModalOpen(true);
     },
     onError: (e) => {
       Snackbar.error(m.settings_ldap_test_failed());
       console.error(e);
     },
   });
+
+  const { mutate: handleLdapConnectionTest, isPending: connectionTestInProgress } =
+    useMutation({
+      mutationFn: (data: Settings) => api.settings.testLdapSettings(data),
+      onSuccess: () => {
+        Snackbar.default(m.settings_ldap_test_success());
+      },
+      onError: (e) => {
+        Snackbar.error(m.settings_ldap_test_failed());
+        console.error(e);
+      },
+    });
 
   const form = useAppForm({
     defaultValues,
@@ -208,18 +237,10 @@ const PageForm = () => {
 
       await mutateAsync({
         ...value,
-        ldap_user_auxiliary_obj_classes: value.ldap_user_auxiliary_obj_classes
-          ? value.ldap_user_auxiliary_obj_classes
-              .split(',')
-              .map((item) => item.trim())
-              .filter(Boolean)
-          : [],
-        ldap_sync_groups: value.ldap_sync_groups
-          ? value.ldap_sync_groups
-              .split(',')
-              .map((item) => item.trim())
-              .filter(Boolean)
-          : [],
+        ldap_user_auxiliary_obj_classes: csvToArray(
+          value.ldap_user_auxiliary_obj_classes,
+        ),
+        ldap_sync_groups: csvToArray(value.ldap_sync_groups),
       });
       formApi.reset(value);
     },
@@ -302,6 +323,20 @@ const PageForm = () => {
                 )
               }
             </form.Subscribe>
+            <form.AppField name="ldap_disable_password_management">
+              {(field) => (
+                <field.FormCheckbox
+                  text={m.settings_ldap_checkbox_disable_password_management()}
+                  helperBlock={
+                    <Helper>
+                      <p>
+                        {m.settings_ldap_checkbox_disable_password_management_helper()}
+                      </p>
+                    </Helper>
+                  }
+                />
+              )}
+            </form.AppField>
           </div>
           <SizedBox height={ThemeSpacing.Xl2} />
           <EvenSplit>
@@ -607,10 +642,7 @@ const PageForm = () => {
               {({ isDefaultValue, isSubmitting }) => (
                 <>
                   <TooltipProvider
-                    disabled={
-                      !(!isAppLdapEnabled || !isDefaultValue) ||
-                      !canUseBusinessLicenseCheck
-                    }
+                    disabled={requiredFieldsFilled && canUseBusinessLicenseCheck}
                   >
                     <TooltipTrigger>
                       <div>
@@ -621,13 +653,25 @@ const PageForm = () => {
                           iconLeft={IconKind.Refresh}
                           disabled={
                             isSubmitting ||
-                            !isDefaultValue ||
-                            !isAppLdapEnabled ||
+                            !requiredFieldsFilled ||
                             !canUseBusinessLicenseCheck
                           }
-                          loading={testInProgress}
+                          loading={dryRunInProgress || connectionTestInProgress}
                           onClick={() => {
-                            handleLdapTest();
+                            const values = form.state.values;
+                            const submitted = {
+                              ...settings,
+                              ...values,
+                              ldap_user_auxiliary_obj_classes: csvToArray(
+                                values.ldap_user_auxiliary_obj_classes,
+                              ),
+                              ldap_sync_groups: csvToArray(values.ldap_sync_groups),
+                            } as Settings;
+                            if (values.ldap_sync_enabled) {
+                              handleLdapDryRun(submitted);
+                            } else {
+                              handleLdapConnectionTest(submitted);
+                            }
                           }}
                         />
                       </div>
@@ -648,6 +692,11 @@ const PageForm = () => {
           </div>
         </Controls>
       </form.AppForm>
+      <LdapDryRunModal
+        isOpen={dryRunModalOpen}
+        result={dryRunResult}
+        onClose={() => setDryRunModalOpen(false)}
+      />
     </form>
   );
 };

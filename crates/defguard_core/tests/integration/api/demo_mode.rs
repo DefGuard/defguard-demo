@@ -1,13 +1,14 @@
 use defguard_common::db::models::{Settings, settings::update_current_settings};
 use defguard_core::{
     enterprise::{directory_sync::do_directory_sync, ldap::do_ldap_sync},
-    grpc::GatewayEvent,
+    events::{DirectorySyncEvent, LdapSyncEventType},
+    grpc::GatewayCommand,
     handlers::Auth,
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use super::common::{client::TestClient, fetch_user_details, make_test_client_demo, setup_pool};
 
@@ -208,6 +209,7 @@ async fn test_demo_openid_provider_secret_not_stored(_: PgPoolOptions, options: 
             "directory_sync_admin_behavior": "keep",
             "directory_sync_target": "all",
             "prefetch_users": false,
+            "disable_password_management": false,
             "create_account": false,
             "username_handling": "RemoveForbidden"
         }))
@@ -258,8 +260,9 @@ async fn test_demo_ldap_sync_job_does_not_run(_: PgPoolOptions, options: PgConne
         .await
         .unwrap();
 
-    let (wg_tx, _wg_rx) = broadcast::channel::<GatewayEvent>(16);
-    do_ldap_sync(&state.pool, &wg_tx)
+    let (gateway_tx, _gateway_rx) = broadcast::channel::<GatewayCommand>(16);
+    let (ldap_tx, _ldap_rx) = mpsc::unbounded_channel::<LdapSyncEventType>();
+    do_ldap_sync(&state.pool, &gateway_tx, &ldap_tx)
         .await
         .expect("LDAP sync must be a no-op in demo mode");
 }
@@ -284,6 +287,7 @@ async fn test_demo_directory_sync_job_does_not_run(_: PgPoolOptions, options: Pg
             "directory_sync_admin_behavior": "keep",
             "directory_sync_target": "all",
             "prefetch_users": false,
+            "disable_password_management": false,
             "create_account": false,
             "username_handling": "RemoveForbidden"
         }))
@@ -291,8 +295,10 @@ async fn test_demo_directory_sync_job_does_not_run(_: PgPoolOptions, options: Pg
         .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let (wg_tx, _wg_rx) = broadcast::channel::<GatewayEvent>(16);
-    do_directory_sync(&state.pool, &wg_tx)
+    let (gateway_tx, _gateway_rx) = broadcast::channel::<GatewayCommand>(16);
+    let (ldap_tx, _ldap_rx) = mpsc::unbounded_channel::<LdapSyncEventType>();
+    let (dirsync_tx, _dirsync_rx) = mpsc::unbounded_channel::<DirectorySyncEvent>();
+    do_directory_sync(&state.pool, &gateway_tx, &ldap_tx, &dirsync_tx)
         .await
         .expect("directory sync must be a no-op in demo mode");
 }

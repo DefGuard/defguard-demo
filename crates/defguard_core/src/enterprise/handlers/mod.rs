@@ -1,15 +1,12 @@
-use crate::{
-    auth::{AdminRole, SessionInfo},
-    enterprise::get_counts,
-    handlers::{ApiResponse, ApiResult},
-};
-
 pub mod acl;
 pub mod activity_log_stream;
 pub mod api_tokens;
+pub mod device_posture;
 pub mod enterprise_settings;
 pub mod openid_login;
 pub mod openid_providers;
+
+use std::marker::PhantomData;
 
 use axum::{
     extract::{FromRef, FromRequestParts},
@@ -20,10 +17,17 @@ use defguard_common::config::server_config;
 use serde::Serialize;
 
 use super::{
-    db::models::enterprise_settings::EnterpriseSettings, is_business_license_active,
-    license::get_cached_license,
+    LicenseFeature,
+    db::models::enterprise_settings::EnterpriseSettings,
+    effective_features, get_counts, has_enterprise_access, is_business_license_active,
+    license::{LicenseTier, get_cached_license, validate_license},
 };
-use crate::{appstate::AppState, error::WebError};
+use crate::{
+    appstate::AppState,
+    auth::{AdminRole, SessionInfo},
+    error::WebError,
+    handlers::{ApiResponse, ApiResult},
+};
 
 pub struct LicenseInfo {
     pub valid: bool,
@@ -56,7 +60,40 @@ where
 
     async fn from_request_parts(_parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         if is_business_license_active() {
-            Ok(LicenseInfo { valid: true })
+            Ok(Self { valid: true })
+        } else {
+            Err(WebError::Forbidden("Enterprise features are disabled"))
+        }
+    }
+}
+
+/// Marker type tying an extractor to a single enterprise feature flag.
+pub trait EnterpriseFeature {
+    const FEATURE: LicenseFeature;
+}
+
+/// Marker for the device posture feature.
+pub struct DevicePostureFeature;
+
+impl EnterpriseFeature for DevicePostureFeature {
+    const FEATURE: LicenseFeature = LicenseFeature::DevicePosture;
+}
+
+/// Extractor that rejects with 403 unless the enterprise feature `F` is active for the current
+/// license (either Enterprise tier or granted via an additive feature flag).
+pub struct LicenseGated<F: EnterpriseFeature>(PhantomData<F>);
+
+impl<S, F> FromRequestParts<S> for LicenseGated<F>
+where
+    S: Send + Sync,
+    AppState: FromRef<S>,
+    F: EnterpriseFeature,
+{
+    type Rejection = WebError;
+
+    async fn from_request_parts(_parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if has_enterprise_access(Some(F::FEATURE)) {
+            Ok(Self(PhantomData))
         } else {
             Err(WebError::Forbidden("Enterprise features are disabled"))
         }
@@ -66,48 +103,56 @@ where
 /// Gets full information about enterprise status.
 pub async fn check_enterprise_info(_admin: AdminRole, _session: SessionInfo) -> ApiResult {
     let license = get_cached_license();
-    let license_info = license
-        .as_ref()
-        .map(|license: &crate::enterprise::license::License| {
-            let counts = get_counts();
-            let limits_info = license.limits.map(|limits| LicenseLimitsInfo {
-                locations: LimitInfo {
-                    current: counts.location(),
-                    limit: limits.locations,
-                },
-                users: LimitInfo {
-                    current: counts.user(),
-                    limit: limits.users,
-                },
-                devices: limits.network_devices.map_or(
-                    Some(LimitInfo {
-                        current: counts.user_device() + counts.network_device(),
-                        limit: limits.devices,
-                    }),
-                    |_| None,
-                ),
-                user_devices: limits.network_devices.map(|_| LimitInfo {
-                    current: counts.user_device(),
+    let license_info = license.as_ref().map(|license| {
+        let counts = get_counts();
+        let limits_info = license.limits.map(|limits| LicenseLimitsInfo {
+            locations: LimitInfo {
+                current: counts.location(),
+                limit: limits.locations,
+            },
+            users: LimitInfo {
+                current: counts.user(),
+                limit: limits.users,
+            },
+            devices: limits.network_devices.map_or(
+                Some(LimitInfo {
+                    current: counts.user_device() + counts.network_device(),
                     limit: limits.devices,
                 }),
-                network_devices: limits
-                    .network_devices
-                    .map(|network_devices_limit| LimitInfo {
-                        current: counts.network_device(),
-                        limit: network_devices_limit,
-                    }),
-            });
-
-            serde_json::json!({
-                "valid_until": license.valid_until,
-                "subscription": license.subscription,
-                "expired": license.is_max_overdue(),
-                "limits_exceeded": counts.is_over_license_limits(license),
-                "tier": license.tier,
-                "support_type": license.support_type,
-                "limits": limits_info,
-            })
+                |_| None,
+            ),
+            user_devices: limits.network_devices.map(|_| LimitInfo {
+                current: counts.user_device(),
+                limit: limits.devices,
+            }),
+            network_devices: limits
+                .network_devices
+                .map(|network_devices_limit| LimitInfo {
+                    current: counts.network_device(),
+                    limit: network_devices_limit,
+                }),
         });
+
+        let valid = validate_license(Some(license), &counts, LicenseTier::Business).is_ok();
+        let features = if valid {
+            effective_features(license)
+        } else {
+            Vec::new()
+        };
+
+        serde_json::json!({
+            "valid_until": license.valid_until,
+            "subscription": license.subscription,
+            "expired": license.is_max_overdue(),
+            "limits_exceeded": counts.is_over_license_limits(license),
+            "tier": license.tier,
+            "support_type": license.support_type,
+            "limits": limits_info,
+            // effective set of enabled features (tier-granted plus additive flags)
+            "features": features,
+            "customer_id": license.customer_id,
+        })
+    });
 
     let license_info = license_info.or_else(|| {
         server_config().is_demo_mode.then(|| {
@@ -119,6 +164,8 @@ pub async fn check_enterprise_info(_admin: AdminRole, _session: SessionInfo) -> 
                 "tier": "Enterprise",
                 "support_type": "DirectEnterprise",
                 "limits": null,
+                "features": ["ServiceLocations", "DevicePosture", "AclAllowedIps", "ComponentHa"],
+                "customer_id": "demo",
             })
         })
     });

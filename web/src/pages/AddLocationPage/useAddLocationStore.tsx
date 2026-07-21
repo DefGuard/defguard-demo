@@ -12,6 +12,7 @@ type StoreValues = {
   isWelcome: boolean;
   activeStep: AddLocationPageStepValue;
   locationType: 'regular' | 'service';
+  posture_checks: number[];
 } & EditNetworkLocation;
 
 type StoreMethods = {
@@ -33,6 +34,7 @@ const defaults: StoreValues = {
   peer_disconnect_threshold: 300,
   acl_default_allow: true,
   acl_enabled: false,
+  allowed_ips_from_acl: false,
   address: '',
   allowed_groups: [],
   allowed_ips: '',
@@ -40,6 +42,7 @@ const defaults: StoreValues = {
   endpoint: '',
   location_mfa_mode: LocationMfaMode.Disabled,
   service_location_mode: LocationServiceMode.Disabled,
+  posture_checks: [],
 };
 
 export const useAddLocationStore = create<StoreMethods & StoreValues>()(

@@ -1,7 +1,8 @@
-FROM mcr.microsoft.com/playwright:v1.61.0-noble as base
+FROM mcr.microsoft.com/playwright:v1.32.0-focal as base
 WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-RUN npm i -g pnpm
+COPY package.json .
+COPY pnpm-lock.yaml .
+RUN npm i -g pnpm@11
 RUN pnpm i --frozen-lockfile
 FROM base as runner
 COPY --from=base /app /app

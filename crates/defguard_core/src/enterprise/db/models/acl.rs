@@ -17,17 +17,17 @@ use sqlx::{
     query, query_as, query_scalar,
 };
 use thiserror::Error;
+use tokio::sync::broadcast::Sender;
 use utoipa::ToSchema;
 
 use crate::{
-    appstate::AppState,
     enterprise::{
         firewall::{FirewallError, try_get_location_firewall_config},
         handlers::acl::{
             ApiAclRule, EditAclRule, alias::EditAclAlias, destination::EditAclDestination,
         },
     },
-    grpc::GatewayEvent,
+    grpc::{GatewayCommand, send_gateway_command},
 };
 
 #[derive(Debug, Error)]
@@ -127,8 +127,8 @@ impl From<PgRange<i32>> for PortRange {
 }
 
 impl From<PortRange> for PgRange<i32> {
-    fn from(range: PortRange) -> PgRange<i32> {
-        PgRange {
+    fn from(range: PortRange) -> Self {
+        Self {
             start: Bound::Included(i32::from(*range.0.start())),
             end: Bound::Included(i32::from(*range.0.end())),
         }
@@ -283,7 +283,7 @@ impl Default for AclRule {
             id: NoId,
             parent_id: Option::default(),
             state: RuleState::New,
-            name: "ACL rule".to_string(),
+            name: "ACL rule".to_owned(),
             allow_all_users: false,
             deny_all_users: false,
             allow_all_groups: false,
@@ -321,7 +321,7 @@ impl AclRule {
         actor: &str,
     ) -> Result<ApiAclRule, AclError> {
         // save the rule
-        let mut rule: AclRule = api_rule.clone().try_into()?;
+        let mut rule: Self = api_rule.clone().try_into()?;
         rule.stamp_modified(actor);
         let rule = rule.save(&mut *conn).await?;
 
@@ -364,7 +364,7 @@ impl AclRule {
         })?;
 
         // convert API rule to model
-        let mut rule: AclRule<NoId> = api_rule.clone().try_into()?;
+        let mut rule: Self = api_rule.clone().try_into()?;
         rule.stamp_modified(actor);
 
         // perform appropriate updates depending on existing rule's state
@@ -515,10 +515,11 @@ impl AclRule {
     pub async fn apply_rules(
         rules: &[Id],
         actor: &str,
-        appstate: &AppState,
+        pool: &PgPool,
+        gateway_tx: &Sender<GatewayCommand>,
     ) -> Result<(), AclError> {
         debug!("Applying {} ACL rules: {rules:?}", rules.len());
-        let mut transaction = appstate.pool.begin().await?;
+        let mut transaction = pool.begin().await?;
 
         // prepare variable for collecting affected locations
         let mut affected_locations = HashSet::new();
@@ -547,15 +548,15 @@ impl AclRule {
             match try_get_location_firewall_config(&location, &mut transaction).await? {
                 Some(firewall_config) => {
                     debug!("Sending firewall update event for location {location}");
-                    appstate.send_wireguard_event(GatewayEvent::FirewallConfigChanged(
-                        location.id,
-                        firewall_config,
-                    ));
+                    send_gateway_command(
+                        GatewayCommand::FirewallConfigChanged(location.id, firewall_config),
+                        gateway_tx,
+                    );
                 }
                 None => {
                     debug!(
                         "No firewall config generated for location {location}. Not sending a \
-                        gateway event"
+                        gateway command"
                     );
                 }
             }
@@ -574,7 +575,7 @@ pub(crate) struct ParsedDestination {
 
 fn invalid_destination_range(range: &str) -> AclError {
     error!("Failed to parse destination range token: \"{range}\"");
-    AclError::InvalidIpRangeError(range.to_string())
+    AclError::InvalidIpRangeError(range.to_owned())
 }
 
 fn parse_destination_range(range: &str) -> Result<(IpAddr, IpAddr), AclError> {
@@ -634,7 +635,7 @@ pub(crate) fn parse_destination_addresses(
 /// `22, 23, 8000-9000, 80-90`
 fn invalid_ports_format(ports: &str) -> AclError {
     error!("Failed to parse ports string: \"{ports}\"");
-    AclError::InvalidPortsFormat(ports.to_string())
+    AclError::InvalidPortsFormat(ports.to_owned())
 }
 
 fn parse_port_token(port_token: &str, ports: &str) -> Result<PortRange, AclError> {
@@ -1336,6 +1337,138 @@ impl AclRuleInfo<Id> {
         Ok(unique_denied_users.into_iter().collect())
     }
 
+    /// Returns `true` if the given user is permitted by this rule's source policy.
+    ///
+    /// Evaluation order:
+    /// 1. If `deny_all_users` is set, return `false` immediately.
+    /// 2. If the user is explicitly denied or is a member of a denied group, return `false`.
+    /// 3. If `allow_all_users` is set, return `true`.
+    /// 4. If the user is explicitly allowed or is a member of an allowed group, return `true`.
+    /// 5. Otherwise return `false`.
+    pub(crate) async fn user_is_allowed(
+        &self,
+        user_id: Id,
+        conn: &mut PgConnection,
+    ) -> sqlx::Result<bool> {
+        debug!(
+            "Checking if user {user_id} is allowed by ACL rule {}",
+            self.id
+        );
+
+        // All users are denied - no need to check further.
+        if self.deny_all_users {
+            debug!(
+                "deny_all_users is set on rule {} - user {user_id} is denied",
+                self.id
+            );
+            return Ok(false);
+        }
+
+        // Check if user is explicitly denied.
+        if self.denied_users.iter().any(|u| u.id == user_id) {
+            debug!("User {user_id} is explicitly denied by rule {}", self.id);
+            return Ok(false);
+        }
+
+        // Check if user is a member of a denied group.
+        let denied_by_group = if self.deny_all_groups {
+            // Every group is a denied group - check if user is in any group.
+            query_scalar!(
+                "SELECT EXISTS(
+                    SELECT 1 FROM group_user gu
+                    JOIN \"user\" u ON u.id = gu.user_id
+                    WHERE u.id = $1 AND u.is_active
+                )",
+                user_id
+            )
+            .fetch_one(&mut *conn)
+            .await?
+            .unwrap_or(false)
+        } else if !self.denied_groups.is_empty() {
+            let denied_group_ids: Vec<Id> = self.denied_groups.iter().map(|g| g.id).collect();
+            query_scalar!(
+                "SELECT EXISTS(
+                    SELECT 1 FROM group_user gu
+                    JOIN \"user\" u ON u.id = gu.user_id
+                    WHERE u.id = $1 AND u.is_active AND gu.group_id = ANY($2)
+                )",
+                user_id,
+                &denied_group_ids
+            )
+            .fetch_one(&mut *conn)
+            .await?
+            .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if denied_by_group {
+            debug!(
+                "User {user_id} is denied via group membership by rule {}",
+                self.id
+            );
+            return Ok(false);
+        }
+
+        // All users are allowed (and not denied above).
+        if self.allow_all_users {
+            debug!(
+                "allow_all_users is set on rule {} - user {user_id} is allowed",
+                self.id
+            );
+            return Ok(true);
+        }
+
+        // Check if user is explicitly allowed.
+        if self.allowed_users.iter().any(|u| u.id == user_id) {
+            debug!("User {user_id} is explicitly allowed by rule {}", self.id);
+            return Ok(true);
+        }
+
+        // Check if user is a member of an allowed group.
+        let allowed_by_group = if self.allow_all_groups {
+            // Every group is an allowed group - check if user is in any group.
+            query_scalar!(
+                "SELECT EXISTS(
+                    SELECT 1 FROM group_user gu
+                    JOIN \"user\" u ON u.id = gu.user_id
+                    WHERE u.id = $1 AND u.is_active
+                )",
+                user_id
+            )
+            .fetch_one(&mut *conn)
+            .await?
+            .unwrap_or(false)
+        } else if !self.allowed_groups.is_empty() {
+            let allowed_group_ids: Vec<Id> = self.allowed_groups.iter().map(|g| g.id).collect();
+            query_scalar!(
+                "SELECT EXISTS(
+                    SELECT 1 FROM group_user gu
+                    JOIN \"user\" u ON u.id = gu.user_id
+                    WHERE u.id = $1 AND u.is_active AND gu.group_id = ANY($2)
+                )",
+                user_id,
+                &allowed_group_ids
+            )
+            .fetch_one(&mut *conn)
+            .await?
+            .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if allowed_by_group {
+            debug!(
+                "User {user_id} is allowed via group membership by rule {}",
+                self.id
+            );
+        } else {
+            debug!("User {user_id} is not matched by rule {}", self.id);
+        }
+
+        Ok(allowed_by_group)
+    }
+
     /// Returns the list of explicitly configured allowed network devices or
     /// a list of all devices if 'allow_all_network_devices' flag is enabled.
     pub(crate) async fn get_all_allowed_devices<'e, E: PgExecutor<'e>>(
@@ -1645,13 +1778,14 @@ impl AclAlias {
         aliases: &[Id],
         kind: AliasKind,
         actor: &str,
-        appstate: &AppState,
+        pool: &PgPool,
+        gateway_tx: &Sender<GatewayCommand>,
     ) -> Result<(), AclError> {
         debug!(
             "Applying {} ACL aliases of kind {kind:?}: {aliases:?}",
             aliases.len(),
         );
-        let mut transaction = appstate.pool.begin().await?;
+        let mut transaction = pool.begin().await?;
 
         // prepare variable for collecting affected rules
         // we are unable to use `HashSet` because `PgRange` does not implement `Hash` trait
@@ -1696,15 +1830,15 @@ impl AclAlias {
             match try_get_location_firewall_config(&location, &mut transaction).await? {
                 Some(firewall_config) => {
                     debug!("Sending firewall update event for location {location}");
-                    appstate.send_wireguard_event(GatewayEvent::FirewallConfigChanged(
-                        location.id,
-                        firewall_config,
-                    ));
+                    send_gateway_command(
+                        GatewayCommand::FirewallConfigChanged(location.id, firewall_config),
+                        gateway_tx,
+                    );
                 }
                 None => {
                     debug!(
                         "No firewall config generated for location {location}. Not sending a \
-                        gateway event"
+                        gateway command"
                     );
                 }
             }
@@ -1947,7 +2081,7 @@ impl AclAlias<Id> {
 }
 
 #[derive(Model)]
-pub(crate) struct AclRuleNetwork<I = NoId> {
+pub struct AclRuleNetwork<I = NoId> {
     #[allow(dead_code)]
     id: I,
     rule_id: Id,
@@ -1956,7 +2090,7 @@ pub(crate) struct AclRuleNetwork<I = NoId> {
 
 impl AclRuleNetwork {
     #[must_use]
-    pub(crate) fn new(rule_id: Id, network_id: Id) -> Self {
+    pub fn new(rule_id: Id, network_id: Id) -> Self {
         Self {
             id: NoId,
             rule_id,
@@ -1966,7 +2100,7 @@ impl AclRuleNetwork {
 }
 
 #[derive(Model)]
-pub(crate) struct AclRuleUser<I = NoId> {
+pub struct AclRuleUser<I = NoId> {
     #[allow(dead_code)]
     id: I,
     rule_id: Id,
@@ -1976,7 +2110,7 @@ pub(crate) struct AclRuleUser<I = NoId> {
 
 impl AclRuleUser {
     #[must_use]
-    pub(crate) fn new(rule_id: Id, user_id: Id, allow: bool) -> Self {
+    pub fn new(rule_id: Id, user_id: Id, allow: bool) -> Self {
         Self {
             id: NoId,
             rule_id,

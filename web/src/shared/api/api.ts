@@ -29,8 +29,10 @@ import type {
   AddUsersToGroupsRequest,
   AddWebhookRequest,
   AdminChangeUserPasswordRequest,
+  ApiDevicePosture,
   ApiToken,
   ApplicationInfo,
+  AssignPosturesData,
   AssignStaticIpsRequest,
   AuthKey,
   AvailableLocationIpResponse,
@@ -48,11 +50,14 @@ import type {
   DeleteAuthKeyRequest,
   Device,
   DeviceLocationIpsResponse,
+  DevicePostureListFilters,
+  DevicePostureVersionMetadata,
   Edge,
   EdgeInfo,
   EditAclAliasRequest,
   EditAclDestination,
   EditAclRuleRequest,
+  EditDevicePostureRequest,
   EditGroupRequest,
   EditNetworkDeviceRequest,
   EditNetworkLocation,
@@ -67,6 +72,7 @@ import type {
   GetInternalSslInfoResponse,
   GroupInfo,
   IpValidation,
+  LdapDryRunResult,
   LicenseCheckResponse,
   LicenseInfo,
   LicenseInfoResponse,
@@ -444,6 +450,26 @@ const api = {
     validateUserDeviceIp: (username: string, data: ValidateIpAssignmentRequest) =>
       client.post(`/device/user/${username}/ip/validate`, data),
   },
+  devicePosture: {
+    addDevicePosture: (data: EditDevicePostureRequest) =>
+      client.post<ApiDevicePosture>('/device-posture', removeEmptyStrings(data)),
+    deleteDevicePosture: (id: number) => client.delete(`/device-posture/${id}`),
+    duplicateDevicePosture: (id: number) =>
+      client.post<ApiDevicePosture>(`/device-posture/${id}/duplicate`),
+    editDevicePosture: (id: number, data: EditDevicePostureRequest) =>
+      client.put<ApiDevicePosture>(`/device-posture/${id}`, removeEmptyStrings(data)),
+    getDevicePosture: (id: number) =>
+      client.get<ApiDevicePosture>(`/device-posture/${id}`),
+    getDevicePostureVersionMetadata: () =>
+      client.get<DevicePostureVersionMetadata>('/device-posture/versions'),
+    getDevicePostures: () => fetchAllPages<ApiDevicePosture>('/device-posture'),
+    getDevicePosturesPage: (params?: DevicePostureListFilters) =>
+      fetchPage<ApiDevicePosture>('/device-posture', params),
+    setLocationsForDevicePosture: (id: number, locations: number[]) =>
+      client.put<number[]>(`/device-posture/${id}/locations`, { locations }),
+    setLocationPostures: (locationId: number, data: AssignPosturesData) =>
+      client.put<number[]>(`/network/${locationId}/postures`, data),
+  },
   settings: {
     getSettings: () => client.get<Settings>('/settings'),
     editSettings: (data: Settings) => client.put('/settings', data),
@@ -453,6 +479,8 @@ const api = {
       client.patch('/settings_enterprise', data),
     getSettingsEssentials: () => client.get<SettingsEssentials>('/settings_essentials'),
     getLdapConnectionStatus: () => client.get(`/ldap/test`),
+    testLdapSettings: (data: Settings) => client.post('/ldap/test', data),
+    ldapDryRun: (data: Settings) => client.post<LdapDryRunResult>('/ldap/dry_run', data),
   },
   openIdProvider: {
     getOpenIdProvider: () =>

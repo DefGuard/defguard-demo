@@ -3,9 +3,12 @@ use std::net::IpAddr;
 use base64::{DecodeError, Engine, prelude::BASE64_STANDARD};
 use defguard_common::{
     KEY_LENGTH,
-    db::models::{
-        Device, WireguardNetwork,
-        wireguard::{DEFAULT_WIREGUARD_MTU, LocationMfaMode, ServiceLocationMode},
+    db::{
+        Id,
+        models::{
+            Device, WireguardNetwork,
+            wireguard::{DEFAULT_WIREGUARD_MTU, LocationMfaMode, ServiceLocationMode},
+        },
     },
 };
 use ipnetwork::{IpNetwork, IpNetworkError};
@@ -14,7 +17,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct ImportedDevice {
-    pub user_id: Option<i64>,
+    pub user_id: Option<Id>,
     pub name: String,
     pub wireguard_pubkey: String,
     pub wireguard_ips: Vec<IpAddr>,
@@ -46,7 +49,7 @@ pub(crate) enum WireguardConfigParseError {
 
 impl From<DecodeError> for WireguardConfigParseError {
     fn from(e: DecodeError) -> Self {
-        WireguardConfigParseError::InvalidKey(format!("{e}"))
+        Self::InvalidKey(format!("{e}"))
     }
 }
 
@@ -64,7 +67,7 @@ pub(crate) fn parse_wireguard_config(
     let prvkey_bytes: [u8; KEY_LENGTH] = BASE64_STANDARD
         .decode(prvkey.as_bytes())?
         .try_into()
-        .map_err(|_| WireguardConfigParseError::InvalidKey(prvkey.to_string()))?;
+        .map_err(|_| WireguardConfigParseError::InvalidKey(prvkey.to_owned()))?;
     let pubkey =
         BASE64_STANDARD.encode(PublicKey::from(&StaticSecret::from(prvkey_bytes)).to_bytes());
     let address = interface_section
@@ -75,19 +78,19 @@ pub(crate) fn parse_wireguard_config(
         .ok_or(WireguardConfigParseError::KeyNotFound("ListenPort"))?;
     let port = port
         .parse()
-        .map_err(|_| WireguardConfigParseError::InvalidPort(port.to_string()))?;
-    let dns = interface_section.get("DNS").map(ToString::to_string);
+        .map_err(|_| WireguardConfigParseError::InvalidPort(port.to_owned()))?;
+    let dns = interface_section.get("DNS").map(str::to_owned);
     let mtu = match interface_section.get("MTU") {
         Some(value) => value
             .parse::<i32>()
-            .map_err(|_| WireguardConfigParseError::InvalidMTU(value.to_string()))?,
+            .map_err(|_| WireguardConfigParseError::InvalidMTU(value.to_owned()))?,
         None => DEFAULT_WIREGUARD_MTU,
     };
     // TODO: FwMark should also accept hex values.
     let fwmark = match interface_section.get("FwMark") {
         Some(value) => value
             .parse::<i64>()
-            .map_err(|_| WireguardConfigParseError::InvalidFwMark(value.to_string()))?,
+            .map_err(|_| WireguardConfigParseError::InvalidFwMark(value.to_owned()))?,
         None => 0,
     };
     let mut addresses = Vec::<IpNetwork>::new();
@@ -114,6 +117,7 @@ pub(crate) fn parse_wireguard_config(
         true,
         false,
         false,
+        false,
         LocationMfaMode::Disabled,
         ServiceLocationMode::Disabled,
     )
@@ -121,7 +125,7 @@ pub(crate) fn parse_wireguard_config(
     network.mtu = mtu;
     network.fwmark = fwmark;
     network.pubkey = pubkey;
-    network.prvkey = prvkey.to_string();
+    prvkey.clone_into(&mut network.prvkey);
 
     // Parse Devices
     let peer_sections = config.section_all(Some("Peer"));
@@ -166,8 +170,8 @@ pub(crate) fn parse_wireguard_config(
 
         devices.push(ImportedDevice {
             user_id: None,
-            name: pubkey.to_string(),
-            wireguard_pubkey: pubkey.to_string(),
+            name: pubkey.to_owned(),
+            wireguard_pubkey: pubkey.to_owned(),
             wireguard_ips: peer_addresses,
         });
     }
@@ -220,7 +224,7 @@ mod test {
             "GAA2X3DW0WakGVx+DsGjhDpTgg50s1MlmrLf24Psrlg="
         );
         assert_eq!(network.endpoint, "");
-        assert_eq!(network.dns, Some("10.0.0.2".to_string()));
+        assert_eq!(network.dns, Some("10.0.0.2".to_owned()));
         assert_eq!(network.mtu, 1420);
         assert_eq!(network.fwmark, 51820);
         assert_eq!(network.allowed_ips, vec!["10.0.0.0/24".parse().unwrap()]);
@@ -292,7 +296,7 @@ mod test {
             "GAA2X3DW0WakGVx+DsGjhDpTgg50s1MlmrLf24Psrlg="
         );
         assert_eq!(network.endpoint, "");
-        assert_eq!(network.dns, Some("10.0.0.2".to_string()));
+        assert_eq!(network.dns, Some("10.0.0.2".to_owned()));
         assert_eq!(
             network.allowed_ips,
             vec![

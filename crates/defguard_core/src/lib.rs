@@ -41,7 +41,7 @@ use defguard_common::{
 use defguard_proto::gateway::Configuration;
 use defguard_version::server::DefguardVersionLayer;
 use defguard_web_ui::{index, svg, web_asset};
-use events::ApiEvent;
+use events::{ApiEvent, DirectorySyncEvent, LdapSyncEventType};
 use handlers::{
     activity_log::get_activity_log_events,
     auth::disable_user_mfa,
@@ -112,6 +112,11 @@ use crate::{
             },
             api_tokens::{add_api_token, delete_api_token, fetch_api_tokens, rename_api_token},
             check_enterprise_info,
+            device_posture::{
+                create_device_posture, delete_device_posture, duplicate_device_posture,
+                get_device_posture, get_device_posture_versions, list_device_postures,
+                set_locations_for_posture, set_postures_for_location, update_device_posture,
+            },
             enterprise_settings::{get_enterprise_settings, patch_enterprise_settings},
             openid_login::{auth_callback, get_auth_info},
             openid_providers::{
@@ -124,7 +129,7 @@ use crate::{
             create_snat_binding, delete_snat_binding, list_snat_bindings, modify_snat_binding,
         },
     },
-    grpc::{GatewayEvent, WorkerState},
+    grpc::{GatewayCommand, WorkerState},
     handlers::{
         app_info::get_app_info,
         auth::{
@@ -158,8 +163,9 @@ use crate::{
         proxy::{delete_proxy, proxy_details, proxy_list, update_proxy},
         resource_display::get_locations_display,
         settings::{
-            get_settings, get_settings_essentials, patch_settings, set_default_branding,
-            test_ldap_settings, update_settings,
+            get_settings, get_settings_essentials, ldap_dry_run, patch_settings,
+            set_default_branding, test_ldap_settings, test_submitted_ldap_settings,
+            update_settings,
         },
         ssh_authorized_keys::get_authorized_keys,
         static_ips::{
@@ -195,6 +201,7 @@ pub mod appstate;
 pub mod auth;
 pub mod cert_settings;
 pub mod db;
+pub mod device_access;
 pub mod enrollment_management;
 pub mod enterprise;
 pub mod error;
@@ -256,13 +263,15 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
 pub fn build_webapp(
     webhook_tx: UnboundedSender<AppEvent>,
     webhook_rx: UnboundedReceiver<AppEvent>,
-    wireguard_tx: Sender<GatewayEvent>,
+    gateway_tx: Sender<GatewayCommand>,
     web_reload_tx: tokio::sync::broadcast::Sender<()>,
     worker_state: Arc<Mutex<WorkerState>>,
     pool: PgPool,
     key: Key,
     failed_logins: Arc<Mutex<FailedLoginMap>>,
     event_tx: UnboundedSender<ApiEvent>,
+    ldap_tx: UnboundedSender<LdapSyncEventType>,
+    dirsync_tx: UnboundedSender<DirectorySyncEvent>,
     incompatible_components: Arc<RwLock<IncompatibleComponents>>,
     proxy_control_tx: tokio::sync::mpsc::Sender<ProxyControlMessage>,
     tls_active: Arc<AtomicBool>,
@@ -411,7 +420,11 @@ pub fn build_webapp(
                     .post(change_enabled),
             )
             // ldap
-            .route("/ldap/test", get(test_ldap_settings))
+            .route(
+                "/ldap/test",
+                get(test_ldap_settings).post(test_submitted_ldap_settings),
+            )
+            .route("/ldap/dry_run", post(ldap_dry_run))
             // activity log
             .route("/activity_log", get(get_activity_log_events))
             // Proxy routes
@@ -541,6 +554,30 @@ pub fn build_webapp(
     let api_router = api_router.nest(
         "/api/v1",
         Router::new()
+            .route("/device-posture/versions", get(get_device_posture_versions))
+            .route(
+                "/device-posture",
+                get(list_device_postures).post(create_device_posture),
+            )
+            .route(
+                "/device-posture/{id}",
+                get(get_device_posture)
+                    .put(update_device_posture)
+                    .delete(delete_device_posture),
+            )
+            .route(
+                "/device-posture/{id}/duplicate",
+                post(duplicate_device_posture),
+            )
+            .route(
+                "/device-posture/{id}/locations",
+                put(set_locations_for_posture),
+            ),
+    );
+
+    let api_router = api_router.nest(
+        "/api/v1",
+        Router::new()
             // FIXME: Conflict; change /device/{device_id} to /device/{username}.
             .route("/device/{device_id}", post(add_device))
             .route(
@@ -629,6 +666,7 @@ pub fn build_webapp(
                 "/network/{location_id}/snat",
                 get(list_snat_bindings).post(create_snat_binding),
             )
+            .route("/network/{id}/postures", put(set_postures_for_location))
             .route(
                 "/network/{location_id}/snat/{user_id}",
                 put(modify_snat_binding).delete(delete_snat_binding),
@@ -714,11 +752,13 @@ pub fn build_webapp(
         pool.clone(),
         webhook_tx,
         webhook_rx,
-        wireguard_tx,
+        gateway_tx,
         web_reload_tx,
         key,
         failed_logins,
         event_tx,
+        ldap_tx,
+        dirsync_tx,
         incompatible_components,
         proxy_control_tx.clone(),
         tls_active,
@@ -784,11 +824,13 @@ pub async fn run_web_server(
     worker_state: Arc<Mutex<WorkerState>>,
     webhook_tx: UnboundedSender<AppEvent>,
     webhook_rx: UnboundedReceiver<AppEvent>,
-    wireguard_tx: Sender<GatewayEvent>,
+    gateway_tx: Sender<GatewayCommand>,
     web_reload_tx: tokio::sync::broadcast::Sender<()>,
     pool: PgPool,
     failed_logins: Arc<Mutex<FailedLoginMap>>,
     event_tx: UnboundedSender<ApiEvent>,
+    ldap_tx: UnboundedSender<LdapSyncEventType>,
+    dirsync_tx: UnboundedSender<DirectorySyncEvent>,
     incompatible_components: Arc<RwLock<IncompatibleComponents>>,
     proxy_control_tx: tokio::sync::mpsc::Sender<ProxyControlMessage>,
 ) -> Result<(), anyhow::Error> {
@@ -802,13 +844,15 @@ pub async fn run_web_server(
     let webapp = build_webapp(
         webhook_tx,
         webhook_rx,
-        wireguard_tx,
+        gateway_tx,
         web_reload_tx.clone(),
         worker_state,
         pool.clone(),
         key,
         failed_logins,
         event_tx,
+        ldap_tx,
+        dirsync_tx,
         incompatible_components,
         proxy_control_tx,
         Arc::clone(&tls_active),
@@ -974,12 +1018,13 @@ pub async fn init_dev_env(config: &DefGuardConfig) {
     } else {
         info!("Creating test network");
         let mut network = WireguardNetwork::new(
-            "TestNet".to_string(),
+            "TestNet".to_owned(),
             50051,
-            "0.0.0.0".to_string(),
+            "0.0.0.0".to_owned(),
             None,
             vec![IpNetwork::new(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 0)), 24).unwrap()],
             true,
+            false,
             false,
             false,
             LocationMfaMode::Disabled,
@@ -987,8 +1032,8 @@ pub async fn init_dev_env(config: &DefGuardConfig) {
         )
         .set_address([IpNetwork::new(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)), 24).unwrap()])
         .unwrap();
-        network.pubkey = "zGMeVGm9HV9I4wSKF9AXmYnnAIhDySyqLMuKpcfIaQo=".to_string();
-        network.prvkey = "MAk3d5KuB167G88HM7nGYR6ksnPMAOguAg2s5EcPp1M=".to_string();
+        "zGMeVGm9HV9I4wSKF9AXmYnnAIhDySyqLMuKpcfIaQo=".clone_into(&mut network.pubkey);
+        "MAk3d5KuB167G88HM7nGYR6ksnPMAOguAg2s5EcPp1M=".clone_into(&mut network.prvkey);
         network
             .save(&mut *transaction)
             .await
@@ -1010,8 +1055,8 @@ pub async fn init_dev_env(config: &DefGuardConfig) {
     } else {
         info!("Creating test device");
         let device = Device::new(
-            "TestDevice".to_string(),
-            "gQYL5eMeFDj0R+lpC7oZyIl0/sNVmQDC6ckP7husZjc=".to_string(),
+            "TestDevice".to_owned(),
+            "gQYL5eMeFDj0R+lpC7oZyIl0/sNVmQDC6ckP7husZjc=".to_owned(),
             1,
             DeviceType::User,
             None,
@@ -1083,6 +1128,7 @@ pub async fn init_vpn_location(
                 true,
                 false,
                 false,
+                false,
                 LocationMfaMode::Disabled,
                 ServiceLocationMode::Disabled,
             )
@@ -1121,6 +1167,7 @@ pub async fn init_vpn_location(
             args.dns.clone(),
             args.allowed_ips.clone(),
             true,
+            false,
             false,
             false,
             LocationMfaMode::Disabled,
@@ -1164,7 +1211,7 @@ pub async fn gateway_config(
     };
 
     // get peers
-    let peers = get_location_allowed_peers(&location, &mut *conn)
+    let peers = get_location_allowed_peers(&location, &mut conn)
         .await
         .map_err(|err| anyhow!("Failed to get peers for location {location} with error: {err}"))?;
 

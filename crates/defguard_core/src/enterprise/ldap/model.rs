@@ -98,7 +98,7 @@ pub(crate) fn user_from_searchentry(
             "LDAP User \"{username}\" has username that cannot be used in Defguard; change the \
             LDAP username attribute or change the username in LDAP to a valid one"
         );
-        return Err(LdapError::InvalidUsername(username.to_string()));
+        return Err(LdapError::InvalidUsername(username.to_owned()));
     }
     Ok(user)
 }
@@ -132,15 +132,15 @@ pub(crate) fn user_as_ldap_mod<I>(user: &User<I>, config: &LDAPConfig) -> Vec<Mo
             .any(|e| e == UserObjectClass::User.name())
     {
         changes.extend_from_slice(&[
-            Mod::Replace("sn".to_string(), hashset![user.last_name.clone()]),
-            Mod::Replace("givenName".to_string(), hashset![user.first_name.clone()]),
-            Mod::Replace("mail".to_string(), hashset![user.email.clone()]),
+            Mod::Replace("sn".to_owned(), hashset![user.last_name.clone()]),
+            Mod::Replace("givenName".to_owned(), hashset![user.first_name.clone()]),
+            Mod::Replace("mail".to_owned(), hashset![user.email.clone()]),
         ]);
 
         // Allow renaming the user if the CN is not a part of the RDN
         if !config.get_rdn_attr().eq_ignore_ascii_case("cn") {
             changes.push(Mod::Replace(
-                "cn".to_string(),
+                "cn".to_owned(),
                 hashset![user.username.clone()],
             ));
         }
@@ -152,14 +152,14 @@ pub(crate) fn user_as_ldap_mod<I>(user: &User<I>, config: &LDAPConfig) -> Vec<Mo
                 .is_some_and(|rdn_attr| rdn_attr.eq_ignore_ascii_case("uid"))
         {
             changes.push(Mod::Replace(
-                "uid".to_string(),
+                "uid".to_owned(),
                 hashset![user.username.clone()],
             ));
         }
 
         if let Some(phone) = &user.phone {
             changes.push(Mod::Replace(
-                "mobile".to_string(),
+                "mobile".to_owned(),
                 if phone.is_empty() {
                     HashSet::<String>::new()
                 } else {
@@ -176,7 +176,7 @@ pub(crate) fn user_as_ldap_mod<I>(user: &User<I>, config: &LDAPConfig) -> Vec<Mo
 
     if config.ldap_uses_ad && !config.get_rdn_attr().eq_ignore_ascii_case("sAMAccountName") {
         changes.push(Mod::Replace(
-            "sAMAccountName".to_string(),
+            "sAMAccountName".to_owned(),
             hashset![user.username.clone()],
         ));
     }
@@ -192,7 +192,7 @@ pub(crate) fn user_as_ldap_mod<I>(user: &User<I>, config: &LDAPConfig) -> Vec<Mo
             .is_some_and(|rdn_attr| rdn_attr.eq_ignore_ascii_case(username_attr))
     {
         changes.push(Mod::Replace(
-            username_attr.to_string(),
+            username_attr.to_owned(),
             hashset![user.username.clone()],
         ));
     }
@@ -297,7 +297,26 @@ where
 {
     let settings = Settings::get_current_settings();
     let sync_account_status = settings.ldap_uses_ad && settings.ldap_sync_account_status;
-    let sync_groups = settings.ldap_sync_groups;
+    ldap_sync_allowed_for_user_scoped(
+        user,
+        executor,
+        sync_account_status,
+        &settings.ldap_sync_groups,
+    )
+    .await
+}
+
+/// Same as [`ldap_sync_allowed_for_user`] but with the scoping settings passed explicitly.
+/// Needed by flows running with settings that differ from the saved ones (LDAP dry run).
+pub(crate) async fn ldap_sync_allowed_for_user_scoped<'e, E>(
+    user: &User<Id>,
+    executor: E,
+    sync_account_status: bool,
+    sync_groups: &[String],
+) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
     let my_groups = user.member_of(executor).await?;
     Ok(
         (sync_groups.is_empty() || my_groups.iter().any(|g| sync_groups.contains(&g.name)))
@@ -325,7 +344,7 @@ where
 fn get_value_or_error(entry: &SearchEntry, key: &str) -> Result<String, LdapError> {
     match entry.attrs.get(key) {
         Some(values) if !values.is_empty() => Ok(values[0].clone()),
-        _ => Err(LdapError::MissingAttribute(key.to_string())),
+        _ => Err(LdapError::MissingAttribute(key.to_owned())),
     }
 }
 
@@ -340,7 +359,7 @@ fn get_value(entry: &SearchEntry, key: &str) -> Option<String> {
 #[must_use]
 pub(crate) fn extract_rdn_value(dn: &str) -> Option<String> {
     if let (Some(eq_index), Some(comma_index)) = (dn.find('='), dn.find(',')) {
-        dn.get((eq_index + 1)..comma_index).map(ToString::to_string)
+        dn.get((eq_index + 1)..comma_index).map(str::to_owned)
     } else {
         None
     }
@@ -349,8 +368,8 @@ pub(crate) fn extract_rdn_value(dn: &str) -> Option<String> {
 /// Returns true only for a SearchResultEntry (LDAP protocol op id 4).
 ///
 /// Referrals (id 19), intermediate responses (id 25), and any other result type
-/// are rejected. This mirrors the id that `SearchEntry::construct` requires, so a
-/// `true` result guarantees `construct` will not panic on the entry.
+/// are rejected. This mirrors the id that `SearchEntry::try_construct` requires, so a
+/// `true` result guarantees the entry will decode.
 #[must_use]
 pub(super) fn is_search_entry(entry: &ResultEntry) -> bool {
     entry.0.id == 4
@@ -361,7 +380,7 @@ pub(super) fn is_search_entry(entry: &ResultEntry) -> bool {
 #[must_use]
 pub(crate) fn extract_dn_path(dn: &str) -> Option<String> {
     if let Some(parts) = dn.split_once(',') {
-        let path = parts.1.to_string();
+        let path = parts.1.to_owned();
         debug!("Extracted DN path '{path}' from DN '{dn}'");
         Some(path)
     } else {
@@ -374,11 +393,10 @@ pub(crate) fn extract_dn_path(dn: &str) -> Option<String> {
 mod tests {
     use std::collections::HashMap;
 
-    use lber::{
-        common::TagClass,
-        structure::{PL, StructureTag},
+    use ldap3::{
+        ResultEntry, SearchEntry,
+        asn1::{PL, StructureTag, TagClass},
     };
-    use ldap3::{ResultEntry, SearchEntry};
 
     use super::*;
 
@@ -394,7 +412,7 @@ mod tests {
 
     #[test]
     fn is_search_entry_accepts_only_real_entries() {
-        // id 4 is a SearchResultEntry, the only type SearchEntry::construct accepts.
+        // id 4 is a SearchResultEntry, the only type SearchEntry::try_construct accepts.
         assert!(is_search_entry(&result_entry(4)));
         // id 19 is a referral, id 25 an intermediate response.
         assert!(!is_search_entry(&result_entry(19)));
@@ -436,17 +454,17 @@ mod tests {
 
     fn ad_entry_with_uac(uac: Option<&str>) -> SearchEntry {
         let mut attrs = HashMap::new();
-        attrs.insert("sn".to_string(), vec!["lastname".to_string()]);
-        attrs.insert("givenName".to_string(), vec!["firstname".to_string()]);
-        attrs.insert("mail".to_string(), vec!["user@example.com".to_string()]);
+        attrs.insert("sn".to_owned(), vec!["lastname".to_owned()]);
+        attrs.insert("givenName".to_owned(), vec!["firstname".to_owned()]);
+        attrs.insert("mail".to_owned(), vec!["user@example.com".to_owned()]);
         if let Some(uac) = uac {
             attrs.insert(
-                LDAP_USER_ACCOUNT_CONTROL_ATTR.to_string(),
-                vec![uac.to_string()],
+                LDAP_USER_ACCOUNT_CONTROL_ATTR.to_owned(),
+                vec![uac.to_owned()],
             );
         }
         SearchEntry {
-            dn: "cn=user,dc=example,dc=com".to_string(),
+            dn: "cn=user,dc=example,dc=com".to_owned(),
             attrs,
             bin_attrs: HashMap::new(),
         }

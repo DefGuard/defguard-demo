@@ -6,22 +6,28 @@ use defguard_common::{
         Id,
         models::{
             BiometricAuth, Device, DeviceConfig, DeviceType, MFAMethod, Settings, User,
-            WireguardNetwork, device::DeviceInfo, polling_token::PollingToken,
+            WireguardNetwork,
+            device::{DeviceInfo, WireguardNetworkDevice},
+            polling_token::PollingToken,
             wireguard::ServiceLocationMode,
         },
     },
 };
 use defguard_core::{
     db::models::enrollment::{ENROLLMENT_TOKEN_TYPE, Token},
+    device_access::{build_device_config, join_device_to_all_networks},
     enterprise::{
         db::models::{enterprise_settings::EnterpriseSettings, openid_provider::OpenIdProvider},
         firewall::try_get_location_firewall_config,
         ldap::utils::ldap_add_user,
         limits::update_counts,
     },
-    events::{BidiRequestContext, BidiStreamEvent, BidiStreamEventType, EnrollmentEvent},
+    events::{
+        BidiRequestContext, BidiStreamEvent, BidiStreamEventType, EnrollmentEvent,
+        LdapSyncEventType,
+    },
     grpc::{
-        GatewayEvent, InstanceInfo,
+        GatewayCommand, InstanceInfo,
         client_version::ClientFeature,
         utils::{build_device_config_response, parse_client_ip_agent},
     },
@@ -48,21 +54,24 @@ use tonic::Status;
 
 pub(crate) struct EnrollmentServer {
     pool: PgPool,
-    wireguard_tx: Sender<GatewayEvent>,
+    gateway_tx: Sender<GatewayCommand>,
     bidi_event_tx: UnboundedSender<BidiStreamEvent>,
+    ldap_tx: UnboundedSender<LdapSyncEventType>,
 }
 
 impl EnrollmentServer {
     #[must_use]
     pub(crate) fn new(
         pool: PgPool,
-        wireguard_tx: Sender<GatewayEvent>,
+        gateway_tx: Sender<GatewayCommand>,
         bidi_event_tx: UnboundedSender<BidiStreamEvent>,
+        ldap_tx: UnboundedSender<LdapSyncEventType>,
     ) -> Self {
         Self {
             pool,
-            wireguard_tx,
+            gateway_tx,
             bidi_event_tx,
+            ldap_tx,
         }
     }
 
@@ -96,10 +105,10 @@ impl EnrollmentServer {
         }
     }
 
-    /// Sends given `GatewayEvent` to be handled by gateway GRPC server
-    pub(crate) fn send_wireguard_event(&self, event: GatewayEvent) {
-        if let Err(err) = self.wireguard_tx.send(event) {
-            error!("Error sending WireGuard event {err}");
+    /// Sends given `GatewayCommand` to be handled by gateway manager service
+    pub(crate) fn send_gateway_command(&self, event: GatewayCommand) {
+        if let Err(err) = self.gateway_tx.send(event) {
+            error!("Error sending Gateway command: {err}");
         }
     }
 
@@ -207,7 +216,7 @@ impl EnrollmentServer {
                     error!("Failed to get OpenID provider: {err}");
                     Status::internal(format!("unexpected error: {err}"))
                 })?;
-            let smtp_configured = settings.smtp.is_configured();
+            let smtp_configured = settings.smtp_configured();
             let instance_info = InstanceInfo::new(
                 settings,
                 &user.username,
@@ -257,7 +266,7 @@ impl EnrollmentServer {
             )
             .fetch_one(&self.pool)
             .await
-            .map_err(|_| Status::internal("Failed to read data".to_string()))?;
+            .map_err(|_| Status::internal("Failed to read data".to_owned()))?;
             let enrollment_settings = defguard_proto::client_types::EnrollmentSettings {
                 vpn_setup_optional,
                 smtp_configured,
@@ -407,11 +416,13 @@ impl EnrollmentServer {
 
         // check if password is strong enough
         debug!("Verifying password strength for user activation process.");
-        if let Err(err) = check_password_strength(&request.password) {
-            error!("Password not strong enough: {err}");
-            return Err(Status::invalid_argument("password not strong enough"));
+        if let Some(password) = &request.password {
+            if let Err(err) = check_password_strength(password) {
+                error!("Password not strong enough: {err}");
+                return Err(Status::invalid_argument("password not strong enough"));
+            }
+            debug!("Password is strong enough to complete the user activation process.");
         }
-        debug!("Password is strong enough to complete the user activation process.");
 
         // fetch related users
         let mut user = enrollment.fetch_user(&self.pool).await?;
@@ -435,6 +446,32 @@ impl EnrollmentServer {
         }
         debug!("User is active.");
 
+        // Reject password-less activation for users whose password management is NOT
+        // disabled. Externally-managed users (LDAP/AD or OIDC with the flag enabled)
+        // are allowed to skip the password; local users must supply one.
+        if request.password.is_none() {
+            let oidc_disable_password_management =
+                OpenIdProvider::current_disables_password_management(&self.pool)
+                    .await
+                    .map_err(|err| {
+                        // Default to false on transient DB errors
+                        error!("Failed to check OIDC password management flag: {err}");
+                        Status::internal("unexpected error")
+                    })?;
+            let settings = Settings::get_current_settings();
+            let is_admin = user.is_admin(&self.pool).await.map_err(|err| {
+                error!("Failed to check if user is admin: {err}");
+                Status::internal("unexpected error")
+            })?;
+            if !user.password_management_disabled(
+                is_admin,
+                &settings,
+                oidc_disable_password_management,
+            ) {
+                return Err(Status::invalid_argument("password required for this user"));
+            }
+        }
+
         let mut transaction = self.pool.begin().await.map_err(|err| {
             error!("Failed to begin transaction: {err}");
             Status::internal("unexpected error")
@@ -443,7 +480,9 @@ impl EnrollmentServer {
         // update user
         info!("Update user details and set a new password.");
         user.phone = request.phone_number;
-        user.set_password(&request.password);
+        if let Some(password) = &request.password {
+            user.set_password(password);
+        }
         user.save(&mut *transaction).await.map_err(|err| {
             error!("Failed to update user {}: {err}", user.username);
             Status::internal("unexpected error")
@@ -503,7 +542,13 @@ impl EnrollmentServer {
             Status::internal("unexpected error")
         })?;
 
-        ldap_add_user(&mut user, Some(&request.password), &self.pool).await;
+        ldap_add_user(
+            &mut user,
+            request.password.as_deref(),
+            &self.pool,
+            &self.ldap_tx,
+        )
+        .await;
 
         info!("User {} activated", user.username);
 
@@ -696,18 +741,41 @@ impl EnrollmentServer {
                 );
             }
 
-            let (network_info, configs) = device
-                .get_network_configs(&network, &mut transaction)
+            let wireguard_network_device =
+                WireguardNetworkDevice::find(&mut *transaction, device.id, network.id)
+                    .await
+                    .map_err(|err| {
+                        error!("Failed to find WireguardNetworkDevice: {err}");
+                        Status::internal("unexpected error")
+                    })?
+                    .ok_or_else(|| {
+                        error!(
+                            "Device {} not found in network {}",
+                            device.name, network.name
+                        );
+                        Status::internal("unexpected error")
+                    })?;
+            let device_config =
+                build_device_config(&mut transaction, &network, &wireguard_network_device, &user)
+                    .await
+                    .map_err(|err| {
+                        error!(
+                            "Failed to build device config for device {} for user {}({:?}): {err}",
+                            device.name, user.username, user.id
+                        );
+                        Status::internal("unexpected error")
+                    })?;
+            let device_network_info = wireguard_network_device
+                .to_device_network_info_runtime(&mut *transaction, &network)
                 .await
                 .map_err(|err| {
-                    error!(
-                        "Failed to get network configs for device {} for user {}({:?}): {err}",
-                        device.name, user.username, user.id
-                    );
+                    error!("Failed to get device network info: {err}");
                     Status::internal("unexpected error")
                 })?;
+            let configs = vec![device_config];
+            let network_info = vec![device_network_info];
 
-            (device, vec![network_info], vec![configs])
+            (device, network_info, configs)
         } else {
             debug!(
                 "Creating new device for user {}({:?}): {}.",
@@ -739,16 +807,16 @@ impl EnrollmentServer {
                 "Adding device {} to all existing user networks for user {}({:?}).",
                 device.wireguard_pubkey, user.username, user.id,
             );
-            let (network_info, configs) = device
-                .add_to_all_networks(&mut transaction)
-                .await
-                .map_err(|err| {
-                    error!(
-                        "Failed to add device {} to existing networks: {err}",
-                        device.name
-                    );
-                    Status::internal("unexpected error")
-                })?;
+            let (network_info, configs) =
+                join_device_to_all_networks(&mut transaction, &device, &user)
+                    .await
+                    .map_err(|err| {
+                        error!(
+                            "Failed to add device {} to existing networks: {err}",
+                            device.name
+                        );
+                        Status::internal("unexpected error")
+                    })?;
             info!(
                 "Added device {} to all existing user networks for user {}({:?})",
                 device.wireguard_pubkey, user.username, user.id
@@ -784,7 +852,7 @@ impl EnrollmentServer {
                         adding new device {}, user {}({})",
                     device.wireguard_pubkey, user.username, user.id
                 );
-                self.send_wireguard_event(GatewayEvent::FirewallConfigChanged(
+                self.send_gateway_command(GatewayCommand::FirewallConfigChanged(
                     location_id,
                     firewall_config,
                 ));
@@ -795,7 +863,7 @@ impl EnrollmentServer {
             "Sending DeviceCreated event to gateway for device {}, user {}({:?})",
             device.wireguard_pubkey, user.username, user.id,
         );
-        self.send_wireguard_event(GatewayEvent::DeviceCreated(DeviceInfo {
+        self.send_gateway_command(GatewayCommand::DeviceCreated(DeviceInfo {
             device: device.clone(),
             network_info,
         }));
@@ -831,13 +899,17 @@ impl EnrollmentServer {
             device.wireguard_pubkey, user.username, user.id,
         );
 
-        // Don't send them service locations if they don't support it
+        // Don't send them service locations or posture-checked locations if they don't support it
         let configs = configs
             .into_iter()
             .filter(|config| {
                 config.service_location_mode == ServiceLocationMode::Disabled
                     || ClientFeature::ServiceLocations
                         .is_supported_by_device(req_device_info.as_ref())
+            })
+            .filter(|config| {
+                !config.posture_check_required
+                    || ClientFeature::PostureChecks.is_supported_by_device(req_device_info.as_ref())
             })
             .collect::<Vec<DeviceConfig>>();
 
@@ -956,7 +1028,7 @@ impl EnrollmentServer {
         debug!("Begin enrollment code MFA setup start");
         let method = request.method();
         if method != MfaMethod::Email && method != MfaMethod::Totp {
-            return Err(Status::invalid_argument("Method not supported".to_string()));
+            return Err(Status::invalid_argument("Method not supported".to_owned()));
         }
         let enrollment = Token::find_by_id(&self.pool, &request.token).await?;
         let mut user = enrollment.fetch_user(&self.pool).await?;
@@ -967,52 +1039,52 @@ impl EnrollmentServer {
         match method {
             MfaMethod::Email => {
                 let settings = Settings::get_current_settings();
-                if !settings.smtp.is_configured() {
+                if !settings.smtp_configured() {
                     error!("Unable to start email MFA setup; SMTP is not configured");
-                    return Err(Status::internal("SMTP not configured".to_string()));
+                    return Err(Status::internal("SMTP not configured".to_owned()));
                 }
                 if user.email_mfa_enabled {
                     return Err(Status::invalid_argument(
-                        "Method already enabled".to_string(),
+                        "Method already enabled".to_owned(),
                     ));
                 }
                 user.new_email_secret(&self.pool).await.map_err(|_| {
                     error!("Failed to create email secret");
-                    Status::internal("Failed to setup email mfa".to_string())
+                    Status::internal("Failed to setup email mfa".to_owned())
                 })?;
                 info!("Created email secret for {}", &user.username);
                 let mut transaction = self.pool.begin().await.map_err(|err| {
                     error!("Failed to begin database transaction\nReason:{err}");
-                    Status::internal("Failed begin database transaction".to_string())
+                    Status::internal("Failed begin database transaction".to_owned())
                 })?;
                 let code = user.generate_email_mfa_code().map_err(|err| {
                     error!("Failed to generate MFA code for {user}\nReason:{err}");
-                    Status::internal("Failed to generate MFA code".to_string())
+                    Status::internal("Failed to generate MFA code".to_owned())
                 })?;
                 mfa_activation_mail(&user.email, &mut transaction, &user.first_name, &code, None)
                     .await
                     .map_err(|err| {
                         error!("Failed to send MFA activation email\nReason:{err}");
-                        Status::internal("Failed to send activation email".to_string())
+                        Status::internal("Failed to send activation email".to_owned())
                     })?;
                 Ok(CodeMfaSetupStartResponse { totp_secret: None })
             }
             MfaMethod::Totp => {
                 if user.totp_enabled {
                     return Err(Status::invalid_argument(
-                        "Method already enabled".to_string(),
+                        "Method already enabled".to_owned(),
                     ));
                 }
                 let secret = user.new_totp_secret(&self.pool).await.map_err(|_| {
                     error!("Failed to make new TOTP secret");
-                    Status::internal("Failed to make new TOTP secret".to_string())
+                    Status::internal("Failed to make new TOTP secret".to_owned())
                 })?;
                 info!("New TOTP secret created for {}", &user.username);
                 Ok(CodeMfaSetupStartResponse {
                     totp_secret: Some(secret),
                 })
             }
-            _ => Err(Status::invalid_argument("Method not supported".to_string())),
+            _ => Err(Status::invalid_argument("Method not supported".to_owned())),
         }
     }
 
@@ -1031,7 +1103,7 @@ impl EnrollmentServer {
         let mut user = enrollment.fetch_user(&self.pool).await?;
         if user.mfa_enabled {
             return Err(Status::invalid_argument(
-                "Mfa already enabled on the account".to_string(),
+                "Mfa already enabled on the account".to_owned(),
             ));
         }
         // available only for unenrolled users
@@ -1043,20 +1115,20 @@ impl EnrollmentServer {
         match method {
             MfaMethod::Email => {
                 if !user.verify_email_mfa_code(&request.code) {
-                    return Err(Status::invalid_argument("Email code invalid".to_string()));
+                    return Err(Status::invalid_argument("Email code invalid".to_owned()));
                 }
                 user.enable_email_mfa(&self.pool)
                     .await
-                    .map_err(|_| Status::internal("Enabling method failed.".to_string()))?;
+                    .map_err(|_| Status::internal("Enabling method failed.".to_owned()))?;
                 mfa_method = MFAMethod::Email;
             }
             MfaMethod::Totp => {
                 if !user.verify_totp_code(&request.code) {
-                    return Err(Status::invalid_argument("Code invalid".to_string()));
+                    return Err(Status::invalid_argument("Code invalid".to_owned()));
                 }
                 user.enable_totp(&self.pool)
                     .await
-                    .map_err(|_| Status::internal("Enabling method failed.".to_string()))?;
+                    .map_err(|_| Status::internal("Enabling method failed.".to_owned()))?;
                 mfa_method = MFAMethod::OneTimePassword;
             }
             _ => {
@@ -1065,12 +1137,12 @@ impl EnrollmentServer {
         }
         user.enable_mfa(&self.pool)
             .await
-            .map_err(|_| Status::internal("Enabling MFA on the account failed.".to_string()))?;
+            .map_err(|_| Status::internal("Enabling MFA on the account failed.".to_owned()))?;
         let recovery_codes = user
             .get_recovery_codes(&self.pool)
             .await
-            .map_err(|_| Status::internal("Failed to get recovery codes.".to_string()))?
-            .ok_or_else(|| Status::internal("Recovery codes not found".to_string()))?;
+            .map_err(|_| Status::internal("Failed to get recovery codes.".to_owned()))?
+            .ok_or_else(|| Status::internal("Recovery codes not found".to_owned()))?;
         if let Ok(mut conn) = self.pool.begin().await {
             if let Err(err) =
                 mfa_configured_mail(&user.email, &mut conn, None, &mfa_method, &user.first_name)
@@ -1098,6 +1170,11 @@ async fn initial_info_from_user(
     let devices = user.user_devices(pool).await?;
     let device_names = devices.into_iter().map(|dev| dev.device.name).collect();
     let is_admin = user.is_admin(pool).await?;
+    let oidc_disable_password_management =
+        OpenIdProvider::current_disables_password_management(pool).await?;
+    let settings = Settings::get_current_settings();
+    let password_management_disabled =
+        user.password_management_disabled(is_admin, &settings, oidc_disable_password_management);
     Ok(InitialUserInfo {
         first_name: user.first_name,
         last_name: user.last_name,
@@ -1108,6 +1185,7 @@ async fn initial_info_from_user(
         device_names,
         enrolled,
         is_admin,
+        password_management_disabled,
     })
 }
 
@@ -1189,7 +1267,7 @@ mod test {
             None,
             Some(user.email.clone()),
             10,
-            Some(ENROLLMENT_TOKEN_TYPE.to_string()),
+            Some(ENROLLMENT_TOKEN_TYPE.to_owned()),
         );
 
         Settings::initialize_runtime_defaults(&pool).await.unwrap();
@@ -1199,9 +1277,10 @@ mod test {
         settings.enrollment_send_welcome_email = false;
         update_current_settings(&pool, settings).await.unwrap();
 
-        let (wireguard_tx, _) = broadcast::channel(1);
+        let (gateway_tx, _) = broadcast::channel(1);
         let (bidi_event_tx, _) = unbounded_channel();
-        let server = EnrollmentServer::new(pool.clone(), wireguard_tx, bidi_event_tx);
+        let (ldap_tx, _) = unbounded_channel();
+        let server = EnrollmentServer::new(pool.clone(), gateway_tx, bidi_event_tx, ldap_tx);
 
         let mut transaction = pool.begin().await.unwrap();
         let result = server

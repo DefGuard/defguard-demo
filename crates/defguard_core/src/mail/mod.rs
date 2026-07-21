@@ -25,7 +25,10 @@ use defguard_common::{
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     message::{Body, Mailbox, MultiPart, SinglePart, header::ContentType},
-    transport::smtp::authentication::{Credentials, Mechanism},
+    transport::smtp::{
+        authentication::{Credentials, Mechanism},
+        client::{Tls, TlsParameters},
+    },
 };
 use serde::Serialize;
 use sqlx::PgConnection;
@@ -117,7 +120,7 @@ pub struct Mail {
 impl Mail {
     /// Create new [`Mail`].
     #[must_use]
-    pub fn new<T>(to: T, subject: String, html: String, text: String) -> Mail
+    pub fn new<T>(to: T, subject: String, html: String, text: String) -> Self
     where
         T: Into<String>,
     {
@@ -277,10 +280,19 @@ impl Mail {
             return Err(MailError::SmtpNotConfigured);
         };
 
+        let tls_params = TlsParameters::builder(server.clone())
+            .dangerous_accept_invalid_certs(!smtp_settings.tls_verify_cert)
+            .dangerous_accept_invalid_hostnames(!smtp_settings.tls_verify_cert)
+            .build()?;
+
         let mut builder = match smtp_settings.encryption {
             SmtpEncryption::None => Builder::builder_dangerous(server),
-            SmtpEncryption::StartTls => Builder::starttls_relay(server)?,
-            SmtpEncryption::ImplicitTls => Builder::relay(server)?,
+            SmtpEncryption::StartTls => {
+                Builder::builder_dangerous(server).tls(Tls::Required(tls_params))
+            }
+            SmtpEncryption::ImplicitTls => {
+                Builder::builder_dangerous(server).tls(Tls::Wrapper(tls_params))
+            }
         }
         .port(port.try_into().map_err(|_| MailError::InvalidPort(port))?)
         .timeout(Some(SMTP_TIMEOUT));
@@ -343,6 +355,7 @@ pub enum MailMessage {
     MFACode,
     PasswordReset,
     PasswordResetDone,
+    PasswordResetDisabled,
     UserImportBlocked,
     /// Enrollment notification for admins.
     EnrollmentNotification,
@@ -363,30 +376,31 @@ impl MailMessage {
             }
         }
         match self {
-            Self::Test => "Defguard: Test message".to_string(),
-            Self::Welcome => WELCOME_EMAIL_SUBJECT.to_string(),
-            Self::SupportData => "Defguard: Support data".to_string(),
-            Self::DesktopStart => "Defguard: Desktop client configuration".to_string(),
-            Self::NewAccount => "Defguard: User enrollment".to_string(),
-            Self::NewDevice => "Defguard: new device added to your account".to_string(),
-            Self::NewDeviceLogin => "Defguard: New device logged in to your account".to_string(),
-            Self::NewDeviceOIDCLogin => "New login to OIDC application".to_string(),
-            Self::GatewayDisconnect => "Defguard: Gateway disconnected".to_string(),
-            Self::GatewayReconnect => "Defguard: Gateway reconnected".to_string(),
-            Self::MFAActivation => "Multi-Factor Authentication activation".to_string(),
+            Self::Test => "Defguard: Test message".to_owned(),
+            Self::Welcome => WELCOME_EMAIL_SUBJECT.to_owned(),
+            Self::SupportData => "Defguard: Support data".to_owned(),
+            Self::DesktopStart => "Defguard: Desktop client configuration".to_owned(),
+            Self::NewAccount => "Defguard: User enrollment".to_owned(),
+            Self::NewDevice => "Defguard: new device added to your account".to_owned(),
+            Self::NewDeviceLogin => "Defguard: New device logged in to your account".to_owned(),
+            Self::NewDeviceOIDCLogin => "New login to OIDC application".to_owned(),
+            Self::GatewayDisconnect => "Defguard: Gateway disconnected".to_owned(),
+            Self::GatewayReconnect => "Defguard: Gateway reconnected".to_owned(),
+            Self::MFAActivation => "Multi-Factor Authentication activation".to_owned(),
             Self::MFAConfigured { method } => {
                 format!("Multi-Factor Authentication {method} has been activated")
             }
-            Self::MFACode => "Defguard: Multi-Factor Authentication code for login".to_string(),
-            Self::PasswordReset => "Defguard: Password reset".to_string(),
-            Self::PasswordResetDone => "Defguard: Password reset success".to_string(),
-            Self::UserImportBlocked => "User import blocked".to_string(),
-            Self::EnrollmentNotification => "Defguard: User enrollment completed".to_string(),
+            Self::MFACode => "Defguard: Multi-Factor Authentication code for login".to_owned(),
+            Self::PasswordReset => "Defguard: Password reset".to_owned(),
+            Self::PasswordResetDone => "Defguard: Password reset success".to_owned(),
+            Self::PasswordResetDisabled => "Defguard: Password reset disabled".to_owned(),
+            Self::UserImportBlocked => "User import blocked".to_owned(),
+            Self::EnrollmentNotification => "Defguard: User enrollment completed".to_owned(),
             Self::LetsencryptCertRefreshFailed => {
-                "Defguard: automatic Let's Encrypt certificate refresh failed".to_string()
+                "Defguard: automatic Let's Encrypt certificate refresh failed".to_owned()
             }
-            Self::CertificateExpiration => "Defguard: Certificate expiration".to_string(),
-            Self::CertificateExpired => "Defguard: Certificate has expired".to_string(),
+            Self::CertificateExpiration => "Defguard: Certificate expiration".to_owned(),
+            Self::CertificateExpired => "Defguard: Certificate has expired".to_owned(),
         }
     }
 
@@ -407,6 +421,7 @@ impl MailMessage {
             Self::MFACode => "mfa-code",
             Self::PasswordReset => "password-reset",
             Self::PasswordResetDone => "password-reset-done",
+            Self::PasswordResetDisabled => "password-reset-disabled",
             Self::UserImportBlocked => "user-import-blocked",
             Self::EnrollmentNotification => "enrollment-admin-notification",
             Self::LetsencryptCertRefreshFailed => "letsencrypt-cert-refresh-failed",
@@ -432,6 +447,7 @@ impl MailMessage {
             Self::MFACode => include_str!("templates/mfa-code.mjml"),
             Self::PasswordReset => include_str!("templates/password-reset.mjml"),
             Self::PasswordResetDone => include_str!("templates/password-reset-done.mjml"),
+            Self::PasswordResetDisabled => include_str!("templates/password-reset-disabled.mjml"),
             Self::UserImportBlocked => include_str!("templates/plain-notification.mjml"),
             Self::EnrollmentNotification => {
                 include_str!("templates/enrollment-admin-notification.mjml")
@@ -462,6 +478,7 @@ impl MailMessage {
             Self::MFACode => include_str!("templates/mfa-code.text"),
             Self::PasswordReset => include_str!("templates/password-reset.text"),
             Self::PasswordResetDone => include_str!("templates/password-reset-done.text"),
+            Self::PasswordResetDisabled => include_str!("templates/password-reset-disabled.text"),
             Self::UserImportBlocked => include_str!("templates/plain-notification.text"),
             Self::EnrollmentNotification => {
                 include_str!("templates/enrollment-admin-notification.text")

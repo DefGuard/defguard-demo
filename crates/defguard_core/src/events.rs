@@ -8,13 +8,18 @@ use defguard_common::db::{
         gateway::Gateway, group::Group, oauth2client::OAuth2Client, proxy::Proxy,
     },
 };
-use defguard_proto::client_types::MfaMethod;
+use defguard_proto::{client_types::MfaMethod, enterprise::posture::DevicePostureData};
+use strum::EnumCount;
 
 use crate::{
     db::WebHook,
     enterprise::db::models::{
-        activity_log_stream::ActivityLogStream, api_tokens::ApiToken,
-        openid_provider::OpenIdProvider, snat::UserSnatBinding,
+        activity_log_stream::ActivityLogStream,
+        api_tokens::ApiToken,
+        device_posture::{DevicePosture, DevicePostureSnapshot},
+        enterprise_settings::EnterpriseSettings,
+        openid_provider::OpenIdProvider,
+        snat::UserSnatBinding,
     },
 };
 
@@ -26,7 +31,9 @@ use crate::{
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApiRequestContext {
     pub timestamp: NaiveDateTime,
-    pub user_id: Id,
+    /// `None` for events about a user that doesn't have an account yet, e.g. an
+    /// OpenID login blocked before the corresponding account could be created.
+    pub user_id: Option<Id>,
     pub username: String,
     pub ip: Option<IpAddr>,
     pub device: String,
@@ -35,7 +42,7 @@ pub struct ApiRequestContext {
 impl ApiRequestContext {
     #[must_use]
     pub fn new(
-        user_id: Id,
+        user_id: impl Into<Option<Id>>,
         username: String,
         ip: impl Into<Option<IpAddr>>,
         device: String,
@@ -43,7 +50,7 @@ impl ApiRequestContext {
         let timestamp = Utc::now().naive_utc();
         Self {
             timestamp,
-            user_id,
+            user_id: user_id.into(),
             username,
             ip: ip.into(),
             device,
@@ -88,7 +95,7 @@ impl GrpcRequestContext {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, EnumCount)]
 pub enum ApiEventType {
     UserLogin,
     UserLoginFailed {
@@ -128,6 +135,14 @@ pub enum ApiEventType {
     UserAdded {
         user: User<Id>,
     },
+    /// Account auto-provisioning (e.g. via OpenID or LDAP) was blocked because it
+    /// would have exceeded the license user limit.
+    UserImportBlocked {
+        username: String,
+        email: String,
+        user_count: u32,
+        limit: u32,
+    },
     UserRemoved {
         user: User<Id>,
     },
@@ -139,6 +154,12 @@ pub enum ApiEventType {
         user: User<Id>,
         before: Vec<String>,
         after: Vec<String>,
+    },
+    UserEnabled {
+        user: User<Id>,
+    },
+    UserDisabled {
+        user: User<Id>,
     },
     UserDeviceAdded {
         owner: User<Id>,
@@ -229,6 +250,10 @@ pub enum ApiEventType {
         after: Settings,
     },
     SettingsDefaultBrandingRestored,
+    EnterpriseSettingsUpdated {
+        before: EnterpriseSettings,
+        after: EnterpriseSettings,
+    },
     GroupsBulkAssigned {
         users: Vec<User<Id>>,
         groups: Vec<Group<Id>>,
@@ -317,6 +342,28 @@ pub enum ApiEventType {
     GatewayDeleted {
         gateway: Gateway<Id>,
     },
+    DevicePostureCreated {
+        snapshot: DevicePostureSnapshot,
+    },
+    DevicePostureUpdated {
+        before: DevicePostureSnapshot,
+        after: DevicePostureSnapshot,
+    },
+    DevicePostureDeleted {
+        snapshot: DevicePostureSnapshot,
+    },
+    DevicePostureDuplicated {
+        original: DevicePostureSnapshot,
+        duplicate: DevicePostureSnapshot,
+    },
+    DevicePostureLocationsAssigned {
+        device_posture: DevicePosture<Id>,
+        location_ids: Vec<Id>,
+    },
+    LocationPosturesAssigned {
+        location: WireguardNetwork<Id>,
+        posture_ids: Vec<Id>,
+    },
 }
 
 /// Events from Web API
@@ -367,21 +414,21 @@ pub struct BidiStreamEvent {
 /// Wrapper enum for different types of events emitted by the bidi stream.
 ///
 /// Each variant represents a separate gRPC service that's part of the bi-directional communications server.
-#[derive(Debug)]
+#[derive(Debug, EnumCount)]
 pub enum BidiStreamEventType {
     Enrollment(Box<EnrollmentEvent>),
     PasswordReset(Box<PasswordResetEvent>),
     DesktopClientMfa(Box<DesktopClientMfaEvent>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, EnumCount)]
 pub enum EnrollmentEvent {
     EnrollmentStarted,
     EnrollmentDeviceAdded { device: Device<Id> },
     EnrollmentCompleted,
 }
 
-#[derive(Debug)]
+#[derive(Debug, EnumCount)]
 pub enum PasswordResetEvent {
     PasswordResetRequested,
     PasswordResetStarted,
@@ -390,12 +437,15 @@ pub enum PasswordResetEvent {
 
 pub type ClientMFAMethod = MfaMethod;
 
-#[derive(Debug)]
+#[derive(Debug, EnumCount)]
 pub enum DesktopClientMfaEvent {
     Success {
         device: Device<Id>,
         location: WireguardNetwork<Id>,
         method: ClientMFAMethod,
+        /// Name of the device used to approve the login when the mobile approve
+        /// MFA method is used. `None` for all other methods.
+        mobile_auth_device_name: Option<String>,
     },
     Failed {
         device: Device<Id>,
@@ -408,4 +458,58 @@ pub enum DesktopClientMfaEvent {
         location: WireguardNetwork<Id>,
         is_mfa_session: bool,
     },
+    PostureCheckPassed {
+        device: Device<Id>,
+        location: WireguardNetwork<Id>,
+        device_posture_data: Option<DevicePostureData>,
+    },
+    PostureCheckFailed {
+        device: Device<Id>,
+        location: WireguardNetwork<Id>,
+        device_posture_data: Option<DevicePostureData>,
+        failed_checks: Vec<String>,
+    },
+    SessionSuperseded {
+        device: Device<Id>,
+        location: WireguardNetwork<Id>,
+        is_mfa_session: bool,
+    },
+}
+
+#[derive(Debug, PartialEq, EnumCount)]
+#[allow(clippy::large_enum_variant)]
+pub enum LdapSyncEventType {
+    UserCreated { user: User<Id> },
+    UserDeleted { user: User<Id> },
+    UserModified { before: User<Id>, after: User<Id> },
+    UserEnabled { user: User<Id> },
+    UserDisabled { user: User<Id> },
+    GroupCreated { group: Group<Id> },
+    GroupMemberAdded { group: Group<Id>, user: User<Id> },
+    GroupMemberRemoved { group: Group<Id>, user: User<Id> },
+    OutboundUserCreated { user: User<Id> },
+    OutboundUserDeleted { username: String },
+    OutboundUserModified { user: User<Id> },
+    OutboundUserEnabled { user: User<Id> },
+    OutboundUserDisabled { user: User<Id> },
+    OutboundGroupMemberAdded { group: String, username: String },
+    OutboundGroupMemberRemoved { group: String, username: String },
+}
+
+#[derive(Debug, PartialEq, EnumCount)]
+#[allow(clippy::large_enum_variant)]
+pub enum DirectorySyncEventType {
+    UserCreated { user: User<Id> },
+    UserDeleted { user: User<Id> },
+    UserEnabled { user: User<Id> },
+    UserDisabled { user: User<Id> },
+    GroupCreated { group: Group<Id> },
+    GroupMemberAdded { group: Group<Id>, user: User<Id> },
+    GroupMemberRemoved { group: Group<Id>, user: User<Id> },
+}
+
+#[derive(Debug, PartialEq)]
+pub struct DirectorySyncEvent {
+    pub provider: String,
+    pub event: DirectorySyncEventType,
 }

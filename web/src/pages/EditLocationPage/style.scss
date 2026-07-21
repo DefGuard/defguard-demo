@@ -8,10 +8,49 @@
       .info-banner {
         padding-top: 0;
       }
+
+      .posture-checks-empty-state {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-2xl);
+
+        .posture-check-shield {
+          display: block;
+          width: 40px;
+          height: 44px;
+        }
+
+        p {
+          font: var(--t-body-sm-400);
+
+          a {
+            color: var(--fg-action);
+            text-decoration: underline;
+          }
+        }
+      }
+
+      .posture-checks-assigned-state {
+        width: 100%;
+
+        .select-multiple {
+          width: 100%;
+        }
+      }
     }
 
     .buttons-group {
       align-items: flex-start;
+    }
+
+    .acl-upsell-text {
+      span {
+        color: var(--fg-muted);
+      }
+
+      a {
+        color: var(--fg-action);
+      }
     }
   }
 }

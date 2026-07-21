@@ -6,32 +6,36 @@ use sqlx::{FromRow, Type};
 
 pub mod metadata;
 
-#[derive(Clone, Debug, Deserialize, Serialize, Type)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Type)]
 #[sqlx(type_name = "activity_log_module", rename_all = "snake_case")]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ActivityLogModule {
     Defguard,
     Client,
     Vpn,
     Enrollment,
+    Posture,
+    ActiveDirectory,
+    Ldap,
+    OidcDirectorySync,
 }
 
 /// Represents activity log event type as it's stored in the DB
 ///
 /// To make searching and exporting the type is stored as text and not a custom Postgres enum.
 /// Variant names are renamed to `snake_case` so `UserLogin` becomes `user_login` in the DB table.
-#[derive(Clone, Debug, Deserialize, Serialize, Type)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
-    // authentication
+    // Authentication
     UserLogin,
     UserLoginFailed,
     UserMfaLogin,
     UserMfaLoginFailed,
     RecoveryCodeUsed,
     UserLogout,
-    // mfa management
+    // MFA management
     MfaDisabled,
     UserMfaDisabled,
     MfaTotpDisabled,
@@ -40,15 +44,18 @@ pub enum EventType {
     MfaEmailEnabled,
     MfaSecurityKeyAdded,
     MfaSecurityKeyRemoved,
-    // user management
+    // User management
     UserAdded,
+    UserImportBlocked,
     UserRemoved,
     UserModified,
     UserGroupsModified,
+    UserEnabled,
+    UserDisabled,
     PasswordChanged,
     PasswordChangedByAdmin,
     PasswordReset,
-    // device management
+    // Device management
     DeviceAdded,
     DeviceRemoved,
     DeviceModified,
@@ -79,6 +86,8 @@ pub enum EventType {
     VpnClientMfaDisconnected,
     VpnClientMfaSuccess,
     VpnClientMfaFailed,
+    VpnClientSessionSuperseded,
+    VpnClientMfaSessionSuperseded,
     // Enrollment events
     EnrollmentTokenAdded,
     EnrollmentStarted,
@@ -95,6 +104,7 @@ pub enum EventType {
     SettingsUpdated,
     SettingsUpdatedPartial,
     SettingsDefaultBrandingRestored,
+    EnterpriseSettingsUpdated,
     // Groups management
     GroupsBulkAssigned,
     GroupAdded,
@@ -122,6 +132,39 @@ pub enum EventType {
     // Gateway management
     GatewayModified,
     GatewayDeleted,
+    // Device posture management
+    DevicePostureCreated,
+    DevicePostureUpdated,
+    DevicePostureDeleted,
+    DevicePostureDuplicated,
+    DevicePostureLocationsAssigned,
+    LocationPosturesAssigned,
+    DevicePostureCheckPassed,
+    DevicePostureCheckFailed,
+    // LDAP sync events
+    LdapSyncUserCreated,
+    LdapSyncUserDeleted,
+    LdapSyncUserModified,
+    LdapSyncUserEnabled,
+    LdapSyncUserDisabled,
+    LdapSyncGroupCreated,
+    LdapSyncGroupMemberAdded,
+    LdapSyncGroupMemberRemoved,
+    LdapSyncOutboundUserCreated,
+    LdapSyncOutboundUserDeleted,
+    LdapSyncOutboundUserModified,
+    LdapSyncOutboundUserEnabled,
+    LdapSyncOutboundUserDisabled,
+    LdapSyncOutboundGroupMemberAdded,
+    LdapSyncOutboundGroupMemberRemoved,
+    // OIDC directory sync events
+    OidcDirectorySyncUserCreated,
+    OidcDirectorySyncUserDeleted,
+    OidcDirectorySyncUserEnabled,
+    OidcDirectorySyncUserDisabled,
+    OidcDirectorySyncGroupCreated,
+    OidcDirectorySyncGroupMemberAdded,
+    OidcDirectorySyncGroupMemberRemoved,
 }
 
 #[derive(Model, FromRow, Serialize)]
@@ -129,7 +172,8 @@ pub enum EventType {
 pub struct ActivityLogEvent<I = NoId> {
     pub id: I,
     pub timestamp: NaiveDateTime,
-    pub user_id: Id,
+    #[model(option)]
+    pub user_id: Option<Id>,
     pub username: String,
     pub location: Option<String>,
     #[model(option)]

@@ -7,7 +7,6 @@ use rsa::{
     RsaPrivateKey,
     pkcs1::EncodeRsaPrivateKey,
     pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding},
-    traits::PublicKeyParts,
 };
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -22,7 +21,8 @@ use webauthn_rs::prelude::WebauthnBuilder;
 
 use self::smtp::{SmtpAuthentication, SmtpEncryption, SmtpSettings, SmtpSettingsPatch};
 use crate::{
-    config::DefGuardConfig, db::Id, global_value, secret::SecretStringWrapper, types::AuthFlowType,
+    config::DefGuardConfig, db::Id, global_value, rsa_jwk_thumbprint, secret::SecretStringWrapper,
+    types::AuthFlowType,
 };
 
 pub mod smtp;
@@ -136,7 +136,7 @@ pub enum LdapSyncStatus {
 impl LdapSyncStatus {
     #[must_use]
     pub fn is_out_of_sync(&self) -> bool {
-        matches!(self, LdapSyncStatus::OutOfSync)
+        matches!(self, Self::OutOfSync)
     }
 }
 
@@ -212,6 +212,7 @@ pub struct Settings {
     pub ldap_is_authoritative: bool,
     pub ldap_uses_ad: bool,
     pub ldap_sync_account_status: bool,
+    pub ldap_disable_password_management: bool,
     pub ldap_sync_interval: i32,
     // Additional object classes for users which determine the added attributes
     pub ldap_user_auxiliary_obj_classes: Vec<String>,
@@ -303,6 +304,10 @@ impl fmt::Debug for Settings {
             .field("ldap_is_authoritative", &self.ldap_is_authoritative)
             .field("ldap_uses_ad", &self.ldap_uses_ad)
             .field("ldap_sync_account_status", &self.ldap_sync_account_status)
+            .field(
+                "ldap_disable_password_management",
+                &self.ldap_disable_password_management,
+            )
             .field("ldap_sync_interval", &self.ldap_sync_interval)
             .field(
                 "ldap_user_auxiliary_obj_classes",
@@ -413,7 +418,7 @@ impl Settings {
         let key_der = self.openid_signing_key_der.as_deref()?;
         let key = RsaPrivateKey::from_pkcs8_der(key_der).ok()?;
         let pem = key.to_pkcs1_pem(LineEnding::default()).ok()?;
-        let key_id = JsonWebKeyId::new(key.n().to_str_radix(36));
+        let key_id = JsonWebKeyId::new(rsa_jwk_thumbprint(&key));
         CoreRsaPrivateSigningKey::from_pem(pem.as_ref(), Some(key_id)).ok()
     }
 
@@ -437,9 +442,9 @@ impl Settings {
         let url = self.parse_defguard_url()?;
         let domain = url
             .domain()
-            .map(str::to_string)
+            .map(str::to_owned)
             .or_else(|| match url.host_str() {
-                Some("localhost") => Some("localhost".to_string()),
+                Some("localhost") => Some("localhost".to_owned()),
                 _ => None,
             });
 
@@ -450,7 +455,7 @@ impl Settings {
     pub fn cookie_domain(&self) -> Result<String, SettingsUrlError> {
         let url = self.parse_defguard_url()?;
         url.host_str()
-            .map(ToString::to_string)
+            .map(str::to_owned)
             .ok_or_else(|| SettingsUrlError::MissingDefguardHost(self.defguard_url.clone()))
     }
 
@@ -482,6 +487,7 @@ impl Settings {
             smtp_port, smtp_encryption, smtp_user, smtp_password, smtp_sender, \
             smtp_authentication, smtp_oauth_issuer_url, smtp_oauth_client_id, \
             smtp_oauth_client_secret, smtp_oauth_refresh_token, smtp_oauth_tenant_id, \
+            smtp_tls_verify_cert, \
             enrollment_vpn_step_optional, enrollment_welcome_message, \
             enrollment_welcome_email, enrollment_welcome_email_subject, \
             enrollment_use_welcome_message_as_email, enrollment_send_welcome_email, \
@@ -494,7 +500,7 @@ impl Settings {
             gateway_disconnect_notifications_reconnect_notification_enabled, \
             ldap_sync_status, ldap_enabled, ldap_sync_enabled, ldap_is_authoritative, \
             ldap_sync_interval, ldap_user_auxiliary_obj_classes, ldap_uses_ad, \
-            ldap_sync_account_status, ldap_user_rdn_attr, ldap_sync_groups, \
+            ldap_sync_account_status, ldap_disable_password_management, ldap_user_rdn_attr, ldap_sync_groups, \
             ldap_remote_enrollment_enabled, ldap_remote_enrollment_send_invite, \
             openid_username_handling, defguard_url, \
             default_admin_group_name, authentication_period_days, mfa_code_timeout_seconds, \
@@ -575,60 +581,62 @@ impl Settings {
             smtp_oauth_client_id = $17, \
             smtp_oauth_client_secret = $18, \
             smtp_oauth_refresh_token = $19, \
-            smtp_oauth_tenant_id = $20, \
-            enrollment_vpn_step_optional = $21, \
-            enrollment_welcome_message = $22, \
-            enrollment_welcome_email = $23, \
-            enrollment_welcome_email_subject = $24, \
-            enrollment_use_welcome_message_as_email = $25, \
-            enrollment_send_welcome_email = $26, \
-            uuid = $27, \
-            ldap_url = $28, \
-            ldap_bind_username = $29, \
-            ldap_bind_password  = $30, \
-            ldap_group_search_base = $31, \
-            ldap_user_search_base = $32, \
-            ldap_user_obj_class = $33, \
-            ldap_group_obj_class = $34, \
-            ldap_username_attr = $35, \
-            ldap_groupname_attr = $36, \
-            ldap_group_member_attr = $37, \
-            ldap_member_attr = $38, \
-            ldap_use_starttls = $39, \
-            ldap_tls_verify_cert = $40, \
-            openid_create_account = $41, \
-            license = $42, \
-            gateway_disconnect_notifications_enabled = $43, \
-            gateway_disconnect_notifications_inactivity_threshold = $44, \
-            gateway_disconnect_notifications_reconnect_notification_enabled = $45, \
-            ldap_sync_status = $46, \
-            ldap_enabled = $47, \
-            ldap_sync_enabled = $48, \
-            ldap_is_authoritative = $49, \
-            ldap_sync_interval = $50, \
-            ldap_user_auxiliary_obj_classes = $51, \
-            ldap_uses_ad = $52, \
-            ldap_user_rdn_attr = $53, \
-            ldap_sync_groups = $54, \
-            ldap_remote_enrollment_enabled = $55, \
-            ldap_remote_enrollment_send_invite = $56, \
-            openid_username_handling = $57, \
-            defguard_url = $58, \
-            default_admin_group_name = $59, \
-            authentication_period_days = $60, \
-            mfa_code_timeout_seconds = $61, \
-            public_proxy_url = $62, \
-            default_admin_id = $63, \
-            secret_key = $64, \
-            openid_signing_key_der = $65, \
-            enable_stats_purge = $66, \
-            stats_purge_frequency_hours = $67, \
-            stats_purge_threshold_days = $68, \
-            enrollment_token_timeout_hours = $69, \
-            password_reset_token_timeout_hours = $70, \
-            enrollment_session_timeout_minutes = $71, \
-            password_reset_session_timeout_minutes = $72, \
-            ldap_sync_account_status = $73 \
+            enrollment_vpn_step_optional = $20, \
+            enrollment_welcome_message = $21, \
+            enrollment_welcome_email = $22, \
+            enrollment_welcome_email_subject = $23, \
+            enrollment_use_welcome_message_as_email = $24, \
+            enrollment_send_welcome_email = $25, \
+            uuid = $26, \
+            ldap_url = $27, \
+            ldap_bind_username = $28, \
+            ldap_bind_password  = $29, \
+            ldap_group_search_base = $30, \
+            ldap_user_search_base = $31, \
+            ldap_user_obj_class = $32, \
+            ldap_group_obj_class = $33, \
+            ldap_username_attr = $34, \
+            ldap_groupname_attr = $35, \
+            ldap_group_member_attr = $36, \
+            ldap_member_attr = $37, \
+            ldap_use_starttls = $38, \
+            ldap_tls_verify_cert = $39, \
+            openid_create_account = $40, \
+            license = $41, \
+            gateway_disconnect_notifications_enabled = $42, \
+            gateway_disconnect_notifications_inactivity_threshold = $43, \
+            gateway_disconnect_notifications_reconnect_notification_enabled = $44, \
+            ldap_sync_status = $45, \
+            ldap_enabled = $46, \
+            ldap_sync_enabled = $47, \
+            ldap_is_authoritative = $48, \
+            ldap_sync_interval = $49, \
+            ldap_user_auxiliary_obj_classes = $50, \
+            ldap_uses_ad = $51, \
+            ldap_user_rdn_attr = $52, \
+            ldap_sync_groups = $53, \
+            ldap_remote_enrollment_enabled = $54, \
+            ldap_remote_enrollment_send_invite = $55, \
+            openid_username_handling = $56, \
+            defguard_url = $57, \
+            default_admin_group_name = $58, \
+            authentication_period_days = $59, \
+            mfa_code_timeout_seconds = $60, \
+            public_proxy_url = $61, \
+            default_admin_id = $62, \
+            secret_key = $63, \
+            openid_signing_key_der = $64, \
+            enable_stats_purge = $65, \
+            stats_purge_frequency_hours = $66, \
+            stats_purge_threshold_days = $67, \
+            enrollment_token_timeout_hours = $68, \
+            password_reset_token_timeout_hours = $69, \
+            enrollment_session_timeout_minutes = $70, \
+            password_reset_session_timeout_minutes = $71, \
+            ldap_sync_account_status = $72, \
+            ldap_disable_password_management = $73, \
+            smtp_oauth_tenant_id = $74, \
+            smtp_tls_verify_cert = $75 \
             WHERE id = 1",
             self.openid_enabled,
             self.wireguard_enabled,
@@ -649,7 +657,6 @@ impl Settings {
             self.smtp.oauth_client_id,
             &self.smtp.oauth_client_secret as &Option<SecretStringWrapper>,
             self.smtp.oauth_refresh_token,
-            self.smtp.oauth_tenant_id,
             self.enrollment_vpn_step_optional,
             self.enrollment_welcome_message,
             self.enrollment_welcome_email,
@@ -703,6 +710,9 @@ impl Settings {
             self.enrollment_session_timeout_minutes,
             self.password_reset_session_timeout_minutes,
             self.ldap_sync_account_status,
+            self.ldap_disable_password_management,
+            self.smtp.oauth_tenant_id,
+            self.smtp.tls_verify_cert,
         )
         .execute(executor)
         .await?;
@@ -741,24 +751,23 @@ impl Settings {
             query(&query_string).bind(value).execute(pool).await?;
         }
 
-        let mut settings = Settings::get(pool).await?.unwrap_or_default();
+        let mut settings = Self::get(pool).await?.unwrap_or_default();
 
         match settings.secret_key.as_deref() {
             Some(secret_key) => {
-                Settings::validate_secret_key(secret_key)?;
+                Self::validate_secret_key(secret_key)?;
             }
             None => {
-                settings.secret_key = Some(Settings::generate_secret_key());
+                settings.secret_key = Some(Self::generate_secret_key());
             }
         }
 
         match settings.openid_signing_key_der.as_deref() {
             Some(key_der) => {
-                Settings::validate_openid_signing_key_der(key_der)?;
+                Self::validate_openid_signing_key_der(key_der)?;
             }
             None => {
-                settings.openid_signing_key_der =
-                    Some(Settings::generate_openid_signing_key_der()?);
+                settings.openid_signing_key_der = Some(Self::generate_openid_signing_key_der()?);
             }
         }
 
@@ -816,7 +825,7 @@ impl Settings {
 
     /// Get the DefGuard URL from the current settings
     pub fn url() -> Result<Url, url::ParseError> {
-        let settings = Settings::get_current_settings();
+        let settings = Self::get_current_settings();
         Url::parse(&settings.defguard_url)
     }
 
@@ -871,7 +880,7 @@ impl Settings {
             .as_deref()
             .ok_or(SettingsInitializationError::Missing("secret_key"))?;
 
-        Settings::validate_secret_key(secret_key)?;
+        Self::validate_secret_key(secret_key)?;
 
         Ok(secret_key)
     }
@@ -887,7 +896,7 @@ impl Settings {
                     "openid_signing_key_der",
                 ))?;
 
-        Settings::validate_openid_signing_key_der(key_der)?;
+        Self::validate_openid_signing_key_der(key_der)?;
 
         self.openid_key()
             .ok_or(SettingsInitializationError::Invalid(
@@ -910,7 +919,7 @@ impl Settings {
         let hostname = url
             .host_str()
             .ok_or_else(|| SettingsUrlError::EdgeUrlMissingHostname(self.public_proxy_url.clone()))?
-            .to_string();
+            .to_owned();
 
         Ok(hostname)
     }
@@ -926,17 +935,17 @@ impl Settings {
         }
         if let Some(secret_key) = &config.secret_key {
             let secret_key = secret_key.expose_secret();
-            if let Err(err) = Settings::validate_secret_key(secret_key) {
+            if let Err(err) = Self::validate_secret_key(secret_key) {
                 warn!(
                     "Invalid secret_key provided in deprecated config, generating new one: {err}"
                 );
-                self.secret_key = Some(Settings::generate_secret_key());
+                self.secret_key = Some(Self::generate_secret_key());
             } else {
-                self.secret_key = Some(secret_key.to_string());
+                self.secret_key = Some(secret_key.to_owned());
             }
         }
         if let Some(openid_signing_key) = &config.openid_signing_key {
-            match Settings::openid_signing_key_der_from_config(openid_signing_key) {
+            match Self::openid_signing_key_der_from_config(openid_signing_key) {
                 Ok(key_der) => {
                     self.openid_signing_key_der = Some(key_der);
                 }
@@ -944,7 +953,7 @@ impl Settings {
                     warn!(
                         "Invalid openid_signing_key provided in deprecated config, generating new one: {err}"
                     );
-                    self.openid_signing_key_der = Settings::generate_openid_signing_key_der().ok();
+                    self.openid_signing_key_der = Self::generate_openid_signing_key_der().ok();
                 }
             }
         }
@@ -1129,7 +1138,7 @@ mod test {
     fn dg25_32_test_dont_expose_license_key() {
         let key = "0000000000000000";
         let settings = Settings {
-            license: Some(key.to_string()),
+            license: Some(key.to_owned()),
             ..Default::default()
         };
 
@@ -1405,7 +1414,7 @@ mod test {
     fn test_apply_from_config_invalid_secret_key_generates_new() {
         let mut settings = Settings::default();
         let mut config = DefGuardConfig::new_test_config();
-        config.secret_key = Some(SecretString::from(" short ".to_string()));
+        config.secret_key = Some(SecretString::from(" short ".to_owned()));
 
         settings.apply_from_config(&config);
 

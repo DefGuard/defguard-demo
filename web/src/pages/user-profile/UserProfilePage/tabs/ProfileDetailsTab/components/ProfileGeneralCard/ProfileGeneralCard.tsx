@@ -1,6 +1,7 @@
 import './style.scss';
 import { revalidateLogic, useStore } from '@tanstack/react-form';
 import { useMutation } from '@tanstack/react-query';
+import { useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import z from 'zod';
 import { useShallow } from 'zustand/react/shallow';
@@ -61,6 +62,7 @@ const zodSchema = z.object({
 type FormFields = z.infer<typeof zodSchema>;
 
 export const ProfileGeneralCard = () => {
+  const navigate = useNavigate({ from: '/user/$username' });
   const profileUser = useUserProfile((s) => s.user);
   const isAdmin = useAuth((s) => s.isAdmin);
   const demoMode = useApp((s) => s.appInfo.demo_mode);
@@ -68,7 +70,7 @@ export const ProfileGeneralCard = () => {
   const { mutateAsync } = useMutation({
     mutationFn: api.user.editUser,
     meta: {
-      invalidate: [['user', profileUser.username]],
+      invalidate: [['user'], ['user', profileUser.username], ['enterprise_info']],
     },
   });
 
@@ -102,10 +104,17 @@ export const ProfileGeneralCard = () => {
         Snackbar.error(m.demo_mode_feature_disabled());
         return;
       }
+      const previousUsername = profileUser.username;
       await mutateAsync({
-        username: profileUser.username,
+        username: previousUsername,
         body: { ...profileUser, ...value },
       });
+      if (value.username !== previousUsername) {
+        navigate({
+          to: '/user/$username',
+          params: { username: value.username },
+        });
+      }
     },
   });
 

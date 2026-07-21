@@ -1,12 +1,20 @@
 use defguard_common::db::models::{Settings, User};
 use defguard_core::{
     db::models::enrollment::{PASSWORD_RESET_TOKEN_TYPE, Token},
-    enterprise::ldap::utils::ldap_change_password,
-    events::{BidiRequestContext, BidiStreamEvent, BidiStreamEventType, PasswordResetEvent},
+    enterprise::{
+        db::models::{enterprise_settings::EnterpriseSettings, openid_provider::OpenIdProvider},
+        ldap::utils::ldap_change_password,
+    },
+    events::{
+        BidiRequestContext, BidiStreamEvent, BidiStreamEventType, LdapSyncEventType,
+        PasswordResetEvent,
+    },
     grpc::utils::parse_client_ip_agent,
     handlers::user::check_password_strength,
     headers::get_device_info,
-    mail::templates::{password_reset_mail, password_reset_success_mail},
+    mail::templates::{
+        password_reset_disabled_mail, password_reset_mail, password_reset_success_mail,
+    },
 };
 use defguard_proto::proxy::{
     DeviceInfo, PasswordResetInitializeRequest, PasswordResetRequest, PasswordResetStartRequest,
@@ -19,16 +27,22 @@ use tonic::Status;
 pub(crate) struct PasswordResetServer {
     pool: PgPool,
     bidi_event_tx: UnboundedSender<BidiStreamEvent>,
+    ldap_tx: UnboundedSender<LdapSyncEventType>,
 }
 
 impl PasswordResetServer {
     #[must_use]
-    pub fn new(pool: PgPool, bidi_event_tx: UnboundedSender<BidiStreamEvent>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        bidi_event_tx: UnboundedSender<BidiStreamEvent>,
+        ldap_tx: UnboundedSender<LdapSyncEventType>,
+    ) -> Self {
         // FIXME: check if LDAP feature is enabled
         // let ldap_feature_active = true;
         Self {
             pool,
             bidi_event_tx,
+            ldap_tx,
             // ldap_feature_active,
         }
     }
@@ -86,6 +100,13 @@ impl PasswordResetServer {
     ) -> Result<(), Status> {
         debug!("Starting password reset request");
 
+        let settings = EnterpriseSettings::get(&self.pool)
+            .await
+            .map_err(|_| Status::internal("failed to read enterprise settings"))?;
+        if !settings.display_password_reset {
+            return Err(Status::permission_denied("password reset disabled"));
+        }
+
         let ip_address;
         let device_info;
         if let Some(info) = &req_device_info {
@@ -112,12 +133,59 @@ impl PasswordResetServer {
             return Ok(());
         };
 
-        // Do not allow password change if user is disabled or not enrolled
-        if !user.has_password() || !user.is_active {
+        // Do not allow password reset for inactive (disabled) users.
+        if !user.is_active {
             debug!(
-                "Password reset skipped for disabled or not enrolled user {} ({email})",
+                "Password reset skipped for disabled user {} ({email})",
                 user.username
             );
+            return Ok(());
+        }
+
+        // Externally-managed users get a clear feedback email;
+        // other passwordless users (e.g. half-enrolled) stay silent.
+        if !user.has_password() {
+            let is_admin = user.is_admin(&self.pool).await.map_err(|err| {
+                error!("Failed to check if user is admin: {err}");
+                Status::internal("unexpected error")
+            })?;
+            let settings = Settings::get_current_settings();
+            let oidc_disable_password_management =
+                OpenIdProvider::current_disables_password_management(&self.pool)
+                    .await
+                    .map_err(|err| {
+                        error!("Failed to check OIDC password management flag: {err}");
+                        Status::internal("unexpected error")
+                    })?;
+
+            if user.password_management_disabled(
+                is_admin,
+                &settings,
+                oidc_disable_password_management,
+            ) {
+                debug!(
+                    "Password reset disabled for externally-managed user {} ({email})",
+                    user.username
+                );
+                if let Err(err) = password_reset_disabled_mail(
+                    &user.email,
+                    &mut *self.pool.acquire().await.map_err(|err| {
+                        error!("Failed to acquire DB connection: {err}");
+                        Status::internal("unexpected error")
+                    })?,
+                    Some(&ip_address),
+                    Some(&device_info),
+                )
+                .await
+                {
+                    error!("Failed to send password reset disabled email: {err}");
+                }
+            } else {
+                debug!(
+                    "Password reset skipped for passwordless user {} ({email})",
+                    user.username
+                );
+            }
             return Ok(());
         }
 
@@ -134,7 +202,7 @@ impl PasswordResetServer {
             None,
             Some(email.clone()),
             settings.password_reset_token_timeout().as_secs(),
-            Some(PASSWORD_RESET_TOKEN_TYPE.to_string()),
+            Some(PASSWORD_RESET_TOKEN_TYPE.to_owned()),
         );
         enrollment.save(&mut *transaction).await?;
 
@@ -185,9 +253,16 @@ impl PasswordResetServer {
     ) -> Result<PasswordResetStartResponse, Status> {
         debug!("Starting password reset session: {request:?}");
 
+        let settings = EnterpriseSettings::get(&self.pool)
+            .await
+            .map_err(|_| Status::internal("failed to read enterprise settings"))?;
+        if !settings.display_password_reset {
+            return Err(Status::permission_denied("password reset disabled"));
+        }
+
         let mut enrollment = Token::find_by_id(&self.pool, &request.token).await?;
 
-        if enrollment.token_type != Some("PASSWORD_RESET".to_string()) {
+        if enrollment.token_type != Some("PASSWORD_RESET".to_owned()) {
             error!(
                 "Invalid token type ({:?}) for password reset session",
                 enrollment.token_type
@@ -252,6 +327,14 @@ impl PasswordResetServer {
         req_device_info: Option<DeviceInfo>,
     ) -> Result<(), Status> {
         debug!("Starting password reset");
+
+        let settings = EnterpriseSettings::get(&self.pool)
+            .await
+            .map_err(|_| Status::internal("failed to read enterprise settings"))?;
+        if !settings.display_password_reset {
+            return Err(Status::permission_denied("password reset disabled"));
+        }
+
         let enrollment = self.validate_session(request.token.as_ref()).await?;
 
         let ip_address;
@@ -308,7 +391,7 @@ impl PasswordResetServer {
             Status::internal("unexpected error")
         })?;
 
-        ldap_change_password(&mut user, &request.password, &self.pool).await;
+        ldap_change_password(&mut user, &request.password, &self.pool, &self.ldap_tx).await;
 
         // Prepare event context and push the event
         let (ip, user_agent) = parse_client_ip_agent(&req_device_info).map_err(Status::internal)?;

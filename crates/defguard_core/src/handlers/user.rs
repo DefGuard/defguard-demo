@@ -17,6 +17,7 @@ use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Type};
+use thiserror::Error;
 use utoipa::ToSchema;
 
 use super::{
@@ -34,7 +35,7 @@ use crate::{
         send_enrollment_invitation, start_desktop_configuration, start_user_enrollment,
     },
     enterprise::{
-        db::models::api_tokens::ApiToken,
+        db::models::{api_tokens::ApiToken, openid_provider::OpenIdProvider},
         handlers::CanManageDevices,
         ldap::{
             model::{ldap_sync_allowed_for_user, maybe_update_rdn},
@@ -82,12 +83,16 @@ pub(crate) const MAX_USERNAME_CHARS: usize = 64;
 /// - digits (0-9)
 /// - starts with non-special character
 /// - special characters: . - _
-/// - no whitespaces
-pub fn check_username(username: &str) -> Result<(), WebError> {
+
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct ValidationError(pub String);
+
+pub fn check_username(username: &str) -> Result<(), ValidationError> {
     // check length
     let length = username.len();
     if !(1..MAX_USERNAME_CHARS).contains(&length) {
-        return Err(WebError::Serialization(format!(
+        return Err(ValidationError(format!(
             "Username ({username}) has incorrect length"
         )));
     }
@@ -96,7 +101,7 @@ pub fn check_username(username: &str) -> Result<(), WebError> {
     if let Some(first_char) = username.chars().next()
         && !first_char.is_ascii_alphanumeric()
     {
-        return Err(WebError::Serialization(
+        return Err(ValidationError(
             "Username must not start with a special character".into(),
         ));
     }
@@ -106,32 +111,30 @@ pub fn check_username(username: &str) -> Result<(), WebError> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
     {
-        return Err(WebError::Serialization(
+        return Err(ValidationError(
             "Username contains invalid characters".into(),
         ));
     }
 
     Ok(())
 }
-pub fn check_password_strength(password: &str) -> Result<(), WebError> {
+pub fn check_password_strength(password: &str) -> Result<(), ValidationError> {
     if !(8..=128).contains(&password.len()) {
-        return Err(WebError::Serialization("Incorrect password length".into()));
+        return Err(ValidationError("Incorrect password length".into()));
     }
     if !password.chars().any(|c| c.is_ascii_punctuation()) {
-        return Err(WebError::Serialization(
-            "No special characters in password".into(),
-        ));
+        return Err(ValidationError("No special characters in password".into()));
     }
     if !password.chars().any(|c| c.is_ascii_digit()) {
-        return Err(WebError::Serialization("No numbers in password".into()));
+        return Err(ValidationError("No numbers in password".into()));
     }
     if !password.chars().any(|c| c.is_ascii_lowercase()) {
-        return Err(WebError::Serialization(
+        return Err(ValidationError(
             "No lowercase characters in password".into(),
         ));
     }
     if !password.chars().any(|c| c.is_ascii_uppercase()) {
-        return Err(WebError::Serialization(
+        return Err(ValidationError(
             "No uppercase characters in password".into(),
         ));
     }
@@ -142,13 +145,17 @@ pub fn check_password_strength(password: &str) -> Result<(), WebError> {
 #[derive(Deserialize, Serialize, ToSchema)]
 pub struct UserDetails {
     pub user: UserInfo,
-    pub biometric_enabled_devices: Vec<i64>,
+    pub biometric_enabled_devices: Vec<Id>,
     #[serde(default)]
     pub security_keys: Vec<SecurityKey>,
 }
 
 impl UserDetails {
-    pub(crate) async fn from_user(pool: &PgPool, user: User<Id>) -> sqlx::Result<Self> {
+    pub(crate) async fn from_user(
+        pool: &PgPool,
+        user: User<Id>,
+        oidc_disable_password_management: bool,
+    ) -> sqlx::Result<Self> {
         let security_keys = user.security_keys(pool).await?;
         let biometric_enabled_devices = BiometricAuth::find_by_user_id(pool, user.id)
             .await?
@@ -156,7 +163,7 @@ impl UserDetails {
             .map(|a| a.device_id)
             .collect::<Vec<_>>();
         Ok(Self {
-            user: UserInfo::from_user(pool, user).await?,
+            user: UserInfo::from_user(pool, user, oidc_disable_password_management).await?,
             security_keys,
             biometric_enabled_devices,
         })
@@ -322,9 +329,13 @@ pub(crate) async fn list_users(
 
     // Map [`User`] to [`UserInfo`].
     // TODO: too many queries – optimise.
+    let oidc_disable_password_management =
+        OpenIdProvider::current_disables_password_management(&appstate.pool).await?;
     let mut users = Vec::with_capacity(all_users.len());
     for user in all_users {
-        users.push(UserInfo::from_user(&appstate.pool, user).await?);
+        users.push(
+            UserInfo::from_user(&appstate.pool, user, oidc_disable_password_management).await?,
+        );
     }
 
     info!("Listed users");
@@ -449,7 +460,10 @@ pub(crate) async fn get_user(
     Path(username): Path<String>,
 ) -> ApiResult {
     let user = user_for_admin_or_self(&appstate.pool, &session, &username).await?;
-    let user_details = UserDetails::from_user(&appstate.pool, user).await?;
+    let oidc_disable_password_management =
+        OpenIdProvider::current_disables_password_management(&appstate.pool).await?;
+    let user_details =
+        UserDetails::from_user(&appstate.pool, user, oidc_disable_password_management).await?;
     Ok(ApiResponse::json(user_details, StatusCode::OK))
 }
 
@@ -566,10 +580,23 @@ pub(crate) async fn add_user(
     update_counts(&appstate.pool).await?;
 
     if let Some(password) = user_data.password {
-        ldap_add_user(&mut user, Some(&password), &appstate.pool).await;
+        ldap_add_user(
+            &mut user,
+            Some(&password),
+            &appstate.pool,
+            &appstate.ldap_tx,
+        )
+        .await;
     }
 
-    let user_info = UserInfo::from_user(&appstate.pool, user.clone()).await?;
+    let oidc_disable_password_management =
+        OpenIdProvider::current_disables_password_management(&appstate.pool).await?;
+    let user_info = UserInfo::from_user(
+        &appstate.pool,
+        user.clone(),
+        oidc_disable_password_management,
+    )
+    .await?;
     appstate.trigger_action(AppEvent::UserCreated(user_info.clone()));
     info!("User {} added user {username}", session.user.username);
     if !user_info.enrolled {
@@ -898,9 +925,15 @@ pub(crate) async fn modify_user(
 
     debug!("User {} updating user {username}", session.user.username);
     let mut user = user_for_admin_or_self(&appstate.pool, &session, &username).await?;
-    let groups_before = UserInfo::from_user(&appstate.pool, user.clone())
-        .await?
-        .groups;
+    let oidc_disable_password_management =
+        OpenIdProvider::current_disables_password_management(&appstate.pool).await?;
+    let groups_before = UserInfo::from_user(
+        &appstate.pool,
+        user.clone(),
+        oidc_disable_password_management,
+    )
+    .await?
+    .groups;
 
     // store user before mods
     let before = user.clone();
@@ -924,13 +957,13 @@ pub(crate) async fn modify_user(
     let ldap_sync_allowed = ldap_sync_allowed_for_user(&user, &mut *transaction).await?;
 
     // remove authorized apps if needed
-    let request_app_ids: Vec<i64> = user_info
+    let request_app_ids: Vec<Id> = user_info
         .authorized_apps
         .iter()
         .map(|app| app.oauth2client_id)
         .collect();
     let db_apps = user.oauth2authorizedapps(&mut *transaction).await?;
-    let removed_apps: Vec<i64> = db_apps
+    let removed_apps: Vec<Id> = db_apps
         .iter()
         .filter(|app| !request_app_ids.contains(&app.oauth2client_id))
         .map(|app| app.oauth2client_id)
@@ -947,6 +980,25 @@ pub(crate) async fn modify_user(
             return Ok(ApiResponse::with_status(StatusCode::BAD_REQUEST));
         }
 
+        // check if re-enabling a disabled user will go over license limits
+        if !user.is_active && user_info.is_active {
+            let user_count = get_counts().user();
+            let user_limit = get_cached_license()
+                .as_ref()
+                .and_then(|l| l.limits.as_ref())
+                .map(|l| l.users);
+
+            if let Some(limit) = user_limit
+                && user_count >= limit
+            {
+                error!("Enabling user {username} blocked. License limit reached.");
+                return Ok(WebError::LicenseLimitReached(format!(
+                    "Cannot enable user {username}: license user limit reached ({user_count}/{limit})"
+                ))
+                .into());
+            }
+        }
+
         // update VPN gateway config if user status or groups have changed
         group_diff = user_info
             .handle_user_groups(&mut transaction, &mut user)
@@ -960,7 +1012,7 @@ pub(crate) async fn modify_user(
                 "User {} changed {username} groups or status, syncing allowed network devices.",
                 session.user.username
             );
-            sync_allowed_user_devices(&user, &mut transaction, &appstate.wireguard_tx).await?;
+            sync_allowed_user_devices(&user, &mut transaction, &appstate.gateway_tx).await?;
         }
 
         // remove API tokens when deactivating a user
@@ -977,14 +1029,23 @@ pub(crate) async fn modify_user(
 
     user.save(&mut *transaction).await?;
     transaction.commit().await?;
-    let user_info = UserInfo::from_user(&appstate.pool, user.clone()).await?;
+    if status_changing {
+        update_counts(&appstate.pool).await?;
+    }
+    let user_info = UserInfo::from_user(
+        &appstate.pool,
+        user.clone(),
+        oidc_disable_password_management,
+    )
+    .await?;
 
     if ldap_sync_allowed {
         ldap_handle_user_modify(
             &old_username,
             &mut user,
             &appstate.pool,
-            &appstate.wireguard_tx,
+            &appstate.gateway_tx,
+            &appstate.ldap_tx,
         )
         .await;
     }
@@ -995,7 +1056,8 @@ pub(crate) async fn modify_user(
     Box::pin(ldap_update_user_state(
         &mut user,
         &appstate.pool,
-        &appstate.wireguard_tx,
+        &appstate.gateway_tx,
+        &appstate.ldap_tx,
     ))
     .await;
 
@@ -1009,6 +1071,7 @@ pub(crate) async fn modify_user(
                     .map(String::as_str)
                     .collect::<HashSet<&str>>(),
                 &appstate.pool,
+                &appstate.ldap_tx,
             )
             .await;
         }
@@ -1022,6 +1085,7 @@ pub(crate) async fn modify_user(
                     .map(String::as_str)
                     .collect::<HashSet<&str>>(),
                 &appstate.pool,
+                &appstate.ldap_tx,
             )
             .await;
         }
@@ -1046,12 +1110,25 @@ pub(crate) async fn modify_user(
     }
 
     appstate.emit_event(ApiEvent {
-        context,
+        context: context.clone(),
         event: Box::new(ApiEventType::UserModified {
             before,
-            after: user,
+            after: user.clone(),
         }),
     })?;
+
+    if status_changing {
+        let event = if user.is_active {
+            ApiEventType::UserEnabled { user }
+        } else {
+            ApiEventType::UserDisabled { user }
+        };
+        appstate.emit_event(ApiEvent {
+            context,
+            event: Box::new(event),
+        })?;
+    }
+
     Ok(ApiResponse::default())
 }
 
@@ -1104,14 +1181,14 @@ pub(crate) async fn delete_user(
         } else {
             None
         };
-        delete_user_and_cleanup_devices(user.clone(), &mut transaction, &appstate.wireguard_tx)
+        delete_user_and_cleanup_devices(user.clone(), &mut transaction, &appstate.gateway_tx)
             .await?;
 
         appstate.trigger_action(AppEvent::UserDeleted(username.clone()));
         transaction.commit().await?;
         update_counts(&appstate.pool).await?;
         if let Some(user_for_ldap) = user_for_ldap {
-            ldap_delete_user(&user_for_ldap, &appstate.pool).await;
+            ldap_delete_user(&user_for_ldap, &appstate.pool, &appstate.ldap_tx).await;
         }
 
         info!("User {} deleted user {}", session.user.username, &username);
@@ -1126,6 +1203,15 @@ pub(crate) async fn delete_user(
             "User {username} not found"
         )))
     }
+}
+
+/// Loads the current settings and configured OIDC provider to determine whether password
+/// management (set/change/reset) is disabled for `user`.
+async fn user_password_management_disabled(pool: &PgPool, user: &User<Id>) -> sqlx::Result<bool> {
+    let settings = Settings::get_current_settings();
+    let oidc_disabled = OpenIdProvider::current_disables_password_management(pool).await?;
+    let is_admin = user.is_admin(pool).await?;
+    Ok(user.password_management_disabled(is_admin, &settings, oidc_disabled))
 }
 
 /// Change your own password
@@ -1164,6 +1250,15 @@ pub(crate) async fn change_self_password(
         ));
     }
     let mut user = session.user;
+
+    if user_password_management_disabled(&appstate.pool, &user).await? {
+        debug!("Password management disabled for user {}", user.username);
+        return Ok(ApiResponse::new(
+            json!({"msg": "Password management is disabled for this user"}),
+            StatusCode::FORBIDDEN,
+        ));
+    }
+
     if user.verify_password(&data.old_password).is_err() {
         return Ok(ApiResponse::with_status(StatusCode::BAD_REQUEST));
     }
@@ -1176,7 +1271,13 @@ pub(crate) async fn change_self_password(
     user.set_password(&data.new_password);
     user.save(&appstate.pool).await?;
 
-    ldap_change_password(&mut user, &data.new_password, &appstate.pool).await;
+    ldap_change_password(
+        &mut user,
+        &data.new_password,
+        &appstate.pool,
+        &appstate.ldap_tx,
+    )
+    .await;
 
     info!("User {} changed his password.", &user.username);
     appstate.emit_event(ApiEvent {
@@ -1247,9 +1348,23 @@ pub(crate) async fn change_password(
     let user = User::find_by_username(&appstate.pool, &username).await?;
 
     if let Some(mut user) = user {
+        if user_password_management_disabled(&appstate.pool, &user).await? {
+            debug!("Password management disabled for user {username}");
+            return Ok(ApiResponse::new(
+                json!({"msg": "Password management is disabled for this user"}),
+                StatusCode::FORBIDDEN,
+            ));
+        }
+
         user.set_password(&data.new_password);
         user.save(&appstate.pool).await?;
-        ldap_change_password(&mut user, &data.new_password, &appstate.pool).await;
+        ldap_change_password(
+            &mut user,
+            &data.new_password,
+            &appstate.pool,
+            &appstate.ldap_tx,
+        )
+        .await;
         info!(
             "Admin {} changed password for user {username}",
             session.user.username
@@ -1312,6 +1427,14 @@ pub(crate) async fn reset_password(
     let user = User::find_by_username(&appstate.pool, &username).await?;
 
     if let Some(user) = user {
+        if user_password_management_disabled(&appstate.pool, &user).await? {
+            debug!("Password management disabled for user {username}");
+            return Ok(ApiResponse::new(
+                json!({"msg": "Password management is disabled for this user"}),
+                StatusCode::FORBIDDEN,
+            ));
+        }
+
         let mut transaction = appstate.pool.begin().await?;
 
         Token::delete_unused_user_password_reset_tokens(&mut transaction, user.id).await?;
@@ -1322,7 +1445,7 @@ pub(crate) async fn reset_password(
             Some(session.user.id),
             Some(user.email.clone()),
             settings.password_reset_token_timeout().as_secs(),
-            Some(PASSWORD_RESET_TOKEN_TYPE.to_string()),
+            Some(PASSWORD_RESET_TOKEN_TYPE.to_owned()),
         );
         enrollment.save(&mut *transaction).await?;
         let public_proxy_url = settings.proxy_public_url()?;
@@ -1462,7 +1585,14 @@ pub(crate) async fn delete_security_key(
     )
 )]
 pub async fn me(session: SessionInfo, State(appstate): State<AppState>) -> ApiResult {
-    let user_info = UserInfo::from_user(&appstate.pool, session.user).await?;
+    let oidc_disable_password_management =
+        OpenIdProvider::current_disables_password_management(&appstate.pool).await?;
+    let user_info = UserInfo::from_user(
+        &appstate.pool,
+        session.user,
+        oidc_disable_password_management,
+    )
+    .await?;
     Ok(ApiResponse::json(user_info, StatusCode::OK))
 }
 
@@ -1600,12 +1730,7 @@ pub(crate) async fn bulk_disable_users(
             token.delete(&mut *transaction).await?;
         }
 
-        disable_user(
-            &mut user_to_disable,
-            &mut transaction,
-            &appstate.wireguard_tx,
-        )
-        .await?;
+        disable_user(&mut user_to_disable, &mut transaction, &appstate.gateway_tx).await?;
         events.push((before, user_to_disable));
     }
     transaction.commit().await?;
@@ -1614,7 +1739,8 @@ pub(crate) async fn bulk_disable_users(
         Box::pin(ldap_update_user_state(
             user,
             &appstate.pool,
-            &appstate.wireguard_tx,
+            &appstate.gateway_tx,
+            &appstate.ldap_tx,
         ))
         .await;
     }
@@ -1678,6 +1804,30 @@ pub(crate) async fn bulk_enable_users(
         ));
     }
 
+    // check if enabling the requested users will go over license limits
+    let to_enable_count = users.iter().filter(|user| !user.is_active).count() as u32;
+    if to_enable_count > 0 {
+        let user_count = get_counts().user();
+        let user_limit = get_cached_license()
+            .as_ref()
+            .and_then(|l| l.limits.as_ref())
+            .map(|l| l.users);
+
+        if let Some(limit) = user_limit
+            && user_count + to_enable_count > limit
+        {
+            error!(
+                "User {} bulk-enabling users blocked! License limit reached.",
+                session.user.username
+            );
+            return Ok(WebError::LicenseLimitReached(format!(
+                "Cannot enable {to_enable_count} user(s): license user limit reached \
+                ({user_count}/{limit})"
+            ))
+            .into());
+        }
+    }
+
     let mut events = Vec::with_capacity(users.len());
     let mut transaction = appstate.pool.begin().await?;
     for user in users {
@@ -1688,17 +1838,20 @@ pub(crate) async fn bulk_enable_users(
         let mut user_to_enable = user;
         user_to_enable.is_active = true;
         user_to_enable.save(&mut *transaction).await?;
-        sync_allowed_user_devices(&user_to_enable, &mut transaction, &appstate.wireguard_tx)
-            .await?;
+        sync_allowed_user_devices(&user_to_enable, &mut transaction, &appstate.gateway_tx).await?;
         events.push((before, user_to_enable));
     }
     transaction.commit().await?;
+    if to_enable_count > 0 {
+        update_counts(&appstate.pool).await?;
+    }
 
     for (_, user) in &mut events {
         Box::pin(ldap_update_user_state(
             user,
             &appstate.pool,
-            &appstate.wireguard_tx,
+            &appstate.gateway_tx,
+            &appstate.ldap_tx,
         ))
         .await;
     }
@@ -1783,7 +1936,7 @@ pub(crate) async fn bulk_delete_users(
         } else {
             None
         };
-        delete_user_and_cleanup_devices(user.clone(), &mut transaction, &appstate.wireguard_tx)
+        delete_user_and_cleanup_devices(user.clone(), &mut transaction, &appstate.gateway_tx)
             .await?;
         if let Some(noid_user) = user_for_ldap {
             ldap_targets.push(noid_user);
@@ -1798,7 +1951,7 @@ pub(crate) async fn bulk_delete_users(
         appstate.trigger_action(AppEvent::UserDeleted(username.clone()));
     }
     for noid_user in &ldap_targets {
-        ldap_delete_user(noid_user, &appstate.pool).await;
+        ldap_delete_user(noid_user, &appstate.pool, &appstate.ldap_tx).await;
     }
 
     info!(

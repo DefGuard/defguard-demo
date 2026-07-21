@@ -1,4 +1,4 @@
 ignorePaths:
-- e2e/**
+  - e2e/**
 
 vulnerabilities:

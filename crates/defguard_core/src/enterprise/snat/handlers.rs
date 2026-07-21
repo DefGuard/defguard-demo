@@ -21,14 +21,14 @@ use crate::{
     },
     error::WebError,
     events::{ApiEvent, ApiEventType, ApiRequestContext},
-    grpc::GatewayEvent,
+    grpc::GatewayCommand,
     handlers::{ApiResponse, ApiResult},
 };
 
 /// List all SNAT bindings for a WireGuard location
 ///
 /// # Returns
-/// - `Vec<UserSnatBinding<i64>>` object
+/// - `Vec<UserSnatBinding<Id>>` object
 ///
 /// - `WebError` if error occurs
 #[utoipa::path(
@@ -85,7 +85,7 @@ pub struct NewUserSnatBinding {
 /// Create snat binding basing on `NewUserSnatBinding` object.
 ///
 /// # Returns
-/// - `UserSnatBinding<i64>` object
+/// - `UserSnatBinding<Id>` object
 ///
 /// - `WebError` if error occurs
 #[utoipa::path(
@@ -159,7 +159,7 @@ pub async fn create_snat_binding(
         debug!(
             "Sending firewall config update for location {location} affected by adding new SNAT binding"
         );
-        appstate.send_wireguard_event(GatewayEvent::FirewallConfigChanged(
+        appstate.send_gateway_command(GatewayCommand::FirewallConfigChanged(
             location.id,
             firewall_config,
         ));
@@ -258,7 +258,7 @@ pub async fn modify_snat_binding(
         debug!(
             "Sending firewall config update for location {location} affected by adding new SNAT binding"
         );
-        appstate.send_wireguard_event(GatewayEvent::FirewallConfigChanged(
+        appstate.send_gateway_command(GatewayCommand::FirewallConfigChanged(
             location_id,
             firewall_config,
         ));
@@ -342,7 +342,7 @@ pub async fn delete_snat_binding(
         debug!(
             "Sending firewall config update for location {location} affected by adding new SNAT binding"
         );
-        appstate.send_wireguard_event(GatewayEvent::FirewallConfigChanged(
+        appstate.send_gateway_command(GatewayCommand::FirewallConfigChanged(
             location_id,
             firewall_config,
         ));

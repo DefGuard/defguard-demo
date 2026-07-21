@@ -27,13 +27,14 @@ use super::{ApiResponse, ApiResult, WebError};
 use crate::{
     appstate::AppState,
     auth::{AdminRole, SessionInfo},
+    device_access::{build_device_config, join_device_to_network},
     enrollment_management::start_desktop_configuration,
     enterprise::{
         db::models::enterprise_settings::EnterpriseSettings,
         firewall::try_get_location_firewall_config, limits::update_counts,
     },
     events::{ApiEvent, ApiEventType, ApiRequestContext},
-    grpc::GatewayEvent,
+    grpc::GatewayCommand,
     handlers::{
         device_for_admin_or_self,
         pagination::{PaginatedApiResponse, PaginatedApiResult, PaginationParams},
@@ -97,7 +98,7 @@ impl NetworkDeviceInfo {
                     })
             })
             .collect::<Result<_, _>>()?;
-        Ok(NetworkDeviceInfo {
+        Ok(Self {
             id: device.id,
             name: device.name,
             assigned_ips: wireguard_device.wireguard_ips,
@@ -143,6 +144,12 @@ pub(crate) async fn network_device_configs(
     }
 
     let device = device_for_admin_or_self(&appstate.pool, &session, device_id).await?;
+    let user = User::find_by_id(&appstate.pool, device.user_id)
+        .await?
+        .ok_or(WebError::ObjectNotFound(format!(
+            "User {} not found",
+            device.user_id
+        )))?;
     let networks =
         WireguardNetwork::find_network_device_networks(&appstate.pool, device_id).await?;
 
@@ -158,12 +165,14 @@ pub(crate) async fn network_device_configs(
             "Created a WireGuard config for network device {device_id} in network {}.",
             network.name
         );
-        let config = Device::create_config(&network, &network_device);
+        let mut conn = appstate.pool.acquire().await?;
+        let device_config =
+            build_device_config(&mut conn, &network, &network_device, &user).await?;
         let device_config = DeviceWireGuardConfig {
-            network_id: network.id,
-            network_name: network.name,
-            config,
-            location_mfa_mode: network.location_mfa_mode.clone(),
+            network_id: device_config.network_id,
+            network_name: device_config.network_name,
+            config: device_config.config,
+            location_mfa_mode: device_config.location_mfa_mode,
         };
         result.push(device_config);
     }
@@ -371,7 +380,7 @@ pub(crate) async fn find_available_ips(
                 "Failed to find available IP for network with ID {}",
                 network_id
             );
-            WebError::BadRequest("Failed to find available IP, network not found".to_string())
+            WebError::BadRequest("Failed to find available IP, network not found".to_owned())
         })?;
 
     let mut transaction = appstate.pool.begin().await?;
@@ -427,7 +436,7 @@ pub struct StartNetworkDeviceSetup {
 
 impl From<NetworkAddressError> for WebError {
     fn from(error: NetworkAddressError) -> Self {
-        WebError::BadRequest(error.to_string())
+        Self::BadRequest(error.to_string())
     }
 }
 
@@ -452,7 +461,7 @@ pub(crate) async fn start_network_device_setup(
                 "Failed to add device {device_name}, network with ID {} not found",
                 setup_start.location_id
             );
-            WebError::BadRequest("Failed to add device, network not found".to_string())
+            WebError::BadRequest("Failed to add device, network not found".to_owned())
         })?;
 
     debug!(
@@ -463,7 +472,7 @@ pub(crate) async fn start_network_device_setup(
     let mut transaction = appstate.pool.begin().await?;
     let device = Device::new(
         setup_start.name,
-        "NOT_CONFIGURED".to_string(),
+        "NOT_CONFIGURED".to_owned(),
         user.id,
         DeviceType::Network,
         setup_start.description,
@@ -491,9 +500,8 @@ pub(crate) async fn start_network_device_setup(
 
     network.can_assign_ips(&mut transaction, &ips, None).await?;
 
-    let (_, config) = device
-        .add_to_network(&network, &ips, &mut transaction)
-        .await?;
+    let (_, config) =
+        join_device_to_network(&mut transaction, &device, &network, &user, &ips).await?;
 
     info!(
         "User {} added a new unconfigured network device {device_name} with IPs {ips:?} to network \
@@ -623,7 +631,7 @@ pub(crate) async fn add_network_device(
                 "Failed to add device {device_name}, network with ID {} not found",
                 add_network_device.location_id
             );
-            WebError::BadRequest("Failed to add device, network not found".to_string())
+            WebError::BadRequest("Failed to add device, network not found".to_owned())
         })?;
 
     Device::validate_pubkey(&add_network_device.wireguard_pubkey)
@@ -665,11 +673,10 @@ pub(crate) async fn add_network_device(
         })?;
     network.can_assign_ips(&mut transaction, &ips, None).await?;
 
-    let (network_info, config) = device
-        .add_to_network(&network, &ips, &mut transaction)
-        .await?;
+    let (network_info, config) =
+        join_device_to_network(&mut transaction, &device, &network, &user, &ips).await?;
 
-    appstate.send_wireguard_event(GatewayEvent::DeviceCreated(DeviceInfo {
+    appstate.send_gateway_command(GatewayCommand::DeviceCreated(DeviceInfo {
         device: device.clone(),
         network_info: vec![network_info.clone()],
     }));
@@ -680,7 +687,7 @@ pub(crate) async fn add_network_device(
     if let Some(firewall_config) =
         try_get_location_firewall_config(&network, &mut transaction).await?
     {
-        appstate.send_wireguard_event(GatewayEvent::FirewallConfigChanged(
+        appstate.send_gateway_command(GatewayCommand::FirewallConfigChanged(
             network.id,
             firewall_config,
         ));
@@ -777,14 +784,14 @@ pub async fn modify_network_device(
         wireguard_network_device.wireguard_ips = data.assigned_ips;
         wireguard_network_device.update(&mut *transaction).await?;
         let device_info = DeviceInfo::from_device(&mut *transaction, device.clone()).await?;
-        appstate.send_wireguard_event(GatewayEvent::DeviceModified(device_info));
+        appstate.send_gateway_command(GatewayCommand::DeviceModified(device_info));
 
         // send firewall update event if ACLs are enabled
         if device_network.acl_enabled
             && let Some(firewall_config) =
                 try_get_location_firewall_config(&device_network, &mut transaction).await?
         {
-            appstate.send_wireguard_event(GatewayEvent::FirewallConfigChanged(
+            appstate.send_gateway_command(GatewayCommand::FirewallConfigChanged(
                 device_network.id,
                 firewall_config,
             ));

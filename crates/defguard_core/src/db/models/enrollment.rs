@@ -70,7 +70,7 @@ impl From<TokenError> for Status {
             TokenError::AlreadyActive => (Code::InvalidArgument, "already active"),
             TokenError::TokenExpired => (Code::Unauthenticated, "token expired"),
         };
-        Status::new(code, msg)
+        Self::new(code, msg)
     }
 }
 

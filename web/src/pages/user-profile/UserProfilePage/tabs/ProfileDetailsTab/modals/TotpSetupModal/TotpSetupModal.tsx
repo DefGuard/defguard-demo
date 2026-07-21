@@ -77,6 +77,7 @@ const ModalContent = () => {
       invalidate: [['user', username]],
     },
     onSuccess: (response) => {
+      Snackbar.default(m.modal_mfa_enable_totp_success());
       if (response.data.codes) {
         closeModal(modalName);
         openModal(ModalName.RecoveryCodes, response.data.codes);

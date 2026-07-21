@@ -18,6 +18,7 @@ use crate::{
     enterprise::db::models::{
         activity_log_stream::{ActivityLogStream, ActivityLogStreamType},
         api_tokens::ApiToken,
+        enterprise_settings::EnterpriseSettings,
         openid_provider::{DirectorySyncTarget, DirectorySyncUserBehavior, OpenIdProvider},
         snat::UserSnatBinding,
     },
@@ -113,6 +114,14 @@ pub struct UserMetadata {
 }
 
 #[derive(Serialize)]
+pub struct UserImportBlockedMetadata {
+    pub username: String,
+    pub email: String,
+    pub user_count: u32,
+    pub limit: u32,
+}
+
+#[derive(Serialize)]
 pub struct UserModifiedMetadata {
     pub before: UserNoSecrets,
     pub after: UserNoSecrets,
@@ -186,6 +195,10 @@ pub struct VpnClientMfaMetadata {
     pub location: WireguardNetwork<Id>,
     pub device: Device<Id>,
     pub method: ClientMFAMethod,
+    /// Name of the device used to approve the login when the mobile approve MFA
+    /// method is used. Omitted for all other methods.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mobile_auth_device_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -343,6 +356,12 @@ pub struct SettingsUpdateMetadata {
 }
 
 #[derive(Serialize)]
+pub struct EnterpriseSettingsUpdateMetadata {
+    pub before: EnterpriseSettings,
+    pub after: EnterpriseSettings,
+}
+
+#[derive(Serialize)]
 pub struct SettingsNoSecrets {
     // Modules
     pub openid_enabled: bool,
@@ -361,6 +380,7 @@ pub struct SettingsNoSecrets {
     pub smtp_encryption: SmtpEncryption,
     pub smtp_user: Option<String>,
     pub smtp_sender: Option<String>,
+    pub smtp_tls_verify_cert: bool,
     // Enrollment
     pub enrollment_vpn_step_optional: bool,
     pub enrollment_welcome_message: Option<String>,
@@ -420,6 +440,7 @@ impl From<Settings> for SettingsNoSecrets {
             smtp_encryption: value.smtp.encryption,
             smtp_user: value.smtp.user,
             smtp_sender: value.smtp.sender,
+            smtp_tls_verify_cert: value.smtp.tls_verify_cert,
             enrollment_vpn_step_optional: value.enrollment_vpn_step_optional,
             enrollment_welcome_message: value.enrollment_welcome_message,
             enrollment_welcome_email: value.enrollment_welcome_email,
@@ -514,7 +535,7 @@ pub struct AuthenticationKeyMetadata {
 #[derive(Serialize)]
 pub struct AuthenticationKeyNoSecrets {
     pub id: Id,
-    pub yubikey_id: Option<i64>,
+    pub yubikey_id: Option<Id>,
     pub name: Option<String>,
     pub user_id: Id,
     pub key_type: AuthenticationKeyType,
@@ -591,4 +612,29 @@ pub struct GatewayModifiedMetadata {
 #[derive(Serialize)]
 pub struct GatewayDeletedMetadata {
     pub gateway: Gateway<Id>,
+}
+
+#[derive(Serialize)]
+pub struct ClientDeviceMetadata {
+    pub device_id: Id,
+    pub device_name: String,
+}
+
+#[derive(Serialize)]
+pub struct OidcDirectorySyncUserMetadata {
+    pub provider: String,
+    pub user: UserNoSecrets,
+}
+
+#[derive(Serialize)]
+pub struct OidcDirectorySyncGroupMetadata {
+    pub provider: String,
+    pub group: Group<Id>,
+}
+
+#[derive(Serialize)]
+pub struct OidcDirectorySyncGroupMemberMetadata {
+    pub provider: String,
+    pub group: Group<Id>,
+    pub user: UserNoSecrets,
 }

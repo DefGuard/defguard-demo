@@ -48,6 +48,7 @@ pub struct AddProviderData {
     pub directory_sync_group_match: Option<String>,
     pub jumpcloud_api_key: Option<String>,
     pub prefetch_users: bool,
+    pub disable_password_management: bool,
     pub directory_sync_user_groups: Option<String>,
     // Core settings
     pub create_account: bool,
@@ -104,6 +105,7 @@ pub(crate) async fn add_openid_provider(
                 .jumpcloud_api_key
                 .map(|_| "SECRET".to_string()),
             provider_data.prefetch_users,
+            provider_data.disable_password_management,
             None,
         )
         .upsert(&appstate.pool)
@@ -194,7 +196,7 @@ pub(crate) async fn add_openid_provider(
         } else {
             group_match
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().to_owned())
                 .collect()
         }
     } else {
@@ -208,7 +210,7 @@ pub(crate) async fn add_openid_provider(
             Some(
                 user_groups
                     .split(',')
-                    .map(|s| s.trim().to_string())
+                    .map(|s| s.trim().to_owned())
                     .collect(),
             )
         }
@@ -237,6 +239,7 @@ pub(crate) async fn add_openid_provider(
         group_match,
         provider_data.jumpcloud_api_key,
         provider_data.prefetch_users,
+        provider_data.disable_password_management,
         user_groups,
     )
     .upsert(&appstate.pool)
@@ -477,7 +480,7 @@ pub(crate) async fn modify_openid_provider(
             } else {
                 group_match
                     .split(',')
-                    .map(|s| s.trim().to_string())
+                    .map(|s| s.trim().to_owned())
                     .collect()
             }
         } else {
@@ -491,7 +494,7 @@ pub(crate) async fn modify_openid_provider(
                 Some(
                     user_groups
                         .split(',')
-                        .map(|s| s.trim().to_string())
+                        .map(|s| s.trim().to_owned())
                         .collect(),
                 )
             }

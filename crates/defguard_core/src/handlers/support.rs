@@ -58,6 +58,6 @@ pub(crate) async fn logs(_admin: AdminRole, session: SessionInfo) -> Result<Stri
             }
         }
     } else {
-        Ok("Log file not configured".to_string())
+        Ok("Log file not configured".to_owned())
     }
 }

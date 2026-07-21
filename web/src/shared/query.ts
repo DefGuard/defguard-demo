@@ -208,6 +208,21 @@ export const getSettingsQueryOptions = queryOptions({
   select: (resp) => resp.data,
 });
 
+export const getDevicePostureVersionMetadataQueryOptions = queryOptions({
+  queryFn: api.devicePosture.getDevicePostureVersionMetadata,
+  queryKey: ['device-posture', 'versions'],
+  select: (resp) => resp.data,
+  staleTime: Infinity,
+  refetchOnWindowFocus: false,
+  refetchOnReconnect: true,
+});
+
+export const getDevicePostureQueryOptions = (id: number) =>
+  queryOptions({
+    queryFn: () => api.devicePosture.getDevicePosture(id).then((resp) => resp.data),
+    queryKey: ['device-posture', id],
+  });
+
 export const getOpenIdProvidersQueryOptions = queryOptions({
   queryFn: api.openIdProvider.getOpenIdProvider,
   queryKey: ['openid', 'provider'],

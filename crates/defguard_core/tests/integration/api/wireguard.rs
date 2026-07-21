@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use defguard_common::db::{
     Id,
     models::{
-        Device, WireguardNetwork,
+        Device, User, WireguardNetwork,
         device::WireguardNetworkDevice,
         group::Group,
         settings::OpenIdUsernameHandling,
@@ -15,14 +15,16 @@ use defguard_common::db::{
 };
 use defguard_core::{
     enterprise::{
-        db::models::openid_provider::{
-            DirectorySyncTarget, DirectorySyncUserBehavior, OpenIdProviderKind,
+        db::models::{
+            acl::{AclRule, AclRuleNetwork, AclRuleUser, RuleState},
+            openid_provider::{DirectorySyncTarget, DirectorySyncUserBehavior, OpenIdProviderKind},
         },
         handlers::openid_providers::AddProviderData,
         license::{License, LicenseTier, SupportType, get_cached_license, set_cached_license},
         limits::update_counts,
     },
-    grpc::{GatewayEvent, proto::enterprise::license::LicenseLimits},
+    events::ApiEventType,
+    grpc::{GatewayCommand, proto::enterprise::license::LicenseLimits},
     handlers::{Auth, GroupInfo, wireguard::WireguardNetworkData},
 };
 use ipnetwork::IpNetwork;
@@ -44,7 +46,7 @@ async fn test_network(_: PgPoolOptions, options: PgConnectOptions) {
 
     let (client, client_state) = make_test_client(pool).await;
 
-    let mut wg_rx = client_state.wireguard_rx;
+    let mut gateway_rx = client_state.gateway_rx;
 
     let auth = Auth::new("admin", "pass123");
     let response = &client.post("/api/v1/auth").json(&auth).send().await;
@@ -54,8 +56,8 @@ async fn test_network(_: PgPoolOptions, options: PgConnectOptions) {
     let response = make_network(&client, "network").await;
     let network: WireguardNetwork<Id> = response.json().await;
     assert_eq!(network.name, "network");
-    let event = wg_rx.try_recv().unwrap();
-    assert_matches!(event, GatewayEvent::NetworkCreated(..));
+    let event = gateway_rx.try_recv().unwrap();
+    assert_matches!(event, GatewayCommand::NetworkCreated(..));
 
     // check vpn locations for `admin` group
     let admin_id = Group::find_by_name(&client_state.pool, "admin")
@@ -83,8 +85,10 @@ async fn test_network(_: PgPoolOptions, options: PgConnectOptions) {
         peer_disconnect_threshold: DEFAULT_DISCONNECT_THRESHOLD,
         acl_enabled: false,
         acl_default_allow: false,
+        allowed_ips_from_acl: false,
         location_mfa_mode: LocationMfaMode::Disabled,
         service_location_mode: ServiceLocationMode::Disabled,
+        posture_checks: None,
     };
     let response = client
         .put(format!("/api/v1/network/{}", network.id))
@@ -102,8 +106,8 @@ async fn test_network(_: PgPoolOptions, options: PgConnectOptions) {
         ]
     );
 
-    let event = wg_rx.try_recv().unwrap();
-    assert_matches!(event, GatewayEvent::NetworkModified(..));
+    let event = gateway_rx.try_recv().unwrap();
+    assert_matches!(event, GatewayCommand::NetworkModified(..));
 
     // check vpn locations for `admin` group
     let response = client.get(format!("/api/v1/group/{admin_id}")).send().await;
@@ -134,8 +138,8 @@ async fn test_network(_: PgPoolOptions, options: PgConnectOptions) {
         .send()
         .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let event = wg_rx.try_recv().unwrap();
-    assert_matches!(event, GatewayEvent::NetworkDeleted(..));
+    let event = gateway_rx.try_recv().unwrap();
+    assert_matches!(event, GatewayCommand::NetworkDeleted(..));
 }
 
 #[sqlx::test]
@@ -154,7 +158,7 @@ async fn test_create_network_blocked_when_location_count_exceeds_license_limit(
 
     let license = get_cached_license().clone();
     set_cached_license(Some(License::new(
-        "test_customer".to_string(),
+        "test_customer".to_owned(),
         false,
         None,
         Some(LicenseLimits {
@@ -166,6 +170,7 @@ async fn test_create_network_blocked_when_location_count_exceeds_license_limit(
         None,
         LicenseTier::Business,
         SupportType::Basic,
+        vec![],
     )));
 
     let response = client
@@ -185,6 +190,7 @@ async fn test_create_network_blocked_when_location_count_exceeds_license_limit(
             "peer_disconnect_threshold": 300,
             "acl_enabled": false,
             "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
             "location_mfa_mode": "disabled",
             "service_location_mode": "disabled"
         }))
@@ -193,6 +199,152 @@ async fn test_create_network_blocked_when_location_count_exceeds_license_limit(
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     set_cached_license(license);
+}
+
+#[sqlx::test]
+async fn test_create_network_with_posture_checks_assigns_postures(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (mut client, _client_state) = make_test_client(pool).await;
+    authenticate_admin(&mut client).await;
+    set_enterprise_license();
+
+    let response = client
+        .post("/api/v1/device-posture")
+        .json(&json!({
+            "name": "Posture 1",
+            "description": null,
+            "min_desktop_client_version": null,
+            "min_mobile_client_version": null,
+            "allow_prerelease_client": false,
+            "os_rules": []
+        }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let posture_1: serde_json::Value = response.json().await;
+
+    let response = client
+        .post("/api/v1/device-posture")
+        .json(&json!({
+            "name": "Posture 2",
+            "description": null,
+            "min_desktop_client_version": null,
+            "min_mobile_client_version": null,
+            "allow_prerelease_client": false,
+            "os_rules": []
+        }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let posture_2: serde_json::Value = response.json().await;
+    let posture_ids = vec![
+        posture_1["id"].as_i64().unwrap(),
+        posture_2["id"].as_i64().unwrap(),
+    ];
+    client.drain_all_events();
+
+    let response = client
+        .post("/api/v1/network")
+        .json(&json!({
+            "name": "network-with-postures",
+            "address": "10.1.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.4.14",
+            "allowed_ips": "10.1.1.0/24",
+            "dns": "1.1.1.1",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": false,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled",
+            "posture_checks": posture_ids
+        }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location: serde_json::Value = response.json().await;
+    let location_id = location["id"].as_i64().unwrap();
+
+    let response = client
+        .get(format!("/api/v1/network/{location_id}"))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let network: serde_json::Value = response.json().await;
+    let assigned_postures: Vec<i64> =
+        serde_json::from_value(network["posture_checks"].clone()).unwrap();
+    assert_eq!(assigned_postures.len(), 2);
+    assert!(assigned_postures.contains(&posture_ids[0]));
+    assert!(assigned_postures.contains(&posture_ids[1]));
+
+    for posture_id in posture_ids {
+        let response = client
+            .get(format!("/api/v1/device-posture/{posture_id}"))
+            .send()
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let posture: serde_json::Value = response.json().await;
+        let locations: Vec<i64> = serde_json::from_value(posture["locations"].clone()).unwrap();
+        assert_eq!(locations, vec![location_id]);
+    }
+}
+
+#[sqlx::test]
+async fn test_create_network_with_posture_checks_requires_enterprise_license(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (mut client, mut client_state) = make_test_client(pool).await;
+    authenticate_admin(&mut client).await;
+    client.drain_all_events();
+
+    let response = client
+        .post("/api/v1/network")
+        .json(&json!({
+            "name": "network-without-enterprise-postures",
+            "address": "10.1.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.4.14",
+            "allowed_ips": "10.1.1.0/24",
+            "dns": "1.1.1.1",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": false,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled",
+            "posture_checks": [1]
+        }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    client.assert_event_queue_is_empty();
+    assert_matches!(
+        client_state.gateway_rx.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    );
+
+    let response = client.get("/api/v1/network").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let networks: Vec<serde_json::Value> = response.json().await;
+    assert!(networks.iter().all(|network| {
+        network["name"].as_str() != Some("network-without-enterprise-postures")
+    }));
 }
 
 #[sqlx::test]
@@ -223,8 +375,10 @@ async fn test_location_mfa_mode_validation_create(_: PgPoolOptions, options: PgC
         peer_disconnect_threshold: DEFAULT_DISCONNECT_THRESHOLD,
         acl_enabled: false,
         acl_default_allow: false,
+        allowed_ips_from_acl: false,
         location_mfa_mode: LocationMfaMode::External,
         service_location_mode: ServiceLocationMode::Disabled,
+        posture_checks: None,
     };
 
     // create network
@@ -246,12 +400,12 @@ async fn test_location_mfa_mode_validation_create(_: PgPoolOptions, options: PgC
 
     // add external OpenID provider
     let provider_data = AddProviderData {
-        name: "test".to_string(),
-        base_url: "https://accounts.google.com".to_string(),
+        name: "test".to_owned(),
+        base_url: "https://accounts.google.com".to_owned(),
         kind: OpenIdProviderKind::Custom,
-        client_id: "client_id".to_string(),
-        client_secret: "client_secret".to_string(),
-        display_name: Some("display_name".to_string()),
+        client_id: "client_id".to_owned(),
+        client_secret: "client_secret".to_owned(),
+        display_name: Some("display_name".to_owned()),
         admin_email: None,
         google_service_account_email: None,
         google_service_account_key: None,
@@ -267,6 +421,7 @@ async fn test_location_mfa_mode_validation_create(_: PgPoolOptions, options: PgC
         username_handling: OpenIdUsernameHandling::PruneEmailDomain,
         jumpcloud_api_key: None,
         prefetch_users: false,
+        disable_password_management: false,
         directory_sync_user_groups: None,
     };
 
@@ -309,8 +464,10 @@ async fn test_location_mfa_mode_validation_modify(_: PgPoolOptions, options: PgC
         peer_disconnect_threshold: DEFAULT_DISCONNECT_THRESHOLD,
         acl_enabled: false,
         acl_default_allow: false,
+        allowed_ips_from_acl: false,
         location_mfa_mode: LocationMfaMode::Disabled,
         service_location_mode: ServiceLocationMode::Disabled,
+        posture_checks: None,
     };
 
     // create network
@@ -347,12 +504,12 @@ async fn test_location_mfa_mode_validation_modify(_: PgPoolOptions, options: PgC
 
     // add external OpenID provider
     let provider_data = AddProviderData {
-        name: "test".to_string(),
-        base_url: "https://accounts.google.com".to_string(),
+        name: "test".to_owned(),
+        base_url: "https://accounts.google.com".to_owned(),
         kind: OpenIdProviderKind::Google,
-        client_id: "client_id".to_string(),
-        client_secret: "client_secret".to_string(),
-        display_name: Some("display_name".to_string()),
+        client_id: "client_id".to_owned(),
+        client_secret: "client_secret".to_owned(),
+        display_name: Some("display_name".to_owned()),
         admin_email: None,
         google_service_account_email: None,
         google_service_account_key: None,
@@ -368,6 +525,7 @@ async fn test_location_mfa_mode_validation_modify(_: PgPoolOptions, options: PgC
         username_handling: OpenIdUsernameHandling::PruneEmailDomain,
         jumpcloud_api_key: None,
         prefetch_users: false,
+        disable_password_management: false,
         directory_sync_user_groups: None,
     };
 
@@ -413,8 +571,10 @@ async fn test_peer_disconnect_threshold_validation_create(
         peer_disconnect_threshold: INVALID_MFA_PEER_DISCONNECT_THRESHOLD,
         acl_enabled: false,
         acl_default_allow: false,
+        allowed_ips_from_acl: false,
         location_mfa_mode: LocationMfaMode::Disabled,
         service_location_mode: ServiceLocationMode::Disabled,
+        posture_checks: None,
     };
 
     let response = client
@@ -468,8 +628,10 @@ async fn test_peer_disconnect_threshold_validation_modify(
         peer_disconnect_threshold: INVALID_MFA_PEER_DISCONNECT_THRESHOLD,
         acl_enabled: false,
         acl_default_allow: false,
+        allowed_ips_from_acl: false,
         location_mfa_mode: LocationMfaMode::Disabled,
         service_location_mode: ServiceLocationMode::Disabled,
+        posture_checks: None,
     };
 
     let response = client
@@ -509,7 +671,7 @@ async fn test_device(_: PgPoolOptions, options: PgConnectOptions) {
 
     let (client, client_state) = make_test_client(pool).await;
 
-    let mut wg_rx = client_state.wireguard_rx;
+    let mut gateway_rx = client_state.gateway_rx;
 
     let auth = Auth::new("admin", "pass123");
     let response = &client.post("/api/v1/auth").json(&auth).send().await;
@@ -517,8 +679,8 @@ async fn test_device(_: PgPoolOptions, options: PgConnectOptions) {
 
     // create network
     make_network(&client, "network").await;
-    let event = wg_rx.try_recv().unwrap();
-    assert_matches!(event, GatewayEvent::NetworkCreated(..));
+    let event = gateway_rx.try_recv().unwrap();
+    assert_matches!(event, GatewayCommand::NetworkCreated(..));
 
     // network details
     let response = client.get("/api/v1/network/1").send().await;
@@ -536,8 +698,8 @@ async fn test_device(_: PgPoolOptions, options: PgConnectOptions) {
         .send()
         .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    let event = wg_rx.try_recv().unwrap();
-    assert_matches!(event, GatewayEvent::DeviceCreated(..));
+    let event = gateway_rx.try_recv().unwrap();
+    assert_matches!(event, GatewayCommand::DeviceCreated(..));
 
     // an IP was assigned for new device
     let network_devices = WireguardNetworkDevice::find_by_device(&client_state.pool, 1)
@@ -551,7 +713,10 @@ async fn test_device(_: PgPoolOptions, options: PgConnectOptions) {
 
     // add another network
     make_network(&client, "network").await;
-    assert_matches!(wg_rx.try_recv().unwrap(), GatewayEvent::NetworkCreated(..));
+    assert_matches!(
+        gateway_rx.try_recv().unwrap(),
+        GatewayCommand::NetworkCreated(..)
+    );
 
     // an IP was assigned for an existing device
     let network_devices = WireguardNetworkDevice::find_by_device(&client_state.pool, 1)
@@ -596,8 +761,8 @@ async fn test_device(_: PgPoolOptions, options: PgConnectOptions) {
         .send()
         .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let event = wg_rx.try_recv().unwrap();
-    assert_matches!(event, GatewayEvent::DeviceModified(..));
+    let event = gateway_rx.try_recv().unwrap();
+    assert_matches!(event, GatewayCommand::DeviceModified(..));
 
     // device details
     let response = client
@@ -638,8 +803,8 @@ async fn test_device(_: PgPoolOptions, options: PgConnectOptions) {
         .send()
         .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let event = wg_rx.try_recv().unwrap();
-    assert_matches!(event, GatewayEvent::NetworkDeleted(..));
+    let event = gateway_rx.try_recv().unwrap();
+    assert_matches!(event, GatewayCommand::NetworkDeleted(..));
 
     // delete device
     let response = client
@@ -647,8 +812,8 @@ async fn test_device(_: PgPoolOptions, options: PgConnectOptions) {
         .send()
         .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let event = wg_rx.try_recv().unwrap();
-    assert_matches!(event, GatewayEvent::DeviceDeleted(..));
+    let event = gateway_rx.try_recv().unwrap();
+    assert_matches!(event, GatewayCommand::DeviceDeleted(..));
 
     let response = client.get("/api/v1/device").json(&device).send().await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -737,6 +902,7 @@ async fn test_network_address_reassignment(_: PgPoolOptions, options: PgConnectO
         "peer_disconnect_threshold": 300,
         "acl_enabled": false,
         "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
         "location_mfa_mode": "disabled",
         "service_location_mode": "disabled"
     });
@@ -932,7 +1098,7 @@ async fn test_device_pubkey(_: PgPoolOptions, options: PgConnectOptions) {
 
     let (client, client_state) = make_test_client(pool).await;
 
-    let mut wg_rx = client_state.wireguard_rx;
+    let mut gateway_rx = client_state.gateway_rx;
 
     let auth = Auth::new("admin", "pass123");
     let response = &client.post("/api/v1/auth").json(&auth).send().await;
@@ -940,8 +1106,8 @@ async fn test_device_pubkey(_: PgPoolOptions, options: PgConnectOptions) {
 
     // create network
     make_network(&client, "network").await;
-    let event = wg_rx.try_recv().unwrap();
-    assert_matches!(event, GatewayEvent::NetworkCreated(..));
+    let event = gateway_rx.try_recv().unwrap();
+    assert_matches!(event, GatewayCommand::NetworkCreated(..));
 
     // network details
     let response = client.get("/api/v1/network/1").send().await;
@@ -1065,6 +1231,7 @@ async fn test_network_size_validation(_: PgPoolOptions, options: PgConnectOption
         "peer_disconnect_threshold": 300,
         "acl_enabled": false,
         "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
         "location_mfa_mode": "disabled",
         "service_location_mode": "disabled"
     });
@@ -1092,6 +1259,7 @@ async fn test_network_size_validation(_: PgPoolOptions, options: PgConnectOption
         "peer_disconnect_threshold": 300,
         "acl_enabled": false,
         "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
         "location_mfa_mode": "disabled",
         "service_location_mode": "disabled"
     });
@@ -1222,6 +1390,7 @@ async fn test_user_device_configs_auth(_: PgPoolOptions, options: PgConnectOptio
             "peer_disconnect_threshold": 300,
             "acl_enabled": false,
             "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
             "location_mfa_mode": "disabled",
             "service_location_mode": "disabled"
         }))
@@ -1315,6 +1484,7 @@ async fn test_user_device_configs_excludes_mfa_locations(
             "peer_disconnect_threshold": 300,
             "acl_enabled": false,
             "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
             "location_mfa_mode": "disabled",
             "service_location_mode": "disabled"
         }))
@@ -1341,6 +1511,7 @@ async fn test_user_device_configs_excludes_mfa_locations(
             "peer_disconnect_threshold": 300,
             "acl_enabled": false,
             "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
             "location_mfa_mode": "internal",
             "service_location_mode": "disabled"
         }))
@@ -1379,5 +1550,698 @@ async fn test_user_device_configs_excludes_mfa_locations(
     assert_ne!(
         configs[0].network_id, mfa_location.id,
         "MFA location config must not be returned"
+    );
+}
+
+#[sqlx::test]
+async fn test_location_allowed_ips_from_acl_flag(_: PgPoolOptions, options: PgConnectOptions) {
+    let pool = setup_pool(options).await;
+    let (mut client, _client_state) = make_test_client(pool).await;
+    authenticate_admin(&mut client).await;
+
+    // Create location with flag enabled
+    let create_response = client
+        .post("/api/v1/network")
+        .json(&json!({
+            "name": "acl-ips-location",
+            "address": "10.20.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.20.1",
+            "allowed_ips": "",
+            "dns": "",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": false,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": true,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled"
+        }))
+        .send()
+        .await;
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let location: WireguardNetwork<Id> = create_response.json().await;
+    assert!(
+        location.allowed_ips_from_acl,
+        "flag should be true after create"
+    );
+
+    // Verify API event was emitted for location creation
+    let events = client.drain_all_events();
+    assert_eq!(events.len(), 1, "expected exactly 1 event after create");
+    let (event_type, _user_id, _username) = &events[0];
+    assert_matches!(
+        event_type,
+        ApiEventType::VpnLocationAdded { location: event_location }
+            if event_location.id == location.id && event_location.allowed_ips_from_acl
+    );
+
+    // Edit: toggle flag to false
+    let edit_response_off = client
+        .put(format!("/api/v1/network/{}", location.id))
+        .json(&json!({
+            "name": "acl-ips-location",
+            "address": "10.20.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.20.1",
+            "allowed_ips": "",
+            "dns": "",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": false,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled"
+        }))
+        .send()
+        .await;
+    assert_eq!(edit_response_off.status(), StatusCode::OK);
+    let location_off: WireguardNetwork<Id> = edit_response_off.json().await;
+    assert!(
+        !location_off.allowed_ips_from_acl,
+        "flag should be false after toggle off"
+    );
+
+    let events = client.drain_all_events();
+    assert_eq!(events.len(), 1, "expected exactly 1 event after edit off");
+    let (event_type, _user_id, _username) = &events[0];
+    assert_matches!(
+        event_type,
+        ApiEventType::VpnLocationModified { before: before_loc, after: after_loc }
+            if before_loc.id == location.id
+                && before_loc.allowed_ips_from_acl
+                && after_loc.id == location_off.id
+                && !after_loc.allowed_ips_from_acl
+    );
+
+    // Edit: toggle flag back to true
+    let edit_response_on = client
+        .put(format!("/api/v1/network/{}", location_off.id))
+        .json(&json!({
+            "name": "acl-ips-location",
+            "address": "10.20.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.20.1",
+            "allowed_ips": "",
+            "dns": "",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": false,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": true,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled"
+        }))
+        .send()
+        .await;
+    assert_eq!(edit_response_on.status(), StatusCode::OK);
+    let location_on: WireguardNetwork<Id> = edit_response_on.json().await;
+    assert!(
+        location_on.allowed_ips_from_acl,
+        "flag should be true after toggle back on"
+    );
+
+    let events = client.drain_all_events();
+    assert_eq!(events.len(), 1, "expected exactly 1 event after edit on");
+    let (event_type, _user_id, _username) = &events[0];
+    assert_matches!(
+        event_type,
+        ApiEventType::VpnLocationModified { before: before_loc, after: after_loc }
+            if before_loc.id == location_off.id
+                && !before_loc.allowed_ips_from_acl
+                && after_loc.id == location_on.id
+                && after_loc.allowed_ips_from_acl
+    );
+
+    // Fetch location and verify flag persisted
+    let get_response = client
+        .get(format!("/api/v1/network/{}", location_on.id))
+        .send()
+        .await;
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let fetched: WireguardNetwork<Id> = get_response.json().await;
+    assert!(
+        fetched.allowed_ips_from_acl,
+        "flag should persist across GET fetch"
+    );
+}
+
+/// Set a cached enterprise-tier license for tests that need ACL AllowedIPs.
+fn set_enterprise_license() {
+    set_cached_license(Some(License::new(
+        "test_customer".to_owned(),
+        false,
+        None,
+        None,
+        None,
+        LicenseTier::Enterprise,
+        SupportType::Basic,
+        vec![],
+    )));
+}
+
+/// Parse the AllowedIPs line from a WireGuard config string.
+/// Returns the comma-separated value, e.g. "10.0.0.0/24, 192.168.1.0/24".
+fn parse_allowed_ips_from_config(config: &str) -> String {
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if let Some(ips) = trimmed.strip_prefix("AllowedIPs = ") {
+            return ips.to_owned();
+        }
+    }
+    String::new()
+}
+
+/// Insert an applied ACL rule that allows all users and targets a
+/// specific location with the given destination addresses.
+async fn insert_acl_rule_for_location(
+    pool: &sqlx::PgPool,
+    location_id: Id,
+    destination: IpNetwork,
+) {
+    let mut conn = pool.acquire().await.unwrap();
+    let rule = AclRule {
+        name: "test-acl-rule".into(),
+        state: RuleState::Applied,
+        enabled: true,
+        allow_all_users: true,
+        addresses: vec![destination],
+        any_address: false,
+        any_port: true,
+        any_protocol: true,
+        use_manual_destination_settings: true,
+        ..Default::default()
+    }
+    .save(&mut *conn)
+    .await
+    .unwrap();
+    AclRuleNetwork::new(rule.id, location_id)
+        .save(&mut *conn)
+        .await
+        .unwrap();
+}
+
+/// Insert an applied ACL rule with `any_address: true` that allows all
+/// users and targets a specific location.
+async fn insert_any_address_rule_for_location(pool: &sqlx::PgPool, location_id: Id) {
+    let mut conn = pool.acquire().await.unwrap();
+    let rule = AclRule {
+        name: "test-any-address-rule".into(),
+        state: RuleState::Applied,
+        enabled: true,
+        allow_all_users: true,
+        any_address: true,
+        any_port: true,
+        any_protocol: true,
+        use_manual_destination_settings: true,
+        ..Default::default()
+    }
+    .save(&mut *conn)
+    .await
+    .unwrap();
+    AclRuleNetwork::new(rule.id, location_id)
+        .save(&mut *conn)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test]
+async fn test_config_allowed_ips_from_acl_merged(_: PgPoolOptions, options: PgConnectOptions) {
+    let pool = setup_pool(options).await;
+    let (mut client, _client_state) = make_test_client(pool.clone()).await;
+    set_enterprise_license();
+    authenticate_admin(&mut client).await;
+
+    let create_response = client
+        .post("/api/v1/network")
+        .json(&json!({
+            "name": "acl-merged",
+            "address": "10.30.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.30.1",
+            "allowed_ips": "10.100.0.0/16",
+            "dns": "",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": true,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": true,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled"
+        }))
+        .send()
+        .await;
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let location: WireguardNetwork<Id> = create_response.json().await;
+
+    let acl_destination: IpNetwork = "192.168.1.0/24".parse().unwrap();
+    insert_acl_rule_for_location(&pool, location.id, acl_destination).await;
+
+    let device_payload = json!({
+        "name": "acl-device",
+        "wireguard_pubkey": "LQKsT6/3HWKuJmMulH63R8iK+5sI8FyYEL6WDIi6lQU=",
+    });
+    let device_response = client
+        .post("/api/v1/device/admin")
+        .json(&device_payload)
+        .send()
+        .await;
+    assert_eq!(device_response.status(), StatusCode::CREATED);
+    let device_json: serde_json::Value = device_response.json().await;
+    let device_id = device_json["device"]["id"].as_i64().unwrap();
+
+    let config_response = client
+        .get(format!("/api/v1/device/{device_id}/config"))
+        .send()
+        .await;
+    assert_eq!(config_response.status(), StatusCode::OK);
+    let configs: Vec<serde_json::Value> = config_response.json().await;
+    assert_eq!(configs.len(), 1);
+    let config_text = configs[0]["config"].as_str().unwrap();
+
+    let allowed_ips = parse_allowed_ips_from_config(config_text);
+    assert!(
+        allowed_ips.contains("10.100.0.0/16"),
+        "config should contain manual IP 10.100.0.0/16, got: {allowed_ips}"
+    );
+    assert!(
+        allowed_ips.contains("192.168.1.0/24"),
+        "config should contain ACL-derived IP 192.168.1.0/24, got: {allowed_ips}"
+    );
+}
+
+#[sqlx::test]
+async fn test_config_allowed_ips_from_acl_no_match(_: PgPoolOptions, options: PgConnectOptions) {
+    let pool = setup_pool(options).await;
+    let (mut client, _client_state) = make_test_client(pool.clone()).await;
+    set_enterprise_license();
+    authenticate_admin(&mut client).await;
+
+    let create_response = client
+        .post("/api/v1/network")
+        .json(&json!({
+            "name": "acl-no-match",
+            "address": "10.40.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.40.1",
+            "allowed_ips": "10.100.0.0/16",
+            "dns": "",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": true,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": true,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled"
+        }))
+        .send()
+        .await;
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let location: WireguardNetwork<Id> = create_response.json().await;
+
+    // Create ACL rule that only allows a specific user (not admin).
+    // Create a dummy user for this purpose.
+    let other_user = User::new(
+        "other-user",
+        Some("password"),
+        "Other",
+        "User",
+        "other@example.com",
+        None,
+    )
+    .save(&pool)
+    .await
+    .unwrap();
+
+    let destination: IpNetwork = "192.168.1.0/24".parse().unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let rule = AclRule {
+        name: "other-user-only".into(),
+        state: RuleState::Applied,
+        enabled: true,
+        allow_all_users: false,
+        addresses: vec![destination],
+        any_address: false,
+        any_port: true,
+        any_protocol: true,
+        use_manual_destination_settings: true,
+        ..Default::default()
+    }
+    .save(&mut *conn)
+    .await
+    .unwrap();
+    AclRuleNetwork::new(rule.id, location.id)
+        .save(&mut *conn)
+        .await
+        .unwrap();
+    AclRuleUser::new(rule.id, other_user.id, true)
+        .save(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+
+    let device_payload = json!({
+        "name": "acl-no-match-device",
+        "wireguard_pubkey": "LQKsT6/3HWKuJmMulH63R8iK+5sI8FyYEL6WDIi6lQU=",
+    });
+    let device_response = client
+        .post("/api/v1/device/admin")
+        .json(&device_payload)
+        .send()
+        .await;
+    assert_eq!(device_response.status(), StatusCode::CREATED);
+    let device_json: serde_json::Value = device_response.json().await;
+    let device_id = device_json["device"]["id"].as_i64().unwrap();
+
+    let config_response = client
+        .get(format!("/api/v1/device/{device_id}/config"))
+        .send()
+        .await;
+    assert_eq!(config_response.status(), StatusCode::OK);
+    let configs: Vec<serde_json::Value> = config_response.json().await;
+    assert_eq!(configs.len(), 1);
+    let config_text = configs[0]["config"].as_str().unwrap();
+
+    let allowed_ips = parse_allowed_ips_from_config(config_text);
+    assert!(
+        allowed_ips.contains("10.100.0.0/16"),
+        "config should contain manual IP 10.100.0.0/16, got: {allowed_ips}"
+    );
+    assert!(
+        !allowed_ips.contains("192.168.1.0/24"),
+        "config should NOT contain ACL destination (user does not match), got: {allowed_ips}"
+    );
+}
+
+#[sqlx::test]
+async fn test_config_allowed_ips_from_acl_toggle_off(_: PgPoolOptions, options: PgConnectOptions) {
+    let pool = setup_pool(options).await;
+    let (mut client, _client_state) = make_test_client(pool.clone()).await;
+    set_enterprise_license();
+    authenticate_admin(&mut client).await;
+
+    let create_response = client
+        .post("/api/v1/network")
+        .json(&json!({
+            "name": "acl-toggle-off",
+            "address": "10.50.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.50.1",
+            "allowed_ips": "10.100.0.0/16",
+            "dns": "",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": true,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": false,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled"
+        }))
+        .send()
+        .await;
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let location: WireguardNetwork<Id> = create_response.json().await;
+
+    let destination: IpNetwork = "192.168.1.0/24".parse().unwrap();
+    insert_acl_rule_for_location(&pool, location.id, destination).await;
+
+    let device_payload = json!({
+        "name": "acl-off-device",
+        "wireguard_pubkey": "LQKsT6/3HWKuJmMulH63R8iK+5sI8FyYEL6WDIi6lQU=",
+    });
+    let device_response = client
+        .post("/api/v1/device/admin")
+        .json(&device_payload)
+        .send()
+        .await;
+    assert_eq!(device_response.status(), StatusCode::CREATED);
+    let device_json: serde_json::Value = device_response.json().await;
+    let device_id = device_json["device"]["id"].as_i64().unwrap();
+
+    let config_response = client
+        .get(format!("/api/v1/device/{device_id}/config"))
+        .send()
+        .await;
+    assert_eq!(config_response.status(), StatusCode::OK);
+    let configs: Vec<serde_json::Value> = config_response.json().await;
+    assert_eq!(configs.len(), 1);
+    let config_text = configs[0]["config"].as_str().unwrap();
+
+    let allowed_ips = parse_allowed_ips_from_config(config_text);
+    assert!(
+        allowed_ips.contains("10.100.0.0/16"),
+        "config should contain manual IP 10.100.0.0/16, got: {allowed_ips}"
+    );
+    assert!(
+        !allowed_ips.contains("192.168.1.0/24"),
+        "config should NOT contain ACL IP when toggle is off, got: {allowed_ips}"
+    );
+}
+
+#[sqlx::test]
+async fn test_config_allowed_ips_from_acl_any_address_skipped(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (mut client, _client_state) = make_test_client(pool.clone()).await;
+    set_enterprise_license();
+    authenticate_admin(&mut client).await;
+
+    let create_response = client
+        .post("/api/v1/network")
+        .json(&json!({
+            "name": "acl-any-skipped",
+            "address": "10.60.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.60.1",
+            "allowed_ips": "10.100.0.0/16",
+            "dns": "",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": true,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": true,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled"
+        }))
+        .send()
+        .await;
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let location: WireguardNetwork<Id> = create_response.json().await;
+
+    insert_any_address_rule_for_location(&pool, location.id).await;
+    let concrete_dest: IpNetwork = "192.168.99.0/24".parse().unwrap();
+    insert_acl_rule_for_location(&pool, location.id, concrete_dest).await;
+
+    let device_payload = json!({
+        "name": "acl-any-device",
+        "wireguard_pubkey": "LQKsT6/3HWKuJmMulH63R8iK+5sI8FyYEL6WDIi6lQU=",
+    });
+    let device_response = client
+        .post("/api/v1/device/admin")
+        .json(&device_payload)
+        .send()
+        .await;
+    assert_eq!(device_response.status(), StatusCode::CREATED);
+    let device_json: serde_json::Value = device_response.json().await;
+    let device_id = device_json["device"]["id"].as_i64().unwrap();
+
+    let config_response = client
+        .get(format!("/api/v1/device/{device_id}/config"))
+        .send()
+        .await;
+    assert_eq!(config_response.status(), StatusCode::OK);
+    let configs: Vec<serde_json::Value> = config_response.json().await;
+    assert_eq!(configs.len(), 1);
+    let config_text = configs[0]["config"].as_str().unwrap();
+
+    let allowed_ips = parse_allowed_ips_from_config(config_text);
+    assert!(
+        allowed_ips.contains("10.100.0.0/16"),
+        "config should contain manual IP 10.100.0.0/16, got: {allowed_ips}"
+    );
+    assert!(
+        allowed_ips.contains("192.168.99.0/24"),
+        "config should contain concrete ACL destination 192.168.99.0/24, got: {allowed_ips}"
+    );
+    assert!(
+        !allowed_ips.contains("0.0.0.0/0"),
+        "config should NOT contain 0.0.0.0/0 from any_address rule, got: {allowed_ips}"
+    );
+    assert!(
+        !allowed_ips.contains("::/0"),
+        "config should NOT contain ::/0 from any_address rule, got: {allowed_ips}"
+    );
+}
+
+/// When the enterprise license is not active, the config should only contain
+/// manual AllowedIPs even when the toggle is on.
+#[sqlx::test]
+async fn test_config_allowed_ips_from_acl_no_license(_: PgPoolOptions, options: PgConnectOptions) {
+    let pool = setup_pool(options).await;
+    // Business license is set by make_test_client; no set_enterprise_license().
+    let (mut client, _client_state) = make_test_client(pool.clone()).await;
+    authenticate_admin(&mut client).await;
+
+    let create_response = client
+        .post("/api/v1/network")
+        .json(&json!({
+            "name": "acl-no-license",
+            "address": "10.70.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.70.1",
+            "allowed_ips": "10.100.0.0/16",
+            "dns": "",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": true,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": true,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled"
+        }))
+        .send()
+        .await;
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let location: WireguardNetwork<Id> = create_response.json().await;
+
+    let destination: IpNetwork = "192.168.1.0/24".parse().unwrap();
+    insert_acl_rule_for_location(&pool, location.id, destination).await;
+
+    let device_payload = json!({
+        "name": "acl-no-license-device",
+        "wireguard_pubkey": "LQKsT6/3HWKuJmMulH63R8iK+5sI8FyYEL6WDIi6lQU=",
+    });
+    let device_response = client
+        .post("/api/v1/device/admin")
+        .json(&device_payload)
+        .send()
+        .await;
+    assert_eq!(device_response.status(), StatusCode::CREATED);
+    let device_json: serde_json::Value = device_response.json().await;
+    let device_id = device_json["device"]["id"].as_i64().unwrap();
+
+    let config_response = client
+        .get(format!("/api/v1/device/{device_id}/config"))
+        .send()
+        .await;
+    assert_eq!(config_response.status(), StatusCode::OK);
+    let configs: Vec<serde_json::Value> = config_response.json().await;
+    assert_eq!(configs.len(), 1);
+    let config_text = configs[0]["config"].as_str().unwrap();
+
+    let allowed_ips = parse_allowed_ips_from_config(config_text);
+    assert!(
+        allowed_ips.contains("10.100.0.0/16"),
+        "config should contain manual IP 10.100.0.0/16, got: {allowed_ips}"
+    );
+    assert!(
+        !allowed_ips.contains("192.168.1.0/24"),
+        "config should NOT contain ACL IP without enterprise license, got: {allowed_ips}"
+    );
+}
+
+/// When ACL is not enabled on the location but the toggle is on,
+/// the config should still only contain manual AllowedIPs.
+#[sqlx::test]
+async fn test_config_allowed_ips_from_acl_disabled(_: PgPoolOptions, options: PgConnectOptions) {
+    set_enterprise_license();
+    let pool = setup_pool(options).await;
+    let (mut client, _client_state) = make_test_client(pool.clone()).await;
+    authenticate_admin(&mut client).await;
+
+    let create_response = client
+        .post("/api/v1/network")
+        .json(&json!({
+            "name": "acl-disabled",
+            "address": "10.80.1.1/24",
+            "port": 55555,
+            "endpoint": "192.168.80.1",
+            "allowed_ips": "10.100.0.0/16",
+            "dns": "",
+            "mtu": 1420,
+            "fwmark": 0,
+            "allowed_groups": ["admin"],
+            "allow_all_groups": false,
+            "keepalive_interval": 25,
+            "peer_disconnect_threshold": 300,
+            "acl_enabled": false,
+            "acl_default_allow": false,
+            "allowed_ips_from_acl": true,
+            "location_mfa_mode": "disabled",
+            "service_location_mode": "disabled"
+        }))
+        .send()
+        .await;
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let location: WireguardNetwork<Id> = create_response.json().await;
+
+    let destination: IpNetwork = "192.168.1.0/24".parse().unwrap();
+    insert_acl_rule_for_location(&pool, location.id, destination).await;
+
+    let device_payload = json!({
+        "name": "acl-disabled-device",
+        "wireguard_pubkey": "LQKsT6/3HWKuJmMulH63R8iK+5sI8FyYEL6WDIi6lQU=",
+    });
+    let device_response = client
+        .post("/api/v1/device/admin")
+        .json(&device_payload)
+        .send()
+        .await;
+    assert_eq!(device_response.status(), StatusCode::CREATED);
+    let device_json: serde_json::Value = device_response.json().await;
+    let device_id = device_json["device"]["id"].as_i64().unwrap();
+
+    let config_response = client
+        .get(format!("/api/v1/device/{device_id}/config"))
+        .send()
+        .await;
+    assert_eq!(config_response.status(), StatusCode::OK);
+    let configs: Vec<serde_json::Value> = config_response.json().await;
+    assert_eq!(configs.len(), 1);
+    let config_text = configs[0]["config"].as_str().unwrap();
+
+    let allowed_ips = parse_allowed_ips_from_config(config_text);
+    assert!(
+        allowed_ips.contains("10.100.0.0/16"),
+        "config should contain manual IP 10.100.0.0/16, got: {allowed_ips}"
+    );
+    assert!(
+        !allowed_ips.contains("192.168.1.0/24"),
+        "config should NOT contain ACL IP when ACL disabled, got: {allowed_ips}"
     );
 }

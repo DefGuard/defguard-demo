@@ -1,0 +1,14 @@
+/// Minimum defguard desktop client versions available for posture rules.
+pub const DESKTOP_CLIENT_VERSIONS: &[&str] = &["2.1"];
+
+/// Minimum defguard mobile client versions available for posture rules.
+pub const MOBILE_CLIENT_VERSIONS: &[&str] = &["1.7.0"];
+
+/// Minimum OS versions available for posture checks.
+pub const WINDOWS_OS_VERSIONS: &[i32] = &[10, 11];
+pub const MACOS_OS_VERSIONS: &[i32] = &[13, 14, 15, 26, 27];
+pub const IOS_OS_VERSIONS: &[i32] = &[17, 18, 26, 27];
+pub const ANDROID_OS_VERSIONS: &[i32] = &[13, 14, 15, 16, 17];
+
+/// Valid Linux kernel major versions for posture rules.
+pub const LINUX_KERNEL_VERSIONS: &[i32] = &[5, 6, 7];

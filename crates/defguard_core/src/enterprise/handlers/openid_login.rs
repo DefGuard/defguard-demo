@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use axum::{Json, extract::State, http::StatusCode};
 use axum_extra::{
     TypedHeader,
@@ -24,6 +26,7 @@ use reqwest::Url;
 use serde_json::json;
 use sqlx::PgPool;
 use time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 
 const COOKIE_MAX_AGE: Duration = Duration::days(1);
 static CSRF_COOKIE_NAME: &str = "csrf";
@@ -43,6 +46,7 @@ use crate::{
         limits::{get_counts, update_counts},
     },
     error::WebError,
+    events::{ApiEvent, ApiEventType, ApiRequestContext},
     handlers::{
         ApiResponse, AuthResponse, ClientIpAddr, SESSION_COOKIE_NAME, SIGN_IN_COOKIE_NAME,
         auth::create_session,
@@ -63,12 +67,12 @@ use crate::{
 /// - no whitespaces
 #[must_use]
 pub fn prune_username(username: &str, handling: OpenIdUsernameHandling) -> String {
-    let mut result = username.to_string();
+    let mut result = username.to_owned();
 
     // Go through the string and remove any non-alphanumeric characters at the beginning
     result = result
         .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
-        .to_string();
+        .to_owned();
 
     let is_char_valid = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_';
 
@@ -119,7 +123,7 @@ fn get_async_http_client() -> Result<reqwest::Client, WebError> {
 }
 
 async fn get_provider_metadata(url: &str) -> Result<CoreProviderMetadata, WebError> {
-    let issuer_url = IssuerUrl::new(url.to_string()).map_err(|err| {
+    let issuer_url = IssuerUrl::new(url.to_owned()).map_err(|err| {
         WebError::BadRequest(format!(
             "Failed to create issuer URL from the provided URL: {url}. Error details: {err}",
         ))
@@ -160,7 +164,7 @@ pub(crate) fn extract_state_data(state: &str) -> Option<String> {
         if part1.is_empty() {
             None
         } else {
-            Some(part2.to_string())
+            Some(part2.to_owned())
         }
     } else {
         None
@@ -200,11 +204,20 @@ pub async fn make_oidc_client(
 }
 
 /// Get or create `User` from OpenID claims.
+///
+/// `ip_addr`/`user_agent`/`event_tx` are only used to emit an activity log event
+/// when account creation is blocked by the license user limit. Pass `None` for
+/// `event_tx` only if this call can never create a new account (e.g. the desktop
+/// client MFA flow, which merely re-verifies an existing user's identity);
+/// any caller that can create accounts should supply a real `ApiEvent` sender.
 pub async fn user_from_claims(
     pool: &PgPool,
     nonce: Nonce,
     code: AuthorizationCode,
     callback_url: Url,
+    ip_addr: Option<IpAddr>,
+    user_agent: Option<&str>,
+    event_tx: Option<&UnboundedSender<ApiEvent>>,
 ) -> Result<User<Id>, WebError> {
     let Some(provider) = OpenIdProvider::get_current(pool).await? else {
         return Err(WebError::ObjectNotFound("OpenID provider not set".into()));
@@ -230,7 +243,7 @@ pub async fn user_from_claims(
     };
     let Some(id_token) = token_response.extra_fields().id_token() else {
         return Err(WebError::Authorization(
-            "Server did not return an ID token".to_string(),
+            "Server did not return an ID token".to_owned(),
         ));
     };
 
@@ -410,6 +423,10 @@ pub async fn user_from_claims(
                 }
 
                 if let Some((user_count, limit)) = reached_user_license_limit() {
+                    // Details (username/email/counts) are recorded in the activity
+                    // log and admin notification email, but deliberately not
+                    // returned to the client, which only learns that it should
+                    // contact an administrator.
                     error!(
                         "Skipping OpenID account creation for user {username} (email: {}) because \
                         license user limit has been reached ({user_count}/{limit})",
@@ -421,7 +438,30 @@ pub async fn user_from_claims(
                             {err}"
                         );
                     }
-                    return Err(WebError::Forbidden("License limit reached."));
+                    if let Some(event_tx) = event_tx
+                        && let Err(err) = event_tx.send(ApiEvent {
+                            context: ApiRequestContext::new(
+                                None::<Id>,
+                                username.clone(),
+                                ip_addr,
+                                user_agent.unwrap_or_default().to_string(),
+                            ),
+                            event: Box::new(ApiEventType::UserImportBlocked {
+                                username: username.clone(),
+                                email: email.as_str().to_string(),
+                                user_count,
+                                limit,
+                            }),
+                        })
+                    {
+                        error!(
+                            "Failed to emit activity log event for blocked OpenID account \
+                            creation: {err}"
+                        );
+                    }
+                    return Err(WebError::LicenseLimitReached(
+                        "Could not log in. Please contact your administrator.".to_string(),
+                    ));
                 }
 
                 // Extract all necessary information from the token or call the userinfo endpoint.
@@ -611,12 +651,12 @@ pub async fn auth_callback(
         .get(NONCE_COOKIE_NAME)
         .ok_or(WebError::Authorization("Nonce cookie not found".into()))?
         .value_trimmed()
-        .to_string();
+        .to_owned();
     let cookie_csrf = private_cookies
         .get(CSRF_COOKIE_NAME)
         .ok_or(WebError::BadRequest("CSRF cookie not found".into()))?
         .value_trimmed()
-        .to_string();
+        .to_owned();
 
     // Verify the CSRF token
     if payload.state.secret() != &cookie_csrf {
@@ -634,6 +674,9 @@ pub async fn auth_callback(
         Nonce::new(cookie_nonce),
         payload.code,
         settings.callback_url()?,
+        Some(ip_addr),
+        Some(user_agent.as_str()),
+        Some(&appstate.event_tx),
     )
     .await?;
 
@@ -664,8 +707,14 @@ pub async fn auth_callback(
     // since he already managed to login through the provider. Currently, there is no other way to
     // sync the groups for the MFA enabled user logging in through the provider without firing it on
     // every login attempt, even for standard, non-provider users.
-    if let Err(err) =
-        sync_user_groups_if_configured(&user, &appstate.pool, &appstate.wireguard_tx).await
+    if let Err(err) = sync_user_groups_if_configured(
+        &user,
+        &appstate.pool,
+        &appstate.gateway_tx,
+        &appstate.ldap_tx,
+        &appstate.dirsync_tx,
+    )
+    .await
     {
         error!(
             "Failed to sync user groups for user {} with the directory while the user was trying \
@@ -673,7 +722,13 @@ pub async fn auth_callback(
             user.username
         );
     } else {
-        ldap_update_user_state(&mut user, &appstate.pool, &appstate.wireguard_tx).await;
+        ldap_update_user_state(
+            &mut user,
+            &appstate.pool,
+            &appstate.gateway_tx,
+            &appstate.ldap_tx,
+        )
+        .await;
     }
 
     if let Some(mfa_info) = mfa_info {
@@ -687,7 +742,7 @@ pub async fn auth_callback(
     if let Some(user_info) = user_info {
         let url = if let Some(openid_cookie) = private_cookies.get(SIGN_IN_COOKIE_NAME) {
             debug!("Found OpenID session cookie, returning the redirect URL stored in it.");
-            let url = openid_cookie.value().to_string();
+            let url = openid_cookie.value().to_owned();
             private_cookies = private_cookies.remove(openid_cookie);
             Some(url)
         } else {
@@ -799,7 +854,7 @@ mod test {
         assert!(!token.secret().is_empty());
 
         // with data
-        let data = "somedata".to_string();
+        let data = "somedata".to_owned();
         let token = build_state(Some(data.clone()));
         let decoded = BASE64_STANDARD.decode(token.secret());
         assert!(decoded.is_ok());
@@ -809,7 +864,7 @@ mod test {
         assert_eq!(state_data, data);
 
         // valid
-        let data = "my_state_data".to_string();
+        let data = "my_state_data".to_owned();
         let token = build_state(Some(data.clone()));
         let extracted = extract_state_data(token.secret());
         assert_eq!(extracted, Some(data));
@@ -836,14 +891,14 @@ mod test {
         // multiple dots
         let encoded = BASE64_STANDARD.encode("csrf.data.with.dots");
         let extracted = extract_state_data(&encoded);
-        assert_eq!(extracted, Some("data.with.dots".to_string()));
+        assert_eq!(extracted, Some("data.with.dots".to_owned()));
     }
 
     #[test]
     fn test_reached_user_license_limit_reached() {
         set_counts(Counts::new(2, 0, 0, 0));
         let license = License::new(
-            "test".to_string(),
+            "test".to_owned(),
             false,
             None,
             Some(LicenseLimits {
@@ -855,6 +910,7 @@ mod test {
             None,
             LicenseTier::Business,
             SupportType::Basic,
+            vec![],
         );
         set_cached_license(Some(license));
 
@@ -865,7 +921,7 @@ mod test {
     fn test_reached_user_license_limit_not_reached() {
         set_counts(Counts::new(1, 0, 0, 0));
         let license = License::new(
-            "test".to_string(),
+            "test".to_owned(),
             false,
             None,
             Some(LicenseLimits {
@@ -877,6 +933,7 @@ mod test {
             None,
             LicenseTier::Business,
             SupportType::Basic,
+            vec![],
         );
         set_cached_license(Some(license));
 
@@ -887,13 +944,14 @@ mod test {
     fn test_reached_user_license_limit_unlimited() {
         set_counts(Counts::new(100, 0, 0, 0));
         let license = License::new(
-            "test".to_string(),
+            "test".to_owned(),
             false,
             None,
             None,
             None,
             LicenseTier::Business,
             SupportType::Basic,
+            vec![],
         );
         set_cached_license(Some(license));
 

@@ -9,7 +9,7 @@ use defguard_common::{
     db::models::{Settings, User},
 };
 use ldap3::{
-    LdapConnAsync, LdapConnSettings, Mod, Scope, SearchEntry,
+    LdapConnAsync, LdapConnSettings, Mod, ResultEntry, Scope, SearchEntry,
     adapters::{Adapter, EntriesOnly, PagedResults},
     drive, ldap_escape,
 };
@@ -19,19 +19,34 @@ use crate::enterprise::ldap::model::{extract_rdn_value, is_search_entry};
 
 const STREAMING_PAGE_SIZE: i32 = 500;
 
+/// Decodes a raw result entry, logging and dropping entries that fail.
+fn try_construct_entry(entry: ResultEntry) -> Option<SearchEntry> {
+    match SearchEntry::try_construct(entry) {
+        Ok(entry) => Some(entry),
+        Err(err) => {
+            warn!("Skipping malformed LDAP entry that failed to decode: {err}");
+            None
+        }
+    }
+}
+
 impl LDAPConnection {
     pub async fn create() -> Result<Self, LdapError> {
+        Self::create_with_settings(Settings::get_current_settings()).await
+    }
+
+    /// Establishes an LDAP connection using the provided settings
+    pub async fn create_with_settings(settings: Settings) -> Result<Self, LdapError> {
         if server_config().is_demo_mode {
             return Err(LdapError::Ldap("LDAP is disabled in demo mode".to_string()));
         }
-        let settings = Settings::get_current_settings();
         let config = LDAPConfig::try_from(settings.clone())?;
         let url = settings.ldap_url.ok_or(LdapError::MissingSettings(
-            "LDAP URL is required for LDAP configuration to work".to_string(),
+            "LDAP URL is required for LDAP configuration to work".to_owned(),
         ))?;
         let password = settings
             .ldap_bind_password
-            .ok_or(LdapError::MissingSettings("LDAP bind password".to_string()))?;
+            .ok_or(LdapError::MissingSettings("LDAP bind password".to_owned()))?;
         let conn_settings = LdapConnSettings::new()
             .set_starttls(settings.ldap_use_starttls)
             .set_no_tls_verify(!settings.ldap_tls_verify_cert)
@@ -68,7 +83,7 @@ impl LDAPConnection {
         Ok(entries
             .into_iter()
             .filter(is_search_entry)
-            .map(SearchEntry::construct)
+            .filter_map(try_construct_entry)
             .collect())
     }
 
@@ -86,7 +101,7 @@ impl LDAPConnection {
                     entries.retain(is_search_entry);
                     if let Some(entry) = entries.pop() {
                         debug!("Found LDAP object with DN {dn}: {entry:?}");
-                        Ok(Some(SearchEntry::construct(entry)))
+                        Ok(try_construct_entry(entry))
                     } else {
                         debug!("No LDAP object found with DN {dn}");
                         Ok(None)
@@ -141,7 +156,9 @@ impl LDAPConnection {
 
         let mut groups = Vec::new();
         for entry in entries.into_iter().filter(is_search_entry) {
-            let se = SearchEntry::construct(entry);
+            let Some(se) = try_construct_entry(entry) else {
+                continue;
+            };
             for (key, mut values) in se.attrs {
                 if key.eq_ignore_ascii_case(&self.config.ldap_groupname_attr) {
                     groups.append(&mut values);
@@ -175,7 +192,7 @@ impl LDAPConnection {
         Ok(rs
             .into_iter()
             .filter(is_search_entry)
-            .map(SearchEntry::construct)
+            .filter_map(try_construct_entry)
             .collect())
     }
 
@@ -344,7 +361,9 @@ impl LDAPConnection {
 
         let mut member_entries = Vec::new();
         while let Some(entry) = search_stream.next().await? {
-            member_entries.push(SearchEntry::construct(entry));
+            if let Some(entry) = try_construct_entry(entry) {
+                member_entries.push(entry);
+            }
         }
 
         let members = member_entries
@@ -446,7 +465,9 @@ impl LDAPConnection {
 
         let mut entries = Vec::new();
         while let Some(entry) = search_stream.next().await? {
-            entries.push(SearchEntry::construct(entry));
+            if let Some(entry) = try_construct_entry(entry) {
+                entries.push(entry);
+            }
         }
 
         debug!("Performed LDAP user search");
@@ -485,7 +506,9 @@ impl LDAPConnection {
 
         let mut memberships = Vec::new();
         while let Some(entry) = search_stream.next().await? {
-            memberships.push(SearchEntry::construct(entry));
+            if let Some(entry) = try_construct_entry(entry) {
+                memberships.push(entry);
+            }
         }
 
         debug!("Performed LDAP group memberships search");

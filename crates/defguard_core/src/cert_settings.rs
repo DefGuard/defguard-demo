@@ -1,58 +1,82 @@
 use axum_server::tls_rustls::RustlsConfig;
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, Utc};
 use defguard_certs::{
-    CertificateInfo, Csr, DnType, PemLabel, der_to_pem, generate_key_pair, parse_pem_certificate,
+    CertificateError, CertificateInfo, Csr, DnType, PemLabel, der_to_pem, generate_key_pair,
+    parse_pem_certificate,
 };
 use defguard_common::db::models::{
-    Certificates, CoreCertSource, ProxyCertSource, Settings, settings::update_current_settings,
+    Certificates, CoreCertSource, ProxyCertSource, Settings,
+    settings::{SettingsSaveError, update_current_settings},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use thiserror::Error;
 use utoipa::ToSchema;
 
-use crate::error::WebError;
+/// Errors arising from certificate settings operations.
+#[derive(Debug, Error)]
+pub enum CertSettingsError {
+    #[error("cert_pem is required for own_cert")]
+    MissingCertPem,
+    #[error("key_pem is required for own_cert")]
+    MissingKeyPem,
+    #[error("Invalid certificate or private key PEM")]
+    InvalidCertOrKey,
+    #[error("Certificate validity period is invalid")]
+    InvalidValidityPeriod,
+    #[error("Certificate has expired")]
+    CertExpired,
+    #[error("Certificate is not valid yet")]
+    CertNotYetValid,
+    #[error("Certificate error: {0}")]
+    Cert(#[from] CertificateError),
+    #[error("URL parse error: {0}")]
+    Url(String),
+    #[error("Database error: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("Settings error: {0}")]
+    Settings(#[from] SettingsSaveError),
+    #[error("Not found: {0}")]
+    NotFound(String),
+}
 
 /// Parses an uploaded certificate, validates its key pair, and rejects invalid validity windows.
-async fn parse_cert(cert_pem: &str, key_pem: &str) -> Result<CertificateInfo, WebError> {
+async fn parse_cert(cert_pem: &str, key_pem: &str) -> Result<CertificateInfo, CertSettingsError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     RustlsConfig::from_pem(cert_pem.as_bytes().to_vec(), key_pem.as_bytes().to_vec())
         .await
-        .map_err(|_| WebError::BadRequest("Invalid certificate or private key PEM".to_string()))?;
+        .map_err(|_| CertSettingsError::InvalidCertOrKey)?;
 
     let cert_der = parse_pem_certificate(cert_pem)?;
     let info = CertificateInfo::from_der(cert_der.as_ref())?;
 
     // Validate cert dates
-    let now = chrono::Utc::now().naive_utc();
+    let now = Utc::now().naive_utc();
 
     if info.not_after <= info.not_before {
-        return Err(WebError::BadRequest(
-            "Certificate validity period is invalid".to_string(),
-        ));
+        return Err(CertSettingsError::InvalidValidityPeriod);
     }
 
     if info.not_after <= now {
-        return Err(WebError::BadRequest("Certificate has expired".to_string()));
+        return Err(CertSettingsError::CertExpired);
     }
 
     if info.not_before > now {
-        return Err(WebError::BadRequest(
-            "Certificate is not valid yet".to_string(),
-        ));
+        return Err(CertSettingsError::CertNotYetValid);
     }
 
     Ok(info)
 }
 
-/// Extract a non-empty hostname from `url`, returning a [`WebError`] on failure.
-fn extract_hostname(url: &str, label: &str) -> Result<String, WebError> {
+/// Extract a non-empty hostname from `url`, returning a [`CertSettingsError`] on failure.
+fn extract_hostname(url: &str, label: &str) -> Result<String, CertSettingsError> {
     reqwest::Url::parse(url)
-        .map_err(|e| WebError::BadRequest(format!("Invalid {label}: {e}")))?
+        .map_err(|e| CertSettingsError::Url(format!("Invalid {label}: {e}")))?
         .host_str()
         .filter(|h| !h.is_empty())
-        .map(ToString::to_string)
-        .ok_or_else(|| WebError::BadRequest(format!("{label} has no hostname")))
+        .map(str::to_owned)
+        .ok_or_else(|| CertSettingsError::Url(format!("{label} has no hostname")))
 }
 
 /// SSL configuration type for Defguard's internal (core) web server.
@@ -118,7 +142,7 @@ pub async fn apply_internal_url_settings(
     pool: &PgPool,
     defguard_url: &str,
     config: InternalUrlSettingsConfig,
-) -> Result<Option<CertInfoResponse>, WebError> {
+) -> Result<Option<CertInfoResponse>, CertSettingsError> {
     debug!(
         "Internal URL certificate settings received: defguard_url={}, ssl_type={:?}",
         defguard_url, config.ssl_type,
@@ -129,14 +153,14 @@ pub async fn apply_internal_url_settings(
 
     // Modify url schema if necessary
     settings.defguard_url = match config.ssl_type {
-        InternalSslType::None => defguard_url.to_string(),
+        InternalSslType::None => defguard_url.to_owned(),
         InternalSslType::DefguardCa | InternalSslType::OwnCert => ensure_https(defguard_url),
     };
     update_current_settings(&mut *transaction, settings).await?;
 
     let mut certs = Certificates::get_or_default(&mut *transaction)
         .await
-        .map_err(WebError::from)?;
+        .map_err(CertSettingsError::from)?;
 
     let cert_info = match config.ssl_type {
         InternalSslType::None => {
@@ -147,7 +171,7 @@ pub async fn apply_internal_url_settings(
             certs
                 .save(&mut *transaction)
                 .await
-                .map_err(WebError::from)?;
+                .map_err(CertSettingsError::from)?;
             None
         }
         InternalSslType::DefguardCa => {
@@ -174,7 +198,7 @@ pub async fn apply_internal_url_settings(
             certs
                 .save(&mut *transaction)
                 .await
-                .map_err(WebError::from)?;
+                .map_err(CertSettingsError::from)?;
 
             Some(CertInfoResponse {
                 common_name: info.subject_common_name,
@@ -184,12 +208,8 @@ pub async fn apply_internal_url_settings(
             })
         }
         InternalSslType::OwnCert => {
-            let cert_pem_str = config.cert_pem.ok_or_else(|| {
-                WebError::BadRequest("cert_pem is required for own_cert".to_string())
-            })?;
-            let key_pem_str = config.key_pem.ok_or_else(|| {
-                WebError::BadRequest("key_pem is required for own_cert".to_string())
-            })?;
+            let cert_pem_str = config.cert_pem.ok_or(CertSettingsError::MissingCertPem)?;
+            let key_pem_str = config.key_pem.ok_or(CertSettingsError::MissingKeyPem)?;
 
             let info = parse_cert(&cert_pem_str, &key_pem_str).await?;
             let valid_for_days = (info.not_after.and_utc() - chrono::Utc::now()).num_days();
@@ -202,7 +222,7 @@ pub async fn apply_internal_url_settings(
             certs
                 .save(&mut *transaction)
                 .await
-                .map_err(WebError::from)?;
+                .map_err(CertSettingsError::from)?;
 
             Some(CertInfoResponse {
                 common_name: info.subject_common_name,
@@ -223,7 +243,7 @@ pub async fn apply_external_url_settings(
     pool: &PgPool,
     public_proxy_url: &str,
     config: ExternalUrlSettingsConfig,
-) -> Result<Option<CertInfoResponse>, WebError> {
+) -> Result<Option<CertInfoResponse>, CertSettingsError> {
     debug!(
         "External URL certificate settings received: public_proxy_url={}, ssl_type={:?}",
         public_proxy_url, config.ssl_type,
@@ -232,12 +252,12 @@ pub async fn apply_external_url_settings(
     let mut transaction = pool.begin().await?;
     let mut certs = Certificates::get_or_default(&mut *transaction)
         .await
-        .map_err(WebError::from)?;
+        .map_err(CertSettingsError::from)?;
 
     // Modify url schema if necessary
     let mut settings = Settings::get_current_settings();
     settings.public_proxy_url = match config.ssl_type {
-        ExternalSslType::None | ExternalSslType::LetsEncrypt => public_proxy_url.to_string(),
+        ExternalSslType::None | ExternalSslType::LetsEncrypt => public_proxy_url.to_owned(),
         ExternalSslType::DefguardCa | ExternalSslType::OwnCert => ensure_https(public_proxy_url),
     };
     update_current_settings(&mut *transaction, settings).await?;
@@ -247,8 +267,8 @@ pub async fn apply_external_url_settings(
         ExternalSslType::DefguardCa | ExternalSslType::LetsEncrypt => {
             let url = public_proxy_url.trim();
             if url.is_empty() {
-                return Err(WebError::BadRequest(
-                    "Public proxy URL is not configured".to_string(),
+                return Err(CertSettingsError::Url(
+                    "Public proxy URL is not configured".to_owned(),
                 ));
             }
 
@@ -267,7 +287,7 @@ pub async fn apply_external_url_settings(
             certs
                 .save(&mut *transaction)
                 .await
-                .map_err(WebError::from)?;
+                .map_err(CertSettingsError::from)?;
             None
         }
         ExternalSslType::LetsEncrypt => {
@@ -300,7 +320,7 @@ pub async fn apply_external_url_settings(
             certs
                 .save(&mut *transaction)
                 .await
-                .map_err(WebError::from)?;
+                .map_err(CertSettingsError::from)?;
 
             Some(CertInfoResponse {
                 common_name: info.subject_common_name,
@@ -310,12 +330,8 @@ pub async fn apply_external_url_settings(
             })
         }
         ExternalSslType::OwnCert => {
-            let cert_pem_str = config.cert_pem.ok_or_else(|| {
-                WebError::BadRequest("cert_pem is required for own_cert".to_string())
-            })?;
-            let key_pem_str = config.key_pem.ok_or_else(|| {
-                WebError::BadRequest("key_pem is required for own_cert".to_string())
-            })?;
+            let cert_pem_str = config.cert_pem.ok_or(CertSettingsError::MissingCertPem)?;
+            let key_pem_str = config.key_pem.ok_or(CertSettingsError::MissingKeyPem)?;
 
             let info = parse_cert(&cert_pem_str, &key_pem_str).await?;
             let valid_for_days = (info.not_after.and_utc() - chrono::Utc::now()).num_days();
@@ -329,7 +345,7 @@ pub async fn apply_external_url_settings(
             certs
                 .save(&mut *transaction)
                 .await
-                .map_err(WebError::from)?;
+                .map_err(CertSettingsError::from)?;
 
             Some(CertInfoResponse {
                 common_name: info.subject_common_name,
@@ -348,13 +364,13 @@ pub async fn apply_external_url_settings(
 /// Returns `(cert_pem, key_pem, expiry)` on success.
 pub(crate) async fn refresh_core_self_signed_cert(
     pool: &PgPool,
-) -> Result<(String, String, NaiveDateTime), WebError> {
+) -> Result<(String, String, NaiveDateTime), CertSettingsError> {
     let settings = Settings::get_current_settings();
     let hostname = extract_hostname(&settings.defguard_url, "defguard URL")?;
 
     let mut certs = Certificates::get_or_default(pool)
         .await
-        .map_err(WebError::from)?;
+        .map_err(CertSettingsError::from)?;
 
     let ca = certs.certificate_authority()?;
     let key_pair = generate_key_pair()?;
@@ -373,7 +389,7 @@ pub(crate) async fn refresh_core_self_signed_cert(
     certs.core_http_cert_pem = Some(cert_pem.clone());
     certs.core_http_cert_key_pem = Some(key_pem.clone());
     certs.core_http_cert_expiry = Some(expiry);
-    certs.save(pool).await.map_err(WebError::from)?;
+    certs.save(pool).await.map_err(CertSettingsError::from)?;
 
     Ok((cert_pem, key_pem, expiry))
 }
@@ -382,13 +398,13 @@ pub(crate) async fn refresh_core_self_signed_cert(
 /// Returns `(cert_pem, key_pem, expiry)` on success.
 pub(crate) async fn refresh_proxy_self_signed_cert(
     pool: &PgPool,
-) -> Result<(String, String, NaiveDateTime), WebError> {
+) -> Result<(String, String, NaiveDateTime), CertSettingsError> {
     let settings = Settings::get_current_settings();
     let hostname = extract_hostname(&settings.public_proxy_url, "public proxy URL")?;
 
     let mut certs = Certificates::get_or_default(pool)
         .await
-        .map_err(WebError::from)?;
+        .map_err(CertSettingsError::from)?;
 
     let ca = certs.certificate_authority()?;
     let key_pair = generate_key_pair()?;
@@ -408,7 +424,7 @@ pub(crate) async fn refresh_proxy_self_signed_cert(
     certs.proxy_http_cert_pem = Some(cert_pem.clone());
     certs.proxy_http_cert_key_pem = Some(key_pem.clone());
     certs.proxy_http_cert_expiry = Some(expiry);
-    certs.save(pool).await.map_err(WebError::from)?;
+    certs.save(pool).await.map_err(CertSettingsError::from)?;
 
     Ok((cert_pem, key_pem, expiry))
 }
@@ -416,7 +432,10 @@ pub(crate) async fn refresh_proxy_self_signed_cert(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use defguard_certs::CertificateAuthority;
+    use defguard_certs::{
+        CertificateAuthority, Csr, DnType, ExtendedKeyUsagePurpose, PemLabel, der_to_pem,
+        generate_key_pair,
+    };
     use defguard_common::db::{
         models::{
             Certificates, CoreCertSource, ProxyCertSource, Settings,
@@ -426,8 +445,10 @@ mod tests {
     };
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-    use super::{extract_hostname, refresh_core_self_signed_cert, refresh_proxy_self_signed_cert};
-    use crate::error::WebError;
+    use super::{
+        CertSettingsError, extract_hostname, parse_cert, refresh_core_self_signed_cert,
+        refresh_proxy_self_signed_cert,
+    };
 
     fn make_ca() -> CertificateAuthority<'static> {
         CertificateAuthority::new("Test CA", "test@example.com", 365).expect("failed to create CA")
@@ -471,7 +492,7 @@ mod tests {
     #[test]
     fn extract_hostname_invalid_url() {
         let err = extract_hostname("not-a-url", "defguard URL").unwrap_err();
-        assert!(matches!(err, WebError::BadRequest(_)));
+        assert!(matches!(err, CertSettingsError::Url(_)));
         let msg = err.to_string();
         assert!(
             msg.contains("Invalid defguard URL"),
@@ -482,7 +503,7 @@ mod tests {
     #[test]
     fn extract_hostname_missing_host() {
         let err = extract_hostname("mailto:test@example.com", "public proxy URL").unwrap_err();
-        assert!(matches!(err, WebError::BadRequest(_)));
+        assert!(matches!(err, CertSettingsError::Url(_)));
         let msg = err.to_string();
         assert!(
             msg.contains("public proxy URL has no hostname"),
@@ -493,12 +514,74 @@ mod tests {
     #[test]
     fn extract_hostname_empty_string() {
         let err = extract_hostname("", "defguard URL").unwrap_err();
-        assert!(matches!(err, WebError::BadRequest(_)));
+        assert!(matches!(err, CertSettingsError::Url(_)));
         let msg = err.to_string();
         assert!(
             msg.contains("Invalid defguard URL"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn parse_cert_invalid_pem() {
+        let err = parse_cert("not a certificate", "not a key")
+            .await
+            .err()
+            .expect("expected an error");
+        assert!(matches!(err, CertSettingsError::InvalidCertOrKey));
+    }
+
+    #[tokio::test]
+    async fn parse_cert_key_mismatch() {
+        let ca = make_ca();
+
+        let key_pair = generate_key_pair().expect("failed to generate key pair");
+        let san = vec!["example.com".to_owned()];
+        let dn = vec![(DnType::CommonName, "example.com")];
+        let csr = Csr::new(&key_pair, &san, dn).expect("failed to build CSR");
+        let cert = ca
+            .sign_web_server_cert(&csr)
+            .expect("failed to sign certificate");
+        let cert_pem =
+            der_to_pem(cert.der(), PemLabel::Certificate).expect("failed to encode cert");
+
+        let other_key_pair = generate_key_pair().expect("failed to generate key pair");
+        let mismatched_key_pem = der_to_pem(
+            other_key_pair.serialize_der().as_slice(),
+            PemLabel::PrivateKey,
+        )
+        .expect("failed to encode key");
+
+        let err = parse_cert(&cert_pem, &mismatched_key_pem)
+            .await
+            .err()
+            .expect("expected an error");
+        assert!(matches!(err, CertSettingsError::InvalidCertOrKey));
+    }
+
+    #[tokio::test]
+    async fn parse_cert_expired() {
+        let ca = make_ca();
+
+        let key_pair = generate_key_pair().expect("failed to generate key pair");
+        let san = vec!["example.com".to_owned()];
+        let dn = vec![(DnType::CommonName, "example.com")];
+        let csr = Csr::new(&key_pair, &san, dn).expect("failed to build CSR");
+        let cert = ca
+            .sign_csr_with_validity(&csr, 0, &[ExtendedKeyUsagePurpose::ServerAuth])
+            .expect("failed to sign certificate");
+        let cert_pem =
+            der_to_pem(cert.der(), PemLabel::Certificate).expect("failed to encode cert");
+        let key_pem = der_to_pem(key_pair.serialize_der().as_slice(), PemLabel::PrivateKey)
+            .expect("failed to encode key");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let err = parse_cert(&cert_pem, &key_pem)
+            .await
+            .err()
+            .expect("expected an error");
+        assert!(matches!(err, CertSettingsError::CertExpired));
     }
 
     #[sqlx::test]

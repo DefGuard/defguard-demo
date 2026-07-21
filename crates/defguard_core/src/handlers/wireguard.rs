@@ -9,7 +9,7 @@ use defguard_common::{
     db::{
         Id,
         models::{
-            Device, DeviceConfig, DeviceType, WireguardNetwork,
+            Device, DeviceConfig, DeviceType, User, WireguardNetwork,
             device::{AddDevice, DeviceInfo, ModifyDevice, WireguardNetworkDevice},
             wireguard::{LocationMfaMode, MappedDevice, ServiceLocationMode},
         },
@@ -25,16 +25,20 @@ use super::{ApiResponse, ApiResult, WebError, device_for_admin_or_self, user_for
 use crate::{
     appstate::AppState,
     auth::{AdminRole, SessionInfo},
+    device_access::{build_device_config, join_device_to_all_networks},
     enterprise::{
-        db::models::{enterprise_settings::EnterpriseSettings, openid_provider::OpenIdProvider},
+        db::models::{
+            device_posture::DevicePostureLocation, enterprise_settings::EnterpriseSettings,
+            openid_provider::OpenIdProvider,
+        },
         firewall::try_get_location_firewall_config,
         handlers::CanManageDevices,
-        is_business_license_active, is_enterprise_license_active,
-        license::get_cached_license,
+        has_enterprise_access, is_business_license_active,
+        license::{LicenseFeature, get_cached_license},
         limits::{get_counts, update_counts},
     },
     events::{ApiEvent, ApiEventType, ApiRequestContext},
-    grpc::GatewayEvent,
+    grpc::GatewayCommand,
     handlers::{gateway::GatewayInfo, network_devices::DeviceWireGuardConfig},
     location_management::{
         allowed_peers::get_location_allowed_peers, handle_imported_devices, handle_mapped_devices,
@@ -51,6 +55,7 @@ pub(crate) struct WireguardNetworkInfo {
     gateways: Vec<GatewayInfo>,
     allowed_groups: Vec<String>,
     has_devices: bool,
+    posture_checks: Vec<Id>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -74,8 +79,11 @@ pub struct WireguardNetworkData {
     pub peer_disconnect_threshold: i32,
     pub acl_enabled: bool,
     pub acl_default_allow: bool,
+    #[serde(default)]
+    pub allowed_ips_from_acl: bool,
     pub location_mfa_mode: LocationMfaMode,
     pub service_location_mode: ServiceLocationMode,
+    pub posture_checks: Option<Vec<i64>>,
 }
 
 const MIN_PEER_DISCONNECT_THRESHOLD_WITH_MFA: i32 = 120;
@@ -212,7 +220,7 @@ pub(crate) async fn create_network(
 
     // check if tries to add service location without active enterprise
     if data.service_location_mode != ServiceLocationMode::Disabled
-        && !is_enterprise_license_active()
+        && !has_enterprise_access(Some(LicenseFeature::ServiceLocations))
     {
         error!("Adding location {network_name} blocked! Enterprise license required.");
         return Ok(ApiResponse {
@@ -237,6 +245,7 @@ pub(crate) async fn create_network(
         data.allow_all_groups,
         data.acl_enabled,
         data.acl_default_allow,
+        data.allowed_ips_from_acl,
         data.location_mfa_mode,
         data.service_location_mode,
     )
@@ -256,9 +265,27 @@ pub(crate) async fn create_network(
     network.add_all_allowed_devices(&mut transaction).await?;
     info!("Assigning IPs for existing devices in network {network}");
 
-    appstate.send_wireguard_event(GatewayEvent::NetworkCreated(network.id, network.clone()));
+    // assign posture checks
+    if let Some(ref posture_checks) = data.posture_checks {
+        debug!("Assigning posture checks {posture_checks:?} to {network}");
+        if !has_enterprise_access(Some(LicenseFeature::DevicePosture)) && !posture_checks.is_empty()
+        {
+            error!(
+                "Cannot assign posture checks to new location {network}: Enterprise license required."
+            );
+            return Ok(WebError::Forbidden(
+                "Cannot assign posture checks to new location: Enterprise license required.",
+            )
+            .into());
+        }
+        DevicePostureLocation::set_for_location(&mut transaction, network.id, posture_checks)
+            .await?;
+        info!("Assigned posture checks {posture_checks:?} to new location {network}");
+    }
 
     transaction.commit().await?;
+
+    appstate.send_gateway_command(GatewayCommand::NetworkCreated(network.id, network.clone()));
 
     info!(
         "User {} created WireGuard network {network_name}",
@@ -321,7 +348,7 @@ pub(crate) async fn modify_network(
 
     // check if tries to modify service location without active enterprise
     if data.service_location_mode != ServiceLocationMode::Disabled
-        && !is_enterprise_license_active()
+        && !has_enterprise_access(Some(LicenseFeature::ServiceLocations))
     {
         let name = data.name;
         error!("Modification of location {name} blocked! Enterprise license required.");
@@ -357,6 +384,7 @@ pub(crate) async fn modify_network(
     network.allow_all_groups = data.allow_all_groups;
     network.acl_enabled = data.acl_enabled;
     network.acl_default_allow = data.acl_default_allow;
+    network.allowed_ips_from_acl = data.allowed_ips_from_acl;
     network.service_location_mode = if data.location_mfa_mode == LocationMfaMode::Disabled {
         data.service_location_mode
     } else {
@@ -374,10 +402,10 @@ pub(crate) async fn modify_network(
         .await?;
     let _events = sync_location_allowed_devices(&network, &mut transaction, None).await?;
 
-    let peers = get_location_allowed_peers(&network, &mut *transaction).await?;
+    let peers = get_location_allowed_peers(&network, &mut transaction).await?;
     let maybe_firewall_config =
         try_get_location_firewall_config(&network, &mut transaction).await?;
-    appstate.send_wireguard_event(GatewayEvent::NetworkModified(
+    appstate.send_gateway_command(GatewayCommand::NetworkModified(
         network.id,
         network.clone(),
         peers,
@@ -444,7 +472,7 @@ pub(crate) async fn delete_network(
     }
     network.clone().delete(&mut *transaction).await?;
     transaction.commit().await?;
-    appstate.send_wireguard_event(GatewayEvent::NetworkDeleted(network_id, network_name));
+    appstate.send_gateway_command(GatewayCommand::NetworkDeleted(network_id, network_name));
     info!(
         "User {} deleted WireGuard network {network_id}",
         session.user.username,
@@ -490,11 +518,14 @@ pub async fn list_networks(_role: AdminRole, State(appstate): State<AppState>) -
         let gateways = GatewayInfo::find_by_location_id(&appstate.pool, network.id).await?;
         let has_devices =
             WireguardNetworkDevice::has_devices_in_network(&appstate.pool, network.id).await?;
+        let posture_checks =
+            DevicePostureLocation::find_by_location(&appstate.pool, network.id).await?;
         network_info.push(WireguardNetworkInfo {
             network,
             gateways,
             allowed_groups,
             has_devices,
+            posture_checks,
         });
     }
     network_info.sort_by(|a, b| a.network.name.cmp(&b.network.name));
@@ -574,11 +605,14 @@ pub(crate) async fn network_details(
             let gateways = GatewayInfo::find_by_location_id(&appstate.pool, network_id).await?;
             let has_devices =
                 WireguardNetworkDevice::has_devices_in_network(&appstate.pool, network_id).await?;
+            let posture_checks =
+                DevicePostureLocation::find_by_location(&appstate.pool, network_id).await?;
             let network_info = WireguardNetworkInfo {
                 network,
                 gateways,
                 allowed_groups,
                 has_devices,
+                posture_checks,
             };
             ApiResponse::json(network_info, StatusCode::OK)
         }
@@ -645,7 +679,7 @@ pub(crate) async fn import_network(
         .await?;
 
     info!("New network {network} created");
-    appstate.send_wireguard_event(GatewayEvent::NetworkCreated(network.id, network.clone()));
+    appstate.send_gateway_command(GatewayCommand::NetworkCreated(network.id, network.clone()));
 
     let reserved_ips = imported_devices
         .iter()
@@ -653,13 +687,13 @@ pub(crate) async fn import_network(
         .collect::<Vec<_>>();
     let (devices, gateway_events) =
         handle_imported_devices(&network, &mut transaction, imported_devices).await?;
-    appstate.send_multiple_wireguard_events(gateway_events);
+    appstate.send_multiple_gateway_commands(gateway_events);
 
     // assign IPs for other existing devices
     debug!("Assigning IPs in imported network for remaining existing devices");
     let gateway_events =
         sync_location_allowed_devices(&network, &mut transaction, Some(&reserved_ips)).await?;
-    appstate.send_multiple_wireguard_events(gateway_events);
+    appstate.send_multiple_gateway_commands(gateway_events);
     debug!("Assigned IPs in imported network for remaining existing devices");
 
     transaction.commit().await?;
@@ -706,7 +740,7 @@ pub(crate) async fn add_user_devices(
         // wrap loop in transaction to abort if a device is invalid
         let mut transaction = appstate.pool.begin().await?;
         let events = handle_mapped_devices(&network, &mut transaction, &mapped_devices).await?;
-        appstate.send_multiple_wireguard_events(events);
+        appstate.send_multiple_gateway_commands(events);
         transaction.commit().await?;
 
         info!(
@@ -859,9 +893,10 @@ pub(crate) async fn add_device(
     .save(&mut *transaction)
     .await?;
 
-    let (network_info, configs) = device.add_to_all_networks(&mut transaction).await?;
+    let (network_info, configs) =
+        join_device_to_all_networks(&mut transaction, &device, &user).await?;
 
-    // prepare a list of gateway events to be sent
+    // prepare a list of gateway commands to be sent
     let mut events = Vec::new();
 
     // get all locations affected by device being added
@@ -881,7 +916,7 @@ pub(crate) async fn add_device(
                 "Sending firewall config update for location {location} affected by adding new \
                     user {username} devices"
             );
-            events.push(GatewayEvent::FirewallConfigChanged(
+            events.push(GatewayCommand::FirewallConfigChanged(
                 location_id,
                 firewall_config,
             ));
@@ -889,12 +924,12 @@ pub(crate) async fn add_device(
     }
 
     // add peer on relevant gateways
-    events.push(GatewayEvent::DeviceCreated(DeviceInfo {
+    events.push(GatewayCommand::DeviceCreated(DeviceInfo {
         device: device.clone(),
         network_info: network_info.clone(),
     }));
 
-    appstate.send_multiple_wireguard_events(events);
+    appstate.send_multiple_gateway_commands(events);
 
     let template_locations = configs
         .iter()
@@ -999,17 +1034,32 @@ pub(crate) async fn modify_device(
     debug!("User {} updating device {device_id}", session.user.username);
 
     let settings = EnterpriseSettings::get(&appstate.pool).await?;
-    if settings.only_client_activation && !session.is_admin {
+    if settings.admin_device_management && !session.is_admin {
         warn!(
-            "User {} tried to add a device, but manual device management is disaled",
+            "User {} tried to edit a device, but manual device management is disaled",
             session.user.username
         );
         return Err(WebError::Forbidden("Manual device management is disabled"));
     }
 
     let mut device = device_for_admin_or_self(&appstate.pool, &session, device_id).await?;
-    // store device before mods
     let before = device.clone();
+
+    if settings.only_client_activation
+        && !session.is_admin
+        && (data.wireguard_pubkey != before.wireguard_pubkey
+            || data.description != before.description)
+    {
+        warn!(
+            "User {} tried to modify fields other than device name for device {device_id}, but \
+            only client activation is enabled",
+            session.user.username
+        );
+        return Err(WebError::BadRequest(
+            "Only the device name can be edited when only client activation is enabled".into(),
+        ));
+    }
+
     let networks = WireguardNetwork::all(&appstate.pool).await?;
 
     if networks.is_empty() {
@@ -1049,7 +1099,7 @@ pub(crate) async fn modify_device(
             network_info.push(device_network_info);
         }
     }
-    appstate.send_wireguard_event(GatewayEvent::DeviceModified(DeviceInfo {
+    appstate.send_gateway_command(GatewayCommand::DeviceModified(DeviceInfo {
         device: device.clone(),
         network_info,
     }));
@@ -1173,7 +1223,7 @@ pub(crate) async fn delete_device(
             debug!(
                 "Sending firewall config update for location {location} affected by deleting user {username} device"
             );
-            events.push(GatewayEvent::FirewallConfigChanged(
+            events.push(GatewayCommand::FirewallConfigChanged(
                 location.id,
                 firewall_config,
             ));
@@ -1181,10 +1231,10 @@ pub(crate) async fn delete_device(
     }
 
     let device_id = device_info.device.id;
-    events.push(GatewayEvent::DeviceDeleted(device_info.clone()));
+    events.push(GatewayCommand::DeviceDeleted(device_info.clone()));
 
-    // send generated gateway events
-    appstate.send_multiple_wireguard_events(events);
+    // send generated gateway commands
+    appstate.send_multiple_gateway_commands(events);
 
     // Emit event specific to the device type.
     match device.device_type {
@@ -1335,11 +1385,20 @@ pub(crate) async fn download_config(
 
     let network = find_network(network_id, &appstate.pool).await?;
     let device = device_for_admin_or_self(&appstate.pool, &session, device_id).await?;
+    let user = User::find_by_id(&appstate.pool, device.user_id)
+        .await?
+        .ok_or(WebError::ObjectNotFound(format!(
+            "User {} not found",
+            device.user_id
+        )))?;
     let wireguard_network_device =
         WireguardNetworkDevice::find(&appstate.pool, device_id, network_id).await?;
     if let Some(wireguard_network_device) = wireguard_network_device {
         info!("Created config for device {}({device_id})", device.name);
-        Ok(Device::create_config(&network, &wireguard_network_device))
+        let mut conn = appstate.pool.acquire().await?;
+        let device_config =
+            build_device_config(&mut conn, &network, &wireguard_network_device, &user).await?;
+        Ok(device_config.config)
     } else {
         error!(
             "Failed to create config, no IP address found for device: {}({})",
@@ -1372,6 +1431,12 @@ pub(crate) async fn user_device_configs(
     }
 
     let device = device_for_admin_or_self(&appstate.pool, &session, device_id).await?;
+    let user = User::find_by_id(&appstate.pool, device.user_id)
+        .await?
+        .ok_or(WebError::ObjectNotFound(format!(
+            "User {} not found",
+            device.user_id
+        )))?;
     let locations = WireguardNetwork::find_user_device_networks(&appstate.pool, device_id).await?;
 
     let mut result = Vec::new();
@@ -1386,12 +1451,14 @@ pub(crate) async fn user_device_configs(
             "Created WireGuard config for user device {device_id} in location {}.",
             location.name
         );
-        let config = Device::create_config(&location, &location_device);
+        let mut conn = appstate.pool.acquire().await?;
+        let device_config =
+            build_device_config(&mut conn, &location, &location_device, &user).await?;
         result.push(DeviceWireGuardConfig {
-            network_id: location.id,
-            network_name: location.name,
-            config,
-            location_mfa_mode: location.location_mfa_mode.clone(),
+            network_id: device_config.network_id,
+            network_name: device_config.network_name,
+            config: device_config.config,
+            location_mfa_mode: device_config.location_mfa_mode,
         });
     }
 

@@ -4,6 +4,7 @@
 //! generating its WireGuard configuration.
 
 use defguard_common::{
+    config::server_config,
     db::{
         Id,
         models::{
@@ -51,7 +52,7 @@ pub async fn build_device_config(
         keepalive_interval: network.keepalive_interval,
         location_mfa_mode: network.location_mfa_mode.clone(),
         service_location_mode: network.service_location_mode.clone(),
-        posture_check_required: has_postures,
+        posture_check_required: has_postures && !server_config().is_demo_mode,
     })
 }
 

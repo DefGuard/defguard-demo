@@ -25,6 +25,7 @@ import { Snackbar } from '../../../../../../../shared/defguard-ui/providers/snac
 import { ThemeSpacing } from '../../../../../../../shared/defguard-ui/types';
 import { isPresent } from '../../../../../../../shared/defguard-ui/utils/isPresent';
 import { formChangeLogic } from '../../../../../../../shared/formLogic';
+import { useApp } from '../../../../../../../shared/hooks/useApp';
 import { useTimer } from '../../../../../../../shared/hooks/useTimer';
 import { useUserProfile } from '../../../../hooks/useUserProfilePage';
 
@@ -83,6 +84,7 @@ const defaultValues: FormFields = {
 
 const ModalContent = () => {
   const user = useUserProfile((s) => s.user);
+  const demoMode = useApp((s) => s.appInfo.demo_mode);
 
   const { mutateAsync: enableMfa } = useMutation({
     mutationFn: api.auth.mfa.email.enable,
@@ -124,6 +126,10 @@ const ModalContent = () => {
       onChange: formSchema,
     },
     onSubmit: async ({ value, formApi }) => {
+      if (demoMode) {
+        Snackbar.error(m.demo_mode_feature_disabled());
+        return;
+      }
       await enableMfa(value.code).catch((e: AxiosError<ApiError>) => {
         const errorCode = e.response?.status;
         if (errorCode && errorCode < 500) {
@@ -217,6 +223,7 @@ const ModalContent = () => {
             loading={isResending}
             disabled={resendSecondsLeft > 0}
             onClick={() => {
+              if (demoMode) return;
               form.reset();
               resendEmail();
             }}

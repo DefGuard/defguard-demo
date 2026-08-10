@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
 };
 use defguard_common::{
+    config::server_config,
     db::{
         Id,
         models::{
@@ -23,7 +24,10 @@ use crate::{
     enterprise::{
         db::models::enterprise_settings::EnterpriseSettings,
         handlers::LicenseInfo,
-        ldap::{LDAPConnection, sync::Authority},
+        ldap::{
+            LDAPConnection,
+            sync::{Authority, LdapDryRunAction, LdapDryRunResult, LdapDryRunUser},
+        },
         license::{
             License, LicenseTier, get_cached_license, update_cached_license, validate_license,
         },
@@ -60,6 +64,13 @@ pub async fn get_settings(_admin: AdminRole, State(appstate): State<AppState>) -
         }
         if settings.main_logo_url.is_empty() {
             settings.main_logo_url = DEFAULT_MAIN_LOGO_URL.into();
+        }
+        if server_config().is_demo_mode {
+            settings.secret_key = None;
+            settings.license = None;
+            settings.smtp.password = None;
+            settings.smtp.oauth_client_secret = None;
+            settings.smtp.oauth_refresh_token = None;
         }
         return Ok(ApiResponse::json(settings, StatusCode::OK));
     }
@@ -102,6 +113,17 @@ pub(crate) async fn update_settings(
 
     data.uuid = before.uuid;
     data.validate()?;
+
+    if server_config().is_demo_mode && data.demo_locked_fields_differ(&before) {
+        return Err(WebError::Forbidden(
+            "This setting is read-only in demo mode",
+        ));
+    }
+
+    if server_config().is_demo_mode {
+        data.ldap_bind_password = data.ldap_bind_password.map(|_| "SECRET".parse().unwrap());
+    }
+
     // clone for event
     let after = data.clone();
 
@@ -289,6 +311,18 @@ pub async fn patch_settings(
     settings.apply(data);
     settings.validate()?;
 
+    if server_config().is_demo_mode && settings.demo_locked_fields_differ(&before) {
+        return Err(WebError::Forbidden(
+            "This setting is read-only in demo mode",
+        ));
+    }
+
+    if server_config().is_demo_mode {
+        settings.ldap_bind_password = settings
+            .ldap_bind_password
+            .map(|_| "SECRET".parse().unwrap());
+    }
+
     // clone for event
     let after = settings.clone();
     update_current_settings(&appstate.pool, settings).await?;
@@ -364,6 +398,9 @@ pub async fn patch_settings(
 )]
 pub(crate) async fn test_ldap_settings(_admin: AdminRole, _license: LicenseInfo) -> ApiResult {
     debug!("Testing LDAP connection");
+    if server_config().is_demo_mode {
+        return Ok(ApiResponse::with_status(StatusCode::OK));
+    }
     match LDAPConnection::create().await {
         Ok(_) => {
             debug!("LDAP connected successfully");
@@ -373,6 +410,57 @@ pub(crate) async fn test_ldap_settings(_admin: AdminRole, _license: LicenseInfo)
             debug!("LDAP connection rejected: {err}");
             Ok(ApiResponse::with_status(StatusCode::BAD_REQUEST))
         }
+    }
+}
+
+fn demo_ldap_dry_run_result() -> LdapDryRunResult {
+    LdapDryRunResult {
+        defguard: vec![
+            LdapDryRunUser {
+                username: "j.smith".to_string(),
+                email: "j.smith@example.com".to_string(),
+                first_name: "John".to_string(),
+                last_name: "Smith".to_string(),
+                action: LdapDryRunAction::Add,
+            },
+            LdapDryRunUser {
+                username: "a.johnson".to_string(),
+                email: "a.johnson@example.com".to_string(),
+                first_name: "Anna".to_string(),
+                last_name: "Johnson".to_string(),
+                action: LdapDryRunAction::Add,
+            },
+            LdapDryRunUser {
+                username: "p.brown".to_string(),
+                email: "p.brown@example.com".to_string(),
+                first_name: "Peter".to_string(),
+                last_name: "Brown".to_string(),
+                action: LdapDryRunAction::Remove,
+            },
+        ],
+        ldap: vec![
+            LdapDryRunUser {
+                username: "m.davis".to_string(),
+                email: "m.davis@example.com".to_string(),
+                first_name: "Maria".to_string(),
+                last_name: "Davis".to_string(),
+                action: LdapDryRunAction::Add,
+            },
+            LdapDryRunUser {
+                username: "t.wilson".to_string(),
+                email: "t.wilson@example.com".to_string(),
+                first_name: "Thomas".to_string(),
+                last_name: "Wilson".to_string(),
+                action: LdapDryRunAction::Remove,
+            },
+            LdapDryRunUser {
+                username: "k.miller".to_string(),
+                email: "k.miller@example.com".to_string(),
+                first_name: "Kate".to_string(),
+                last_name: "Miller".to_string(),
+                action: LdapDryRunAction::Remove,
+            },
+        ],
     }
 }
 
@@ -399,10 +487,16 @@ pub(crate) async fn test_ldap_settings(_admin: AdminRole, _license: LicenseInfo)
 pub(crate) async fn test_submitted_ldap_settings(
     _admin: AdminRole,
     _license: LicenseInfo,
-    Json(settings): Json<Settings>,
+    Json(_settings): Json<Settings>,
 ) -> ApiResult {
     debug!("Testing LDAP connection with provided settings");
-    match LDAPConnection::create_with_settings(settings).await {
+    if server_config().is_demo_mode {
+        return Ok(ApiResponse::json(
+            demo_ldap_dry_run_result(),
+            StatusCode::OK,
+        ));
+    }
+    match LDAPConnection::create_with_settings(_settings).await {
         Ok(_) => {
             debug!("LDAP connected successfully");
             Ok(ApiResponse::with_status(StatusCode::OK))
@@ -445,6 +539,14 @@ pub(crate) async fn ldap_dry_run(
     Json(settings): Json<Settings>,
 ) -> ApiResult {
     debug!("Performing LDAP dry run with provided settings");
+
+    if server_config().is_demo_mode {
+        return Ok(ApiResponse::json(
+            demo_ldap_dry_run_result(),
+            StatusCode::OK,
+        ));
+    }
+
     let authority = if settings.ldap_is_authoritative {
         Authority::LDAP
     } else {

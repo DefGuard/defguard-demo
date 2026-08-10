@@ -4,9 +4,12 @@ use std::{
     time::Duration,
 };
 
-use defguard_common::db::{
-    Id,
-    models::{Settings, group::Group, user::User},
+use defguard_common::{
+    config::server_config,
+    db::{
+        Id,
+        models::{Settings, group::Group, user::User},
+    },
 };
 use paste::paste;
 use reqwest::header::AUTHORIZATION;
@@ -15,6 +18,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast::Sender, mpsc::UnboundedSender};
 
 use super::{
+    REQUEST_TIMEOUT,
     db::models::{
         openid_provider::{DirectorySyncTarget, OpenIdProvider},
         user_directory_identity::UserDirectoryIdentity,
@@ -40,7 +44,6 @@ use crate::{
     user_management::{delete_user_and_cleanup_devices, disable_user, sync_allowed_user_devices},
 };
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_PAGINATION_SLOWDOWN: Duration = Duration::from_millis(100);
 
 fn emit_directory_sync_events(
@@ -444,6 +447,11 @@ pub(crate) async fn test_directory_sync_connection(
         return Ok(());
     }
 
+    if server_config().is_demo_mode {
+        debug!("Demo mode is enabled, skipping testing directory sync connection");
+        return Ok(());
+    }
+
     match DirectorySyncClient::build(pool).await {
         Ok(mut dir_sync) => {
             dir_sync.prepare().await?;
@@ -468,6 +476,11 @@ pub async fn sync_user_groups_if_configured(
     #[cfg(not(test))]
     if !is_business_license_active() {
         debug!("Enterprise is not enabled, skipping syncing user groups");
+        return Ok(());
+    }
+
+    if server_config().is_demo_mode {
+        debug!("Demo mode is enabled, skipping syncing user groups");
         return Ok(());
     }
 
@@ -1252,7 +1265,7 @@ pub(crate) async fn get_directory_sync_interval(pool: &PgPool) -> u64 {
 }
 
 // Performs the directory sync job. This function is called by the utility thread.
-pub(crate) async fn do_directory_sync(
+pub async fn do_directory_sync(
     pool: &PgPool,
     gateway_tx: &Sender<GatewayCommand>,
     ldap_tx: &UnboundedSender<LdapSyncEventType>,
@@ -1261,6 +1274,11 @@ pub(crate) async fn do_directory_sync(
     #[cfg(not(test))]
     if !is_business_license_active() {
         debug!("Enterprise is not enabled, skipping performing directory sync");
+        return Ok(());
+    }
+
+    if server_config().is_demo_mode {
+        debug!("Demo mode is enabled, skipping performing directory sync");
         return Ok(());
     }
 

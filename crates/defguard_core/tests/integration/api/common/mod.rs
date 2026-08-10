@@ -48,7 +48,7 @@ use tokio::{
 use self::client::TestClient;
 use crate::{
     api::common::client::TestResponse,
-    common::{init_config, initialize_users},
+    common::{init_config, init_demo_config, initialize_users},
 };
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -183,6 +183,20 @@ pub(crate) async fn make_test_client(pool: PgPool) -> (TestClient, ClientState) 
         .expect("Could not bind ephemeral socket");
     let port = listener.local_addr().unwrap().port();
     let config = init_config(Some(&format!("http://localhost:{port}")), &pool).await;
+    initialize_users(&pool).await;
+    initialize_current_settings(&pool)
+        .await
+        .expect("Could not initialize settings");
+    make_base_client(pool, config, listener).await
+}
+
+pub(crate) async fn make_test_client_demo(pool: PgPool) -> (TestClient, ClientState) {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let listener = TcpListener::bind(addr)
+        .await
+        .expect("Could not bind ephemeral socket");
+    let port = listener.local_addr().unwrap().port();
+    let config = init_demo_config(Some(&format!("http://localhost:{port}")), &pool).await;
     initialize_users(&pool).await;
     initialize_current_settings(&pool)
         .await

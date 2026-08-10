@@ -3,7 +3,7 @@ use defguard_common::db::models::{ActiveWizard, User, Wizard};
 use serde::Serialize;
 
 use super::{ApiErrorResponse, ApiResponse, ApiResult};
-use crate::{appstate::AppState, auth::SessionExtractor, error::WebError};
+use crate::{appstate::AppState, auth::SessionExtractor, error::WebError, server_config};
 
 #[derive(Serialize)]
 struct SessionInfoResponse {
@@ -11,6 +11,7 @@ struct SessionInfoResponse {
     is_admin: bool,
     active_wizard: Option<ActiveWizard>,
     username: Option<String>,
+    demo_mode: bool,
 }
 
 /// Get information about the current session
@@ -35,6 +36,7 @@ pub async fn get_session_info(
     session: Result<SessionExtractor, WebError>,
 ) -> ApiResult {
     let pool = &appstate.pool;
+    let demo_mode = server_config().is_demo_mode;
     let wizard = Wizard::get(pool).await?;
     let active_wizard = if wizard.completed {
         None
@@ -49,6 +51,7 @@ pub async fn get_session_info(
                 is_admin: false,
                 active_wizard,
                 username: None,
+                demo_mode,
             },
             StatusCode::OK,
         ));
@@ -61,6 +64,7 @@ pub async fn get_session_info(
                 is_admin: false,
                 active_wizard,
                 username: None,
+                demo_mode,
             },
             StatusCode::OK,
         ));
@@ -74,6 +78,7 @@ pub async fn get_session_info(
             is_admin: user_admin,
             active_wizard,
             username: Some(user.username),
+            demo_mode,
         },
         StatusCode::OK,
     ))

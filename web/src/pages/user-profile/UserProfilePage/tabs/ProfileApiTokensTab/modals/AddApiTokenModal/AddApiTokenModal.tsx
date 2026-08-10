@@ -10,6 +10,7 @@ import { InfoBanner } from '../../../../../../../shared/defguard-ui/components/I
 import { Modal } from '../../../../../../../shared/defguard-ui/components/Modal/Modal';
 import { ModalControls } from '../../../../../../../shared/defguard-ui/components/ModalControls/ModalControls';
 import { SizedBox } from '../../../../../../../shared/defguard-ui/components/SizedBox/SizedBox';
+import { Snackbar } from '../../../../../../../shared/defguard-ui/providers/snackbar/snackbar';
 import { ThemeSpacing } from '../../../../../../../shared/defguard-ui/types';
 import { isPresent } from '../../../../../../../shared/defguard-ui/utils/isPresent';
 import { useAppForm } from '../../../../../../../shared/form';
@@ -21,6 +22,7 @@ import {
 } from '../../../../../../../shared/hooks/modalControls/modalsSubjects';
 import { ModalName } from '../../../../../../../shared/hooks/modalControls/modalTypes';
 import type { OpenAddApiTokenModal } from '../../../../../../../shared/hooks/modalControls/types';
+import { useApp } from '../../../../../../../shared/hooks/useApp';
 import { nameValidator } from '../../../../../../../shared/validators';
 
 const modalNameKey = ModalName.AddApiToken;
@@ -68,6 +70,7 @@ const defaultValues: FormFields = {
 
 const ModalContent = ({ username }: OpenAddApiTokenModal) => {
   const [token, setToken] = useState<string | null>(null);
+  const demoMode = useApp((s) => s.appInfo.demo_mode);
 
   const { mutateAsync } = useMutation({
     mutationFn: api.user.addApiToken,
@@ -87,6 +90,10 @@ const ModalContent = ({ username }: OpenAddApiTokenModal) => {
       onChange: formSchema,
     },
     onSubmit: async ({ value }) => {
+      if (demoMode) {
+        Snackbar.error(m.demo_mode_feature_disabled());
+        return;
+      }
       await mutateAsync({
         name: value.name,
         username,

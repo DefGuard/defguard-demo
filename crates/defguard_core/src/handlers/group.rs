@@ -4,11 +4,14 @@ use axum::{
     extract::{Json, Path, Query, State},
     http::StatusCode,
 };
-use defguard_common::db::{
-    Id,
-    models::{
-        User,
-        group::{Group, Permission},
+use defguard_common::{
+    config::server_config,
+    db::{
+        Id,
+        models::{
+            User,
+            group::{Group, Permission},
+        },
     },
 };
 use sqlx::query_as;
@@ -405,6 +408,11 @@ pub(crate) async fn modify_group(
         error!(msg);
         return Err(WebError::ObjectNotFound(msg));
     };
+    if server_config().is_demo_mode && group.is_admin {
+        return Err(WebError::Forbidden(
+            "Modifying admin groups is disabled in demo mode",
+        ));
+    }
     // store group before modifications
     let before = group.clone();
 
@@ -702,6 +710,11 @@ pub(crate) async fn remove_group_member(
     Path((id, username)): Path<(i64, String)>,
 ) -> ApiResult {
     if let Some(group) = Group::find_by_id(&appstate.pool, id).await? {
+        if server_config().is_demo_mode && group.is_admin {
+            return Err(WebError::Forbidden(
+                "Modifying admin groups is disabled in demo mode",
+            ));
+        }
         if let Some(user) = User::find_by_username(&appstate.pool, &username).await? {
             debug!(
                 "Removing user: {} from group: {}",

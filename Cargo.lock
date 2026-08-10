@@ -1709,7 +1709,6 @@ dependencies = [
  "defguard_grpc_tls",
  "defguard_proto",
  "defguard_version",
- "hyper-rustls",
  "hyper-util",
  "ipnetwork",
  "jsonwebkey",
@@ -1752,9 +1751,7 @@ name = "defguard_setup"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "async-stream",
  "axum",
- "axum-client-ip",
  "axum-extra",
  "chrono",
  "defguard_certs",
@@ -1763,7 +1760,6 @@ dependencies = [
  "defguard_proto",
  "defguard_version",
  "defguard_web_ui",
- "futures",
  "ipnetwork",
  "rcgen",
  "reqwest",
@@ -1781,14 +1777,10 @@ dependencies = [
 name = "defguard_static_ip"
 version = "0.0.0"
 dependencies = [
- "anyhow",
- "axum",
  "defguard_common",
  "serde",
- "serde_json",
  "sqlx",
  "thiserror 2.0.19",
- "tokio",
  "tracing",
 ]
 

@@ -1,11 +1,14 @@
 use std::{collections::HashSet, future::Future};
 
-use defguard_common::db::{
-    Id,
-    models::{
-        Settings, User,
-        group::Group,
-        settings::{LdapSyncStatus, update_current_settings},
+use defguard_common::{
+    config::server_config,
+    db::{
+        Id,
+        models::{
+            Settings, User,
+            group::Group,
+            settings::{LdapSyncStatus, update_current_settings},
+        },
     },
 };
 #[cfg(not(test))]
@@ -45,7 +48,7 @@ pub mod utils;
 ///
 /// This function may trigger either full and incremental sync based on the current sync status.
 /// Sets LDAP sync status to OutOfSync if any errors occur during the process.
-pub(crate) async fn do_ldap_sync(
+pub async fn do_ldap_sync(
     pool: &PgPool,
     wg_tx: &Sender<GatewayCommand>,
     ldap_tx: &UnboundedSender<LdapSyncEventType>,
@@ -65,6 +68,11 @@ pub(crate) async fn do_ldap_sync(
 
     if !settings.ldap_sync_enabled {
         debug!("LDAP sync is disabled, not performing LDAP sync");
+        return Ok(());
+    }
+
+    if server_config().is_demo_mode {
+        debug!("Demo mode is enabled, not performing LDAP sync");
         return Ok(());
     }
 

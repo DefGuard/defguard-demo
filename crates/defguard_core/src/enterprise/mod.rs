@@ -13,6 +13,7 @@ pub mod posture;
 pub mod snat;
 mod utils;
 
+use defguard_common::config::server_config;
 use license::{License, get_cached_license, validate_license};
 use limits::get_counts;
 use strum::VariantArray;
@@ -53,6 +54,10 @@ pub fn is_business_license_active() -> bool {
 /// flag; passing `None` gates strictly on the Enterprise tier (no flag can satisfy it).
 #[must_use]
 pub fn has_enterprise_access(feature: Option<LicenseFeature>) -> bool {
+    if server_config().is_demo_mode {
+        return true;
+    }
+
     let counts = get_counts();
     let license = get_cached_license();
     let Some(license) = license.as_ref() else {
@@ -70,6 +75,10 @@ pub fn has_enterprise_access(feature: Option<LicenseFeature>) -> bool {
 /// Shared logic for gating features to specific license tiers
 fn is_license_tier_active(tier: LicenseTier) -> bool {
     trace!("Checking if features for {tier} license tier should be enabled");
+
+    if server_config().is_demo_mode {
+        return true;
+    }
 
     // get current object counts
     let counts = get_counts();

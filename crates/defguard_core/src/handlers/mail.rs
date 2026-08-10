@@ -16,6 +16,7 @@ use crate::{
     PgPool,
     appstate::AppState,
     auth::{AdminRole, SessionInfo},
+    error::WebError,
     mail::{
         Attachment,
         templates::{self, SUPPORT_EMAIL_ADDRESS},
@@ -57,6 +58,11 @@ pub(crate) async fn test_mail(
         "User {} sending test mail to {}",
         session.user.username, data.to
     );
+
+    if server_config().is_demo_mode {
+        debug!("Demo mode enabled; skipping test mail to {}", data.to);
+        return Ok(ApiResponse::with_status(StatusCode::OK));
+    }
 
     let mut conn = appstate.pool.begin().await?;
     let result = templates::test_mail(&data.to, &mut conn, Some(&session.session.into())).await;
@@ -117,6 +123,12 @@ pub async fn send_support_data(
     State(appstate): State<AppState>,
 ) -> ApiResult {
     debug!("User {} sending support mail", session.user.username);
+
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "Sending support data is disabled in demo mode",
+        ));
+    }
 
     let mut conn = appstate.pool.begin().await?;
     let proxies = Proxy::all(&mut *conn).await?;

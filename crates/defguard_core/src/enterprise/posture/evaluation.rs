@@ -245,10 +245,7 @@ pub(crate) async fn validate_posture(
 
     // In demo mode allow managing posture policies but never enforce them.
     if server_config().is_demo_mode {
-        debug!(
-            "Demo mode enabled - skipping posture enforcement for device {}",
-            request.pubkey
-        );
+        debug!("Demo mode enabled - skipping posture enforcement for device {pubkey}");
         return Ok(PostureResult::Pass);
     }
 

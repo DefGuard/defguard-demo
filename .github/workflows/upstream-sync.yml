@@ -1,0 +1,48 @@
+name: Weekly upstream sync
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      SYNC_BASE_BRANCH: release/2.1
+      SYNC_UPSTREAM_BRANCH: release/2.1
+      SYNC_PR_BRANCH: sync/upstream-release-2.1
+    steps:
+      - name: Expose branch variables
+        id: branches
+        run: |
+          echo "base=$SYNC_BASE_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "upstream=$SYNC_UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "pr_branch=$SYNC_PR_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout fork
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.branches.outputs.base }}
+          fetch-depth: 0
+
+      - name: Pull in upstream ${{ steps.branches.outputs.upstream }}
+        run: |
+          git remote add upstream https://github.com/defguard/defguard.git
+          git fetch upstream "$SYNC_UPSTREAM_BRANCH"
+          git reset --hard "upstream/$SYNC_UPSTREAM_BRANCH"
+          rm -rf .github/workflows
+          git checkout "origin/$SYNC_BASE_BRANCH" -- .github/workflows
+
+      - name: Create or update pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.SYNC_PAT }}
+          branch: ${{ steps.branches.outputs.pr_branch }}
+          base: ${{ steps.branches.outputs.base }}
+          title: "Weekly upstream sync: ${{ steps.branches.outputs.upstream }}"
+          body: "Automated weekly sync from upstream defguard/defguard ${{ steps.branches.outputs.upstream }} (workflows excluded). Review and merge manually."

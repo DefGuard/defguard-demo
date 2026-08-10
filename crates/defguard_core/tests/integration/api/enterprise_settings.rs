@@ -1,9 +1,11 @@
 use std::time::Duration;
 
-use defguard_common::types::proxy::ProxyControlMessage;
+use defguard_common::{db::models::group::Group, types::proxy::ProxyControlMessage};
 use defguard_core::{
     enterprise::{
-        db::models::enterprise_settings::{ClientTrafficPolicy, EnterpriseSettings},
+        db::models::enterprise_settings::{
+            ClientTrafficPolicy, EnterpriseSettings, EnterpriseSettingsInfo,
+        },
         license::{get_cached_license, set_cached_license},
     },
     events::ApiEventType,
@@ -40,6 +42,7 @@ async fn test_only_enterprise_can_modify_enterpise_settings(
         admin_device_management: false,
         client_traffic_policy: ClientTrafficPolicy::None,
         only_client_activation: false,
+        disable_tunnels: false,
         display_download_step: true,
         display_password_reset: true,
     };
@@ -108,6 +111,7 @@ async fn test_admin_devices_management_is_enforced(_: PgPoolOptions, options: Pg
         admin_device_management: true,
         client_traffic_policy: ClientTrafficPolicy::None,
         only_client_activation: false,
+        disable_tunnels: false,
         display_download_step: true,
         display_password_reset: true,
     };
@@ -224,6 +228,7 @@ async fn test_regular_user_device_management(_: PgPoolOptions, options: PgConnec
         admin_device_management: false,
         client_traffic_policy: ClientTrafficPolicy::None,
         only_client_activation: false,
+        disable_tunnels: false,
         display_download_step: true,
         display_password_reset: true,
     };
@@ -332,6 +337,7 @@ async fn dg25_12_test_enforce_client_activation_only(_: PgPoolOptions, options: 
         admin_device_management: false,
         client_traffic_policy: ClientTrafficPolicy::None,
         only_client_activation: true,
+        disable_tunnels: false,
         display_download_step: true,
         display_password_reset: true,
     };
@@ -458,6 +464,7 @@ async fn dg25_13_test_disable_device_config(_: PgPoolOptions, options: PgConnect
         admin_device_management: false,
         client_traffic_policy: ClientTrafficPolicy::None,
         only_client_activation: true,
+        disable_tunnels: false,
         display_download_step: true,
         display_password_reset: true,
     };
@@ -510,6 +517,7 @@ async fn test_display_flags_round_trip(_: PgPoolOptions, options: PgConnectOptio
         admin_device_management: false,
         client_traffic_policy: ClientTrafficPolicy::None,
         only_client_activation: false,
+        disable_tunnels: false,
         display_download_step: false,
         display_password_reset: false,
     };
@@ -523,13 +531,13 @@ async fn test_display_flags_round_trip(_: PgPoolOptions, options: PgConnectOptio
     // Read back and verify the values persisted
     let response = client.get("/api/v1/settings_enterprise").send().await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body: EnterpriseSettings = response.json().await;
+    let body: EnterpriseSettingsInfo = response.json().await;
     assert!(
-        !body.display_download_step,
+        !body.settings.display_download_step,
         "display_download_step should be false"
     );
     assert!(
-        !body.display_password_reset,
+        !body.settings.display_password_reset,
         "display_password_reset should be false"
     );
 
@@ -538,6 +546,49 @@ async fn test_display_flags_round_trip(_: PgPoolOptions, options: PgConnectOptio
         admin_device_management: false,
         client_traffic_policy: ClientTrafficPolicy::None,
         only_client_activation: false,
+        disable_tunnels: false,
+        display_download_step: true,
+        display_password_reset: true,
+    };
+    let response = client
+        .patch("/api/v1/settings_enterprise")
+        .json(&settings)
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Read back and verify
+    let response = client.get("/api/v1/settings_enterprise").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: EnterpriseSettingsInfo = response.json().await;
+    assert!(
+        body.settings.display_download_step,
+        "display_download_step should be true"
+    );
+    assert!(
+        body.settings.display_password_reset,
+        "display_password_reset should be true"
+    );
+}
+
+#[sqlx::test]
+async fn test_disable_tunnels_round_trip(_: PgPoolOptions, options: PgConnectOptions) {
+    let pool = setup_pool(options).await;
+
+    // admin login
+    let (client, _) = make_test_client(pool).await;
+    let auth = Auth::new("admin", "pass123");
+    let response = client.post("/api/v1/auth").json(&auth).send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    exceed_enterprise_limits(&client).await;
+
+    // Set disable_tunnels to true
+    let settings = EnterpriseSettings {
+        admin_device_management: false,
+        client_traffic_policy: ClientTrafficPolicy::None,
+        only_client_activation: false,
+        disable_tunnels: true,
         display_download_step: true,
         display_password_reset: true,
     };
@@ -552,14 +603,29 @@ async fn test_display_flags_round_trip(_: PgPoolOptions, options: PgConnectOptio
     let response = client.get("/api/v1/settings_enterprise").send().await;
     assert_eq!(response.status(), StatusCode::OK);
     let body: EnterpriseSettings = response.json().await;
-    assert!(
-        body.display_download_step,
-        "display_download_step should be true"
-    );
-    assert!(
-        body.display_password_reset,
-        "display_password_reset should be true"
-    );
+    assert!(body.disable_tunnels, "disable_tunnels should be true");
+
+    // Set back to false
+    let settings = EnterpriseSettings {
+        admin_device_management: false,
+        client_traffic_policy: ClientTrafficPolicy::None,
+        only_client_activation: false,
+        disable_tunnels: false,
+        display_download_step: true,
+        display_password_reset: true,
+    };
+    let response = client
+        .patch("/api/v1/settings_enterprise")
+        .json(&settings)
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Read back and verify
+    let response = client.get("/api/v1/settings_enterprise").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: EnterpriseSettings = response.json().await;
+    assert!(!body.disable_tunnels, "disable_tunnels should be false");
 }
 
 #[sqlx::test]
@@ -733,4 +799,143 @@ async fn test_public_settings_broadcast_on_save(_: PgPoolOptions, options: PgCon
             panic!("BroadcastPublicSettings should not be sent when flags didn't change");
         }
     }
+}
+
+#[sqlx::test]
+async fn test_group_client_traffic_policies_are_saved_and_validated(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = setup_pool(options).await;
+    let (client, _) = make_test_client(pool.clone()).await;
+    let auth = Auth::new("admin", "pass123");
+    assert_eq!(
+        client
+            .post("/api/v1/auth")
+            .json(&auth)
+            .send()
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    exceed_enterprise_limits(&client).await;
+
+    let allow_choice = Group::new("allow-choice").save(&pool).await.unwrap();
+    let disable = Group::new("disable").save(&pool).await.unwrap();
+
+    let response = client
+        .patch("/api/v1/settings_enterprise")
+        .json(&json!({
+            "client_traffic_policy": "force_all_traffic",
+            "group_client_traffic_policies": {
+                "none": [allow_choice.id],
+                "disable_all_traffic": [disable.id],
+                "force_all_traffic": []
+            }
+        }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = client.get("/api/v1/settings_enterprise").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let settings: EnterpriseSettingsInfo = response.json().await;
+    assert_eq!(
+        settings.group_client_traffic_policies.none,
+        vec![allow_choice.id]
+    );
+    assert_eq!(
+        settings.group_client_traffic_policies.disable_all_traffic,
+        vec![disable.id]
+    );
+    assert!(
+        settings
+            .group_client_traffic_policies
+            .force_all_traffic
+            .is_empty()
+    );
+
+    let license = get_cached_license().clone();
+    set_cached_license(None);
+    let response = client.get("/api/v1/settings_enterprise").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let settings: EnterpriseSettingsInfo = response.json().await;
+    assert_eq!(
+        settings.group_client_traffic_policies.none,
+        vec![allow_choice.id]
+    );
+    assert_eq!(
+        settings.group_client_traffic_policies.disable_all_traffic,
+        vec![disable.id]
+    );
+    set_cached_license(license);
+
+    let response = client
+        .patch("/api/v1/settings_enterprise")
+        .json(&json!({"display_download_step": false}))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = client.get("/api/v1/settings_enterprise").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let settings: EnterpriseSettingsInfo = response.json().await;
+    assert_eq!(
+        settings.group_client_traffic_policies.none,
+        vec![allow_choice.id]
+    );
+    assert_eq!(
+        settings.group_client_traffic_policies.disable_all_traffic,
+        vec![disable.id]
+    );
+
+    let response = client
+        .patch("/api/v1/settings_enterprise")
+        .json(&json!({
+            "group_client_traffic_policies": {
+                "none": [allow_choice.id],
+                "disable_all_traffic": [allow_choice.id],
+                "force_all_traffic": []
+            }
+        }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = client.get("/api/v1/settings_enterprise").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let settings: EnterpriseSettingsInfo = response.json().await;
+    assert_eq!(
+        settings.group_client_traffic_policies.none,
+        vec![allow_choice.id]
+    );
+    assert_eq!(
+        settings.group_client_traffic_policies.disable_all_traffic,
+        vec![disable.id]
+    );
+
+    let response = client
+        .patch("/api/v1/settings_enterprise")
+        .json(&json!({
+            "group_client_traffic_policies": {
+                "none": [999999],
+                "disable_all_traffic": [],
+                "force_all_traffic": []
+            }
+        }))
+        .send()
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = client.get("/api/v1/settings_enterprise").send().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let settings: EnterpriseSettingsInfo = response.json().await;
+    assert_eq!(
+        settings.group_client_traffic_policies.none,
+        vec![allow_choice.id]
+    );
+    assert_eq!(
+        settings.group_client_traffic_policies.disable_all_traffic,
+        vec![disable.id]
+    );
 }

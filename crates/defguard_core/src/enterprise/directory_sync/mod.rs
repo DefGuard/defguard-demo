@@ -19,7 +19,10 @@ use tokio::sync::{broadcast::Sender, mpsc::UnboundedSender};
 
 use super::{
     REQUEST_TIMEOUT,
-    db::models::openid_provider::{DirectorySyncTarget, OpenIdProvider},
+    db::models::{
+        openid_provider::{DirectorySyncTarget, OpenIdProvider},
+        user_directory_identity::UserDirectoryIdentity,
+    },
     ldap::utils::ldap_update_users_state,
 };
 #[cfg(not(test))]
@@ -120,6 +123,8 @@ pub mod okta;
 pub mod testprovider;
 #[cfg(test)]
 pub mod tests;
+#[cfg(test)]
+pub mod tests_cross_provider;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DirectoryGroup {
@@ -487,6 +492,16 @@ pub async fn sync_user_groups_if_configured(
         debug!("Directory sync is disabled, skipping syncing user groups");
         return Ok(());
     }
+    if !matches!(
+        provider.directory_sync_target,
+        DirectorySyncTarget::All | DirectorySyncTarget::Groups
+    ) {
+        debug!(
+            "Directory sync target is set to {}, skipping syncing user groups",
+            provider.directory_sync_target
+        );
+        return Ok(());
+    }
 
     match DirectorySyncClient::build(pool).await {
         Ok(mut dir_sync) => {
@@ -729,7 +744,7 @@ async fn sync_all_users_state(
     ldap_tx: &UnboundedSender<LdapSyncEventType>,
     dirsync_tx: &UnboundedSender<DirectorySyncEvent>,
     all_users: &[DirectoryUser],
-    prefetch_allowed_emails: Option<HashSet<String>>,
+    allowed_emails: Option<HashSet<String>>,
 ) -> Result<(), DirectorySyncError> {
     info!("Syncing all users' state with the directory, this may take a while...");
     let mut transaction = pool.begin().await?;
@@ -743,7 +758,7 @@ async fn sync_all_users_state(
     let prefetch_users = settings.prefetch_users;
 
     let is_allowed_user = |user: &DirectoryUser| -> bool {
-        prefetch_allowed_emails
+        allowed_emails
             .as_ref()
             .is_none_or(|allowed| allowed.contains(&user.email))
     };
@@ -807,6 +822,49 @@ async fn sync_all_users_state(
             .filter(|user| is_allowed_user(user))
             .collect();
 
+        // Backfill the directory identity for users who already exist in Defguard but don't have
+        // an identity mapping stored yet, e.g. they were created before prefetch was enabled,
+        // imported some other way, or have only ever logged in via SSO.
+        let directory_ids_by_email: HashMap<&str, &str> = all_users
+            .iter()
+            .filter_map(|u| u.id.as_deref().map(|id| (u.email.as_str(), id)))
+            .collect();
+        for existing_user in &existing_users {
+            if let Some(&directory_id) = directory_ids_by_email.get(existing_user.email.as_str()) {
+                let provider_id = settings.id;
+                let existing_identity = UserDirectoryIdentity::find_by_user_and_provider(
+                    &mut *transaction,
+                    existing_user.id,
+                    provider_id,
+                )
+                .await?;
+                if existing_identity.is_none() {
+                    let claimed_by = UserDirectoryIdentity::find_user_by_provider_external_id(
+                        &mut *transaction,
+                        provider_id,
+                        directory_id,
+                    )
+                    .await?;
+                    if claimed_by.is_some_and(|user_id| user_id != existing_user.id) {
+                        warn!(
+                            "Directory id {directory_id} matches Defguard user {} by email, but \
+                            is already mapped to a different Defguard user. Skipping identity \
+                            backfill.",
+                            existing_user.username
+                        );
+                        continue;
+                    }
+                    UserDirectoryIdentity::upsert(
+                        &mut *transaction,
+                        existing_user.id,
+                        provider_id,
+                        directory_id,
+                    )
+                    .await?;
+                }
+            }
+        }
+
         let core_settings = Settings::get_current_settings();
 
         // create missing users
@@ -819,6 +877,59 @@ async fn sync_all_users_state(
                     );
                 }
                 Some(details) => {
+                    // The directory ID uniquely identifies a user regardless of their email
+                    // address. If it matches an existing Defguard user, the user's email was
+                    // changed in the directory rather than the user being new. Update the
+                    // existing user instead of trying to create a duplicate.
+                    if let Some(directory_id) = &directory_user.id
+                        && let Some(user_id) =
+                            UserDirectoryIdentity::find_user_by_provider_external_id(
+                                &mut *transaction,
+                                settings.id,
+                                directory_id,
+                            )
+                            .await?
+                        && let Some(mut existing_user) =
+                            User::find_by_ids(&mut *transaction, &[user_id])
+                                .await?
+                                .pop()
+                    {
+                        // Another Defguard user may already occupy the new email address (e.g. a
+                        // manually created account). Skip this user.
+                        if let Some(conflicting_user) =
+                            User::find_by_email(&mut *transaction, &directory_user.email).await?
+                            && conflicting_user.id != existing_user.id
+                        {
+                            error!(
+                                "Cannot change email of user {} from {} to {} because that email \
+                                is already used by another Defguard user ({}). Skipping.",
+                                existing_user.username,
+                                existing_user.email,
+                                directory_user.email,
+                                conflicting_user.username
+                            );
+                            continue;
+                        }
+
+                        info!(
+                            "User {} changed email in the directory from {} to {}, updating in \
+                            Defguard",
+                            existing_user.username, existing_user.email, directory_user.email
+                        );
+                        let before = existing_user.clone();
+                        existing_user.email = directory_user.email.clone();
+                        existing_user.first_name = details.first_name.clone();
+                        existing_user.last_name = details.last_name.clone();
+                        existing_user.phone = details.phone_number.clone();
+                        existing_user.save(&mut *transaction).await?;
+                        dirsync_events.push(DirectorySyncEventType::UserModified {
+                            before,
+                            after: existing_user.clone(),
+                        });
+                        modified_users.push(existing_user);
+                        continue;
+                    }
+
                     debug!(
                         "User {directory_user:?} exists in directory but not in Defguard. Creating \
                         new Defguard user.",
@@ -847,7 +958,7 @@ async fn sync_all_users_state(
                         )));
                     }
 
-                    let mut user = User::new(
+                    let user = User::new(
                         username,
                         None,
                         details.last_name.clone(),
@@ -855,7 +966,6 @@ async fn sync_all_users_state(
                         directory_user.email.clone(),
                         details.phone_number.clone(),
                     );
-                    user.openid_sub.clone_from(&directory_user.id);
                     if let Some(limit) = user_limit.filter(|limit| user_count >= *limit) {
                         error!(
                             "Skipping directory sync import of user {} (email: {}) because \
@@ -869,6 +979,15 @@ async fn sync_all_users_state(
                         continue;
                     }
                     let new_user = user.save(&mut *transaction).await?;
+                    if let Some(directory_id) = &directory_user.id {
+                        UserDirectoryIdentity::upsert(
+                            &mut *transaction,
+                            new_user.id,
+                            settings.id,
+                            directory_id,
+                        )
+                        .await?;
+                    }
                     user_count += 1;
                     dirsync_events.push(DirectorySyncEventType::UserCreated {
                         user: new_user.clone(),
@@ -1175,7 +1294,6 @@ pub async fn do_directory_sync(
     let provider = provider.ok_or(DirectorySyncError::NotConfigured)?;
 
     let sync_target = provider.directory_sync_target;
-    let prefetch_users = provider.prefetch_users;
     let provider_name = provider.name.clone();
     let user_groups_filter = provider
         .directory_sync_user_groups
@@ -1199,18 +1317,18 @@ pub async fn do_directory_sync(
             ) {
                 let users = dir_sync.get_all_users().await?;
 
-                // If prefetch is enabled and a user group filter is configured, build a set
-                // of emails of users who are members of those groups. Only those users will
-                // be imported by the prefetch. When the filter is empty we pass None and
-                // import everyone.
-                let prefetch_allowed_emails = if prefetch_users && !user_groups_filter.is_empty() {
+                // If a user group filter is configured, build a set of emails of users who are
+                // members of those groups. Only those users are considered for syncing (state
+                // updates and, when supported by the provider, prefetch/import of new users).
+                // When the filter is empty we pass None and consider everyone.
+                let allowed_emails = if !user_groups_filter.is_empty() {
                     let groups = dir_sync.get_groups().await?;
                     // get_groups() may itself be limited by the membership sync group filter (directory_sync_group_match),
                     // so groups configured here must also be included there if that filter is in use.
                     for group_name in &user_groups_filter {
                         if !groups.iter().any(|group| &group.name == group_name) {
                             warn!(
-                                "Group '{group_name}' configured for user prefetch was not found among the directory groups, its members won't be imported.
+                                "Group '{group_name}' configured for user sync was not found among the directory groups, its members won't be synced.
                                 Make sure the group name is correct and that it's also included in the membership sync group filter, if one is defined."
                             );
                         }
@@ -1223,7 +1341,7 @@ pub async fn do_directory_sync(
                         match dir_sync.get_group_members(group, Some(&users)).await {
                             Ok(members) => {
                                 debug!(
-                                    "Adding {} members of group '{}' to the prefetch",
+                                    "Adding {} members of group '{}' to the set of users allowed to sync",
                                     members.len(),
                                     group.name
                                 );
@@ -1231,7 +1349,7 @@ pub async fn do_directory_sync(
                             }
                             Err(err) => {
                                 error!(
-                                    "Failed to get members of group '{}' for the prefetch filter: {err}",
+                                    "Failed to get members of group '{}' for the user sync filter: {err}",
                                     group.name
                                 );
                             }
@@ -1248,7 +1366,7 @@ pub async fn do_directory_sync(
                     ldap_tx,
                     dirsync_tx,
                     &users,
-                    prefetch_allowed_emails,
+                    allowed_emails,
                 )
                 .await?;
                 all_users = Some(users);

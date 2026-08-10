@@ -43,6 +43,7 @@ import {
   canUseEnterpriseFeature,
 } from '../../shared/utils/license';
 import { smallestNetworkCapacity } from '../../shared/utils/network';
+import { confirmLocationPostureChange } from '../../shared/utils/postureWarning';
 import { Validate } from '../../shared/validate';
 import postureCheckShield from './assets/posture_check_shield.png';
 import { getPostureChecksSectionState } from './postureChecksSection';
@@ -154,6 +155,8 @@ const formSchema = z
     peer_disconnect_threshold: z.number().nullable(),
     keepalive_interval: z
       .number(m.form_error_required())
+      // Keepalive is mandatory to prevent idle service locations from disconnecting
+      .min(1, m.form_error_keepalive_min())
       .max(65535, m.form_error_port_max()),
     mtu: z.number(m.form_error_required()).min(72).max(0xffffffff),
     fwmark: z.number(m.form_error_required()).min(0).max(0xffffffff),
@@ -371,11 +374,11 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
   const postureChecksSectionState = useMemo(
     () =>
       getPostureChecksSectionState({
-        assignedPostureChecksCount: location.posture_checks.length,
+        assignedPostureChecksCount: location.posture_checks?.length ?? 0,
         canUseEnterprise: canUseDevicePosture,
         postureChecksCount: postureChecks.length,
       }),
-    [canUseDevicePosture, location.posture_checks.length, postureChecks.length],
+    [canUseDevicePosture, location.posture_checks?.length, postureChecks.length],
   );
   const firewallLocked = isPresent(canUseBusiness) && !canUseBusiness;
 
@@ -390,17 +393,6 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
       ),
     [postureChecks],
   );
-
-  const assignedPostureChecks = useMemo(() => {
-    const labelsById = new Map(
-      postureChecks.map((postureCheck) => [postureCheck.id, postureCheck.name]),
-    );
-
-    return location.posture_checks.map((id) => ({
-      id,
-      label: labelsById.get(id) ?? String(id),
-    }));
-  }, [location.posture_checks, postureChecks]);
 
   const serviceLocationLabelContent = useMemo(() => {
     if (!serviceLocationLocked) return undefined;
@@ -472,7 +464,7 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
     },
   });
 
-  const { mutate: setLocationPostures, isPending: isUpdatingLocationPostures } =
+  const { mutateAsync: setLocationPosturesAsync, isPending: isUpdatingLocationPostures } =
     useMutation({
       mutationFn: (data: { postures: number[] }) =>
         api.devicePosture.setLocationPostures(location.id, data),
@@ -483,6 +475,16 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
         Snackbar.error(m.location_posture_checks_update_failed());
       },
     });
+
+  const handlePostureSelection = (values: (string | number)[]) => {
+    const next = values.filter((value): value is number => typeof value === 'number');
+    confirmLocationPostureChange({
+      current: location.posture_checks ?? [],
+      next,
+      options: postureCheckOptions,
+      actionPromise: () => setLocationPosturesAsync({ postures: next }),
+    });
+  };
 
   const openPostureChecksSelection = () => {
     useSelectionModal.setState({
@@ -499,11 +501,7 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
       searchPlaceholder: m.controls_search(),
       selected: new Set(location.posture_checks),
       visibleItemsLimit: 4,
-      onSubmit: (values) => {
-        setLocationPostures({
-          postures: values.filter((value): value is number => typeof value === 'number'),
-        });
-      },
+      onSubmit: handlePostureSelection,
     });
   };
 
@@ -812,13 +810,6 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
                         text={m.location_service_mode_mfa_warning()}
                       />
                     )}
-                    {postureChecksSectionState.hasAssignedPostureChecks && (
-                      <InfoBanner
-                        variant="warning"
-                        icon="info-outlined"
-                        text={m.location_service_mode_postures_warning()}
-                      />
-                    )}
                     <EditPageFormSection
                       label={m.location_edit_section_location_type()}
                       labelContent={serviceLocationLabelContent}
@@ -826,31 +817,19 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
                       <field.FormRadio
                         value={LocationServiceMode.Disabled}
                         text={m.location_service_mode_regular()}
-                        disabled={
-                          mfaEnabled ||
-                          serviceLocationLocked ||
-                          postureChecksSectionState.hasAssignedPostureChecks
-                        }
+                        disabled={mfaEnabled || serviceLocationLocked}
                       />
                       <SizedBox height={ThemeSpacing.Md} />
                       <field.FormRadio
                         value={LocationServiceMode.Prelogon}
                         text={m.location_service_mode_prelogon()}
-                        disabled={
-                          mfaEnabled ||
-                          serviceLocationLocked ||
-                          postureChecksSectionState.hasAssignedPostureChecks
-                        }
+                        disabled={mfaEnabled || serviceLocationLocked}
                       />
                       <SizedBox height={ThemeSpacing.Md} />
                       <field.FormRadio
                         value={LocationServiceMode.Alwayson}
                         text={m.location_service_mode_always_on()}
-                        disabled={
-                          mfaEnabled ||
-                          serviceLocationLocked ||
-                          postureChecksSectionState.hasAssignedPostureChecks
-                        }
+                        disabled={mfaEnabled || serviceLocationLocked}
                       />
                     </EditPageFormSection>
                   </>
@@ -945,98 +924,63 @@ const EditLocationForm = ({ location }: { location: NetworkLocation }) => {
             </>
           )}
         </form.Subscribe>
-        <form.Subscribe
-          selector={(s) =>
-            s.values.service_location_mode !== LocationServiceMode.Disabled
-          }
+        <EditPageFormSection
+          label={m.cmp_nav_item_posture_checks()}
+          labelContent={postureChecksLabelContent}
         >
-          {(isServiceLocation) => (
-            <>
-              {isServiceLocation && (
-                <InfoBanner
-                  icon="info-outlined"
-                  variant="warning"
-                  text={m.location_posture_service_location_warning()}
-                />
-              )}
-              <EditPageFormSection
-                label={m.cmp_nav_item_posture_checks()}
-                labelContent={postureChecksLabelContent}
-              >
-                {postureChecksSectionState.showEmptyState && (
-                  <div className="posture-checks-empty-state">
-                    <img
-                      src={postureCheckShield}
-                      alt=""
-                      className="posture-check-shield"
-                    />
-                    <p>
-                      {m.location_posture_checks_empty_state_before_link()}{' '}
-                      <Link to="/acl/posture-checks">
-                        {m.cmp_nav_item_posture_checks()}
-                      </Link>{' '}
-                      {m.location_posture_checks_empty_state_after_link()}
-                    </p>
-                  </div>
-                )}
-                {postureChecksSectionState.showAssignedPostureChecks && (
-                  <div className="posture-checks-assigned-state">
-                    <SelectMultiple
-                      options={postureCheckOptions}
-                      selected={
-                        new Set(
-                          assignedPostureChecks.map((postureCheck) => postureCheck.id),
-                        )
-                      }
-                      modalTitle={m.location_posture_checks_select()}
-                      editText={m.location_posture_checks_edit()}
-                      editIcon={IconKind.Edit}
-                      toggleValue={false}
-                      counterText={() => ''}
-                      disabled={isServiceLocation}
-                      onSelectionChange={(values) => {
-                        setLocationPostures({
-                          postures: values.filter(
-                            (value): value is number => typeof value === 'number',
-                          ),
-                        });
-                      }}
-                      onToggleChange={() => {}}
-                      selectionCustomItemRender={renderPostureCheckSelectionItem}
-                      selectionModalProps={{
-                        contentClassName: 'posture-check-assignment-modal',
-                        enableDividers: true,
-                        itemGap: 12,
-                        searchPlaceholder: m.controls_search(),
-                        visibleItemsLimit: 6,
-                      }}
-                    />
-                  </div>
-                )}
-                {postureChecksSectionState.showAssignButton && (
-                  <Button
-                    variant="outlined"
-                    iconLeft={IconKind.ConnectedDevices}
-                    loading={isUpdatingLocationPostures}
-                    text={m.posture_checks_wizard_title()}
-                    onClick={openPostureChecksSelection}
-                    disabled={isServiceLocation}
-                  />
-                )}
-                {postureChecksSectionState.showLockedButton && (
-                  <div className="posture-checks-locked-state">
-                    <Button
-                      variant="primary"
-                      disabled
-                      iconLeft={IconKind.ConnectedDevices}
-                      text={m.posture_checks_wizard_title()}
-                    />
-                  </div>
-                )}
-              </EditPageFormSection>
-            </>
+          {postureChecksSectionState.showEmptyState && (
+            <div className="posture-checks-empty-state">
+              <img src={postureCheckShield} alt="" className="posture-check-shield" />
+              <p>
+                {m.location_posture_checks_empty_state_before_link()}{' '}
+                <Link to="/acl/posture-checks">{m.cmp_nav_item_posture_checks()}</Link>{' '}
+                {m.location_posture_checks_empty_state_after_link()}
+              </p>
+            </div>
           )}
-        </form.Subscribe>
+          {postureChecksSectionState.showAssignedPostureChecks && (
+            <div className="posture-checks-assigned-state">
+              <SelectMultiple
+                options={postureCheckOptions}
+                selected={new Set(location.posture_checks)}
+                modalTitle={m.location_posture_checks_select()}
+                editText={m.location_posture_checks_edit()}
+                editIcon={IconKind.Edit}
+                toggleValue={false}
+                counterText={() => ''}
+                onSelectionChange={handlePostureSelection}
+                onToggleChange={() => {}}
+                selectionCustomItemRender={renderPostureCheckSelectionItem}
+                selectionModalProps={{
+                  contentClassName: 'posture-check-assignment-modal',
+                  enableDividers: true,
+                  itemGap: 12,
+                  searchPlaceholder: m.controls_search(),
+                  visibleItemsLimit: 6,
+                }}
+              />
+            </div>
+          )}
+          {postureChecksSectionState.showAssignButton && (
+            <Button
+              variant="outlined"
+              iconLeft={IconKind.ConnectedDevices}
+              loading={isUpdatingLocationPostures}
+              text={m.posture_checks_wizard_title()}
+              onClick={openPostureChecksSelection}
+            />
+          )}
+          {postureChecksSectionState.showLockedButton && (
+            <div className="posture-checks-locked-state">
+              <Button
+                variant="primary"
+                disabled
+                iconLeft={IconKind.ConnectedDevices}
+                text={m.posture_checks_wizard_title()}
+              />
+            </div>
+          )}
+        </EditPageFormSection>
         <form.Subscribe
           selector={(form) => ({
             isSubmitting: form.isSubmitting,

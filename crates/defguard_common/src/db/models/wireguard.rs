@@ -41,11 +41,12 @@ pub const DEFAULT_WIREGUARD_MTU: i32 = 1420; // TODO: use u32 once sqlx supports
 const DEFAULT_FWMARK: i64 = 0; // Zero means: don't use firewall mark.
 
 // Used in process of importing network from WireGuard config.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct MappedDevice {
     pub user_id: Id,
     pub name: String,
     pub wireguard_pubkey: String,
+    #[schema(value_type = Vec<String>)]
     pub wireguard_ips: Vec<IpAddr>,
 }
 
@@ -98,10 +99,11 @@ pub enum ServiceLocationMode {
     AlwaysOn,
 }
 
-/// Stores configuration required to setup a WireGuard network
+/// Stores the configuration required to set up a WireGuard network.
 #[derive(Clone, Deserialize, Eq, Hash, Model, PartialEq, Serialize, ToSchema)]
 #[table(wireguard_network)]
 pub struct WireguardNetwork<I = NoId> {
+    #[schema(value_type = i64)]
     pub id: I,
     pub name: String,
     #[model(ref)]
@@ -451,9 +453,12 @@ impl WireguardNetwork<Id> {
         }
     }
 
-    /// Get a list of all devices belonging to users in allowed groups.
+    /// Get a list of all devices belonging to active users in allowed groups.
     /// Admin users should always be allowed to access a network.
     /// Note: Doesn't check if the devices are really in the network.
+    ///
+    /// For a single device, use [`Self::is_device_allowed_in_network`] instead of
+    /// fetching this whole list.
     pub async fn get_allowed_devices(
         &self,
         transaction: &mut PgConnection,
@@ -468,7 +473,7 @@ impl WireguardNetwork<Id> {
                 JOIN \"user\" u ON d.user_id = u.id \
                 WHERE u.is_active \
                 AND d.device_type = 'user'::device_type \
-                ORDER BY d.id ASC"
+                ORDER BY d.id ASC",
             )
             .fetch_all(&mut *transaction)
             .await
@@ -488,11 +493,47 @@ impl WireguardNetwork<Id> {
                 AND u.is_active \
                 AND d.device_type = 'user'::device_type \
                 ORDER BY d.id ASC",
-            &allowed_groups
+            &allowed_groups,
         )
         .fetch_all(&mut *transaction)
         .await?;
         Ok(devices)
+    }
+
+    /// Checks if a single device is allowed in this network: its user must be active
+    /// and, unless the network allows all groups, a member of one of its allowed groups.
+    pub async fn is_device_allowed_in_network(
+        &self,
+        conn: &mut PgConnection,
+        device: &Device<Id>,
+    ) -> Result<bool, ModelError> {
+        if device.device_type != DeviceType::User {
+            return Ok(false);
+        }
+        if self.allow_all_groups {
+            let allowed = query_scalar!(
+                "SELECT EXISTS(SELECT 1 FROM \"user\" u WHERE u.id = $1 AND u.is_active)",
+                device.user_id
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            return Ok(allowed.unwrap_or(false));
+        }
+
+        let allowed_groups = self.get_allowed_groups(&mut *conn).await?;
+        let allowed = query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM \"user\" u \
+                JOIN group_user gu ON gu.user_id = u.id \
+                JOIN \"group\" g ON gu.group_id = g.id \
+                WHERE u.id = $1 \
+                AND u.is_active \
+                AND g.\"name\" IN (SELECT * FROM UNNEST($2::text[])))",
+            device.user_id,
+            &allowed_groups
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(allowed.unwrap_or(false))
     }
 
     /// Get a list of devices belonging to a user which are also in the network's allowed groups.
@@ -574,11 +615,12 @@ impl WireguardNetwork<Id> {
         reserved_ips: Option<&[IpAddr]>,
     ) -> Result<WireguardNetworkDevice, WireguardNetworkError> {
         info!("Assigning IP in network {self} for {device}");
-        let allowed_devices = self.get_allowed_devices(&mut *conn).await?;
-        let allowed_device_ids = allowed_devices.iter().map(|dev| dev.id).collect::<Vec<_>>();
-        let used_ips = self.all_used_ips_for_network(&mut *conn).await?;
+        let allowed = self
+            .is_device_allowed_in_network(&mut *conn, device)
+            .await?;
 
-        if allowed_device_ids.contains(&device.id) {
+        if allowed {
+            let used_ips = self.all_used_ips_for_network(&mut *conn).await?;
             let wireguard_network_device = device
                 .assign_next_network_ip(&mut *conn, self, &used_ips, reserved_ips, None)
                 .await?;
@@ -1510,7 +1552,7 @@ impl Default for WireguardNetwork {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct WireguardStatsRow {
     pub collected_at: Option<NaiveDateTime>,
     pub upload: Option<i64>,
@@ -1566,7 +1608,7 @@ pub struct WireguardNetworkStats {
     pub transfer_series: Vec<WireguardStatsRow>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct LocationConnectedUserStats {
     user_id: Id,
     first_name: String,
@@ -1575,6 +1617,7 @@ pub struct LocationConnectedUserStats {
     connected_devices_count: u16,
     // oldest active session data
     public_ip: String,
+    #[schema(value_type = Vec<String>)]
     vpn_ips: Vec<IpAddr>,
     connected_at: NaiveDateTime,
     // agregated traffic stats
@@ -1583,12 +1626,13 @@ pub struct LocationConnectedUserStats {
     stats: Vec<WireguardStatsRow>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct LocationConnectedNetworkDevice {
     device_id: Id,
     device_name: String,
     // active session data
     public_ip: String,
+    #[schema(value_type = Vec<String>)]
     vpn_ips: Vec<IpAddr>,
     connected_at: NaiveDateTime,
     // agregated traffic stats

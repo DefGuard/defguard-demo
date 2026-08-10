@@ -119,6 +119,10 @@ export const ActivityLogEventType = {
 
   GatewayModified: 'gateway_modified',
   GatewayDeleted: 'gateway_deleted',
+  GatewayConnected: 'gateway_connected',
+  GatewayDisconnected: 'gateway_disconnected',
+  ProxyConnected: 'proxy_connected',
+  ProxyDisconnected: 'proxy_disconnected',
 
   DevicePostureCreated: 'device_posture_created',
   DevicePostureUpdated: 'device_posture_updated',
@@ -147,6 +151,7 @@ export const ActivityLogEventType = {
 
   OidcDirectorySyncUserCreated: 'oidc_directory_sync_user_created',
   OidcDirectorySyncUserDeleted: 'oidc_directory_sync_user_deleted',
+  OidcDirectorySyncUserModified: 'oidc_directory_sync_user_modified',
   OidcDirectorySyncUserEnabled: 'oidc_directory_sync_user_enabled',
   OidcDirectorySyncUserDisabled: 'oidc_directory_sync_user_disabled',
   OidcDirectorySyncGroupCreated: 'oidc_directory_sync_group_created',

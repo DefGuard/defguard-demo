@@ -310,6 +310,7 @@ export interface User {
   authorized_apps?: OAuth2AuthorizedApps[];
   devices: Device[];
   has_non_mfa_location_access: boolean;
+  has_non_posture_location_access: boolean;
 }
 
 export interface LoginRequest {
@@ -425,6 +426,12 @@ export interface ApiError {
   message?: string;
   code?: WebErrorCode;
 }
+
+export const ApiResponseCode = {
+  LicenseReactivated: 'license_reactivated',
+} as const;
+
+export type ApiResponseCode = (typeof ApiResponseCode)[keyof typeof ApiResponseCode];
 
 export interface AppInfoExceededLimits {
   user: boolean;
@@ -809,7 +816,7 @@ export interface NetworkLocation {
   location_mfa_mode: LocationMfaModeValue;
   service_location_mode: LocationServiceModeValue;
   has_devices: boolean;
-  posture_checks: number[];
+  posture_checks?: number[];
 }
 
 export interface EditNetworkLocation
@@ -946,12 +953,20 @@ export const ClientTrafficPolicy = {
 export type ClientTrafficPolicyValue =
   (typeof ClientTrafficPolicy)[keyof typeof ClientTrafficPolicy];
 
+export interface GroupClientTrafficPolicies {
+  none: number[];
+  disable_all_traffic: number[];
+  force_all_traffic: number[];
+}
+
 export interface SettingsEnterprise {
   admin_device_management: boolean;
   client_traffic_policy: ClientTrafficPolicyValue;
   only_client_activation: boolean;
   display_download_step: boolean;
   display_password_reset: boolean;
+  disable_tunnels: boolean;
+  group_client_traffic_policies: GroupClientTrafficPolicies;
 }
 
 export type ApiDevicePostureOsRule =
@@ -1151,6 +1166,7 @@ export interface SettingsEnrollment {
   enrollment_welcome_email_subject: string;
   enrollment_use_welcome_message_as_email: boolean;
   enrollment_send_welcome_email: boolean;
+  enrollment_display_welcome_message: boolean;
 }
 
 export interface SettingsModules {

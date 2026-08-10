@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::read_to_string,
     sync::{Arc, Mutex, RwLock},
 };
@@ -7,12 +8,13 @@ use anyhow::bail;
 use bytes::Bytes;
 use defguard_common::{
     CARGO_VERSION, VERSION,
-    config::{Command, DefGuardConfig, SERVER_CONFIG},
+    config::{Command, DefGuardConfig, ManageCommand, SERVER_CONFIG},
     db::{
         init_db,
         models::{
-            ActiveWizard, Certificates, Settings, Wizard,
+            ActiveWizard, Certificates, Settings, User, Wizard,
             gateway::Gateway,
+            group::{Group, Permission},
             proxy::Proxy,
             settings::{initialize_current_settings, update_current_settings},
         },
@@ -22,9 +24,11 @@ use defguard_common::{
     types::proxy::ProxyControlMessage,
 };
 use defguard_core::{
+    add_user_to_group,
     auth::failed_login::FailedLoginMap,
-    change_user_password,
+    change_user_password, create_admin_user, create_new_group,
     db::AppEvent,
+    disable_ldap_integration, disable_oidc_directory_sync,
     enterprise::{
         activity_log_stream::activity_log_stream_manager::run_activity_log_stream_manager,
         license::{License, run_periodic_license_check, set_cached_license},
@@ -33,7 +37,7 @@ use defguard_core::{
     events::{ApiEvent, BidiStreamEvent},
     gateway_config,
     grpc::{WorkerState, run_grpc_server},
-    init_dev_env, init_vpn_location, run_web_server,
+    init_dev_env, init_vpn_location, run_web_server, set_admin_group,
     setup_logs::CoreSetupLogLayer,
     utility_thread::run_utility_thread,
     version::IncompatibleComponents,
@@ -126,10 +130,89 @@ async fn main() -> Result<(), anyhow::Error> {
                 let config = gateway_config(&pool, args).await?;
                 println!("{config:?}");
             }
-            Command::ChangePassword(args) => {
-                change_user_password(&pool, args).await?;
-                println!("Password for user {} changed", args.username);
-            }
+            Command::Manage(command) => match command {
+                ManageCommand::CreateAdmin(args) => {
+                    create_admin_user(&pool, args).await?;
+                    println!("Admin user '{}' created successfully.", args.username);
+                }
+                ManageCommand::ChangePassword(args) => {
+                    change_user_password(&pool, args).await?;
+                    println!(
+                        "Password for user '{}' changed successfully.",
+                        args.username
+                    );
+                }
+                ManageCommand::ListUsers => {
+                    let mut admin_ids = HashSet::new();
+                    for group in Group::find_by_permission(&pool, Permission::IsAdmin).await? {
+                        for member in group.members(&pool).await? {
+                            admin_ids.insert(member.id);
+                        }
+                    }
+                    let users = User::all(&pool).await?;
+                    let username_header = "Username";
+                    let username_width = users
+                        .iter()
+                        .map(|user| user.username.len())
+                        .max()
+                        .unwrap_or(0)
+                        .max(username_header.len());
+                    println!("{username_header:<username_width$} | Admin privileges");
+                    for user in users {
+                        let is_admin = admin_ids.contains(&user.id);
+                        println!("{:<username_width$} | {is_admin}", user.username);
+                    }
+                }
+                ManageCommand::SetAdminGroup(args) => {
+                    let name = set_admin_group(&pool, args).await?;
+                    println!("Group '{name}' is now a Defguard admin group.");
+                }
+                ManageCommand::CreateGroup(args) => {
+                    create_new_group(&pool, args).await?;
+                    println!("Group '{}' created successfully.", args.name);
+                }
+                ManageCommand::ListGroups => {
+                    let groups = Group::all(&pool).await?;
+                    let id_header = "ID";
+                    let name_header = "Group name";
+                    let id_width = groups
+                        .iter()
+                        .map(|group| group.id)
+                        .max()
+                        .map_or(0, |id| id.ilog10() as usize + 1)
+                        .max(id_header.len());
+                    let name_width = groups
+                        .iter()
+                        .map(|group| group.name.len())
+                        .max()
+                        .unwrap_or(0)
+                        .max(name_header.len());
+                    println!(
+                        "{id_header:<id_width$} | {name_header:<name_width$} | Admin privileges"
+                    );
+                    for group in groups {
+                        println!(
+                            "{:<id_width$} | {:<name_width$} | {}",
+                            group.id, group.name, group.is_admin
+                        );
+                    }
+                }
+                ManageCommand::AddUserToGroup(args) => {
+                    let group_name = add_user_to_group(&pool, args).await?;
+                    println!("User '{}' added to group '{group_name}'.", args.username);
+                }
+                ManageCommand::DisableLdapIntegration => {
+                    disable_ldap_integration(&pool).await?;
+                    println!(
+                        "LDAP integration disabled. Make sure your Defguard instance is offline \
+                        when running this command for the change to persist."
+                    );
+                }
+                ManageCommand::DisableOidcDirectorySync => {
+                    disable_oidc_directory_sync(&pool).await?;
+                    println!("OIDC external identity provider directory sync disabled.");
+                }
+            },
         }
 
         // return early
@@ -209,6 +292,8 @@ async fn main() -> Result<(), anyhow::Error> {
         unbounded_channel::<SessionManagerEvent>();
     let (ldap_tx, ldap_rx) = unbounded_channel();
     let (dirsync_tx, dirsync_rx) = unbounded_channel();
+    let (gateway_connection_event_tx, gateway_connection_event_rx) = unbounded_channel();
+    let (proxy_connection_event_tx, proxy_connection_event_rx) = unbounded_channel();
 
     // Activity log stream setup
     let (activity_log_messages_tx, activity_log_messages_rx) = broadcast::channel::<Bytes>(100);
@@ -256,7 +341,8 @@ async fn main() -> Result<(), anyhow::Error> {
             ldap_tx.clone(),
             dirsync_tx.clone(),
             api_event_tx.clone(),
-        ),
+        )
+        .with_connection_events(proxy_connection_event_tx),
         Arc::clone(&incompatible_components),
         proxy_control_rx,
         proxy_secret_key,
@@ -264,7 +350,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let mut gateway_manager = GatewayManager::new(
         pool.clone(),
-        GatewayTxSet::new(gateway_tx.clone(), peer_stats_tx),
+        GatewayTxSet::new(gateway_tx.clone(), peer_stats_tx)
+            .with_connection_events(gateway_connection_event_tx),
     );
 
     debug!("Resetting proxy connection state on startup");
@@ -316,6 +403,8 @@ async fn main() -> Result<(), anyhow::Error> {
             session_manager_event_rx,
             ldap_rx,
             dirsync_rx,
+            gateway_connection_event_rx,
+            proxy_connection_event_rx,
             activity_log_stream_reload_notify.clone(),
             activity_log_messages_tx.clone()
         ) => bail!("Activity log event logger returned early: {res:?}"),

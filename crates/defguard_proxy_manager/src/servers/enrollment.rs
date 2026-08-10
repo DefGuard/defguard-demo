@@ -217,16 +217,12 @@ impl EnrollmentServer {
                     Status::internal(format!("unexpected error: {err}"))
                 })?;
             let smtp_configured = settings.smtp_configured();
-            let instance_info = InstanceInfo::new(
-                settings,
-                &user.username,
-                &enterprise_settings,
-                openid_provider,
-            )
-            .map_err(|err| {
-                error!("Failed to create instance info: {err}");
-                Status::internal("unexpected error")
-            })?;
+            let instance_info = InstanceInfo::build(&self.pool, &settings, &user, openid_provider)
+                .await
+                .map_err(|err| {
+                    error!("Failed to create instance info: {err}");
+                    Status::internal("unexpected error")
+                })?;
             debug!("Instance info {instance_info:?}");
 
             debug!(
@@ -234,7 +230,7 @@ impl EnrollmentServer {
                 user.username, user.id
             );
             let (username, user_id) = (user.username.clone(), user.id);
-            let user_info = initial_info_from_user(&self.pool, user)
+            let user_info = initial_info_from_user(&self.pool, &user)
                 .await
                 .map_err(|err| {
                     error!(
@@ -274,13 +270,22 @@ impl EnrollmentServer {
                 admin_device_management: enterprise_settings.admin_device_management,
                 mfa_required: instance_has_internal_mfa,
             };
+            let settings = Settings::get_current_settings();
+            let final_page_content = if settings.enrollment_display_welcome_message {
+                enrollment
+                    .get_welcome_page_content(&mut transaction)
+                    .await?
+            } else {
+                debug!(
+                    "Skipping enrollment welcome page content because it is disabled in settings"
+                );
+                String::new()
+            };
             let response = defguard_proto::client_types::EnrollmentStartResponse {
                 admin: admin_info,
                 user: Some(user_info),
                 deadline_timestamp: session_deadline.and_utc().timestamp(),
-                final_page_content: enrollment
-                    .get_welcome_page_content(&mut transaction)
-                    .await?,
+                final_page_content,
                 instance: Some(instance_info.into()),
                 settings: Some(enrollment_settings),
             };
@@ -479,7 +484,9 @@ impl EnrollmentServer {
 
         // update user
         info!("Update user details and set a new password.");
-        user.phone = request.phone_number;
+        if request.phone_number.is_some() {
+            user.phone = request.phone_number;
+        }
         if let Some(password) = &request.password {
             user.set_password(password);
         }
@@ -954,16 +961,12 @@ impl EnrollmentServer {
                 Status::internal(format!("unexpected error: {err}"))
             })?;
 
-        let instance_info = InstanceInfo::new(
-            settings,
-            &user.username,
-            &enterprise_settings,
-            openid_provider,
-        )
-        .map_err(|err| {
-            error!("Failed to create instance info: {err}");
-            Status::internal("unexpected error")
-        })?;
+        let instance_info = InstanceInfo::build(&self.pool, &settings, &user, openid_provider)
+            .await
+            .map_err(|err| {
+                error!("Failed to create instance info: {err}");
+                Status::internal("unexpected error")
+            })?;
 
         let response = DeviceConfigResponse {
             device: Some(device.clone().into()),
@@ -1043,14 +1046,13 @@ impl EnrollmentServer {
                     error!("Unable to start email MFA setup; SMTP is not configured");
                     return Err(Status::internal("SMTP not configured".to_owned()));
                 }
-                if user.email_mfa_enabled {
-                    return Err(Status::invalid_argument(
-                        "Method already enabled".to_owned(),
-                    ));
-                }
                 user.new_email_secret(&self.pool).await.map_err(|_| {
                     error!("Failed to create email secret");
                     Status::internal("Failed to setup email mfa".to_owned())
+                })?;
+                user.clear_recovery_codes(&self.pool).await.map_err(|e| {
+                    error!("Failed to clear recovery codes: {e}");
+                    Status::internal("Failed to clear recovery codes".to_owned())
                 })?;
                 info!("Created email secret for {}", &user.username);
                 let mut transaction = self.pool.begin().await.map_err(|err| {
@@ -1061,23 +1063,29 @@ impl EnrollmentServer {
                     error!("Failed to generate MFA code for {user}\nReason:{err}");
                     Status::internal("Failed to generate MFA code".to_owned())
                 })?;
-                mfa_activation_mail(&user.email, &mut transaction, &user.first_name, &code, None)
-                    .await
-                    .map_err(|err| {
-                        error!("Failed to send MFA activation email\nReason:{err}");
-                        Status::internal("Failed to send activation email".to_owned())
-                    })?;
+                mfa_activation_mail(
+                    &user.email,
+                    &mut transaction,
+                    &user.first_name,
+                    &code,
+                    None,
+                    true,
+                )
+                .await
+                .map_err(|err| {
+                    error!("Failed to send MFA activation email\nReason:{err}");
+                    Status::internal("Failed to send activation email".to_owned())
+                })?;
                 Ok(CodeMfaSetupStartResponse { totp_secret: None })
             }
             MfaMethod::Totp => {
-                if user.totp_enabled {
-                    return Err(Status::invalid_argument(
-                        "Method already enabled".to_owned(),
-                    ));
-                }
                 let secret = user.new_totp_secret(&self.pool).await.map_err(|_| {
                     error!("Failed to make new TOTP secret");
                     Status::internal("Failed to make new TOTP secret".to_owned())
+                })?;
+                user.clear_recovery_codes(&self.pool).await.map_err(|e| {
+                    error!("Failed to clear recovery codes: {e}");
+                    Status::internal("Failed to clear recovery codes".to_owned())
                 })?;
                 info!("New TOTP secret created for {}", &user.username);
                 Ok(CodeMfaSetupStartResponse {
@@ -1101,11 +1109,6 @@ impl EnrollmentServer {
             return Err(Status::invalid_argument("Method not supported"));
         }
         let mut user = enrollment.fetch_user(&self.pool).await?;
-        if user.mfa_enabled {
-            return Err(Status::invalid_argument(
-                "Mfa already enabled on the account".to_owned(),
-            ));
-        }
         // available only for unenrolled users
         if user.is_enrolled() {
             return Err(Status::permission_denied("User is already enrolled"));
@@ -1164,7 +1167,7 @@ impl EnrollmentServer {
 
 async fn initial_info_from_user(
     pool: &PgPool,
-    user: User<Id>,
+    user: &User<Id>,
 ) -> Result<InitialUserInfo, sqlx::Error> {
     let enrolled = user.is_enrolled();
     let devices = user.user_devices(pool).await?;
@@ -1176,11 +1179,11 @@ async fn initial_info_from_user(
     let password_management_disabled =
         user.password_management_disabled(is_admin, &settings, oidc_disable_password_management);
     Ok(InitialUserInfo {
-        first_name: user.first_name,
-        last_name: user.last_name,
-        login: user.username,
-        email: user.email,
-        phone_number: user.phone,
+        first_name: user.first_name.clone(),
+        last_name: user.last_name.clone(),
+        login: user.username.clone(),
+        email: user.email.clone(),
+        phone_number: user.phone.clone(),
         is_active: user.is_active,
         device_names,
         enrolled,
@@ -1238,6 +1241,7 @@ mod test {
         setup_pool,
     };
     use defguard_core::db::models::enrollment::{ENROLLMENT_TOKEN_TYPE, Token};
+    use defguard_proto::{client_types::EnrollmentStartRequest, proxy::DeviceInfo};
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tokio::sync::{broadcast, mpsc::unbounded_channel};
 
@@ -1288,5 +1292,73 @@ mod test {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    #[sqlx::test]
+    async fn test_display_welcome_message_if_disabled_returns_empty(
+        _: PgPoolOptions,
+        options: PgConnectOptions,
+    ) {
+        let pool = setup_pool(options).await;
+
+        let user = User::new(
+            "test_user_disabled_display",
+            None,
+            "Test",
+            "User",
+            "user-disabled-display@test.com",
+            None,
+        )
+        .save(&pool)
+        .await
+        .unwrap();
+
+        let token = Token::new(
+            user.id,
+            None,
+            Some(user.email.clone()),
+            3600,
+            Some(ENROLLMENT_TOKEN_TYPE.to_owned()),
+        );
+        token.save(&pool).await.unwrap();
+
+        Settings::initialize_runtime_defaults(&pool).await.unwrap();
+        initialize_current_settings(&pool).await.unwrap();
+
+        let mut settings = Settings::get_current_settings();
+        assert!(
+            settings
+                .enrollment_welcome_message
+                .as_deref()
+                .is_some_and(|msg| !msg.is_empty()),
+            "welcome message template must be non-empty for this test to be meaningful"
+        );
+        settings.enrollment_display_welcome_message = false;
+        update_current_settings(&pool, settings).await.unwrap();
+
+        let (gateway_tx, _gateway_rx) = broadcast::channel(1);
+        let (bidi_event_tx, _bidi_events_rx) = unbounded_channel();
+        let (ldap_tx, _ldap_rx) = unbounded_channel();
+        let server = EnrollmentServer::new(pool.clone(), gateway_tx, bidi_event_tx, ldap_tx);
+
+        let request = EnrollmentStartRequest {
+            token: token.id.clone(),
+        };
+        let device_info = DeviceInfo {
+            ip_address: "127.0.0.1".to_owned(),
+            user_agent: None,
+            version: None,
+            platform: None,
+        };
+        let response = server
+            .start_enrollment(request, Some(device_info))
+            .await
+            .expect("start_enrollment should succeed");
+
+        assert!(
+            response.final_page_content.is_empty(),
+            "final_page_content should be empty when display is disabled, got: {}",
+            response.final_page_content
+        );
     }
 }

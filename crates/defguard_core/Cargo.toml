@@ -96,6 +96,8 @@ uaparser = "0.6"
 async-stream = "0.3"
 
 [dev-dependencies]
+# Enable the shared test-only helpers (mock SMTP server) for the test build.
+defguard_common = { workspace = true, features = ["test-support"] }
 claims.workspace = true
 hyper-util = "0.1"
 matches.workspace = true
@@ -109,6 +111,7 @@ reqwest = { version = "0.12", features = [
 serde_qs = "1.0"
 tower = { workspace = true }
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+wiremock = "0.6"
 
 [build-dependencies]
 tonic-prost-build.workspace = true

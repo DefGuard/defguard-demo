@@ -177,6 +177,15 @@ const DevicesTable = ({ rowData }: { rowData: RowData[] }) => {
           text: m.profile_devices_menu_show_config(),
           onClick: () => {
             api.device.getDeviceConfigs(row).then((modalData) => {
+              const hasConfigs = modalData.configs.some(
+                (c) =>
+                  c.location_mfa_mode === LocationMfaMode.Disabled &&
+                  !c.posture_check_required,
+              );
+              if (!hasConfigs) {
+                Snackbar.error(m.profile_devices_config_no_locations());
+                return;
+              }
               openModal(ModalName.UserDeviceConfig, modalData);
             });
           },
@@ -261,24 +270,22 @@ const DevicesTable = ({ rowData }: { rowData: RowData[] }) => {
         header: m.profile_devices_col_connected(),
         enableSorting: false,
         minSize: 200,
-        meta: {
-          flex: !canModifyDevices,
-        },
         cell: (info) => CellWithFallback(info.getValue()),
       }),
-      ...(canModifyDevices
-        ? [
-            columnHelper.display({
-              id: 'edit',
-              header: '',
-              size: tableEditColumnSize,
-              cell: (info) => {
-                const menuItems = makeRowMenu(info.row.original);
-                return <TableEditCell menuItems={menuItems} />;
-              },
-            }),
-          ]
-        : []),
+      // Always render the trailing column; read-only viewers get a filler cell so rows
+      // reach the table edge.
+      columnHelper.display({
+        id: 'edit',
+        header: '',
+        size: tableEditColumnSize,
+        enableResizing: false,
+        cell: (info) =>
+          canModifyDevices ? (
+            <TableEditCell menuItems={makeRowMenu(info.row.original)} />
+          ) : (
+            <TableFlexCell />
+          ),
+      }),
     ],
     [canModifyDevices, makeRowMenu],
   );

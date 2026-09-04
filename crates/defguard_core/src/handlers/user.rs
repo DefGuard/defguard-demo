@@ -718,11 +718,7 @@ pub(crate) async fn start_enrollment(
         "User {} created enrollment token for user {username}.",
         session.user.username
     );
-    debug!(
-        "Enrollment token {}, enrollment url {}",
-        enrollment_token,
-        public_proxy_url.to_string()
-    );
+    debug!("Enrollment url {}", public_proxy_url.to_string());
     appstate.emit_event(ApiEvent {
         context,
         event: Box::new(ApiEventType::EnrollmentTokenAdded { user }),
@@ -816,11 +812,7 @@ pub(crate) async fn start_remote_desktop_configuration(
         "User {} started a new desktop activation.",
         session.user.username
     );
-    debug!(
-        "Desktop configuration token {}, desktop configuration url {}",
-        desktop_configuration_token,
-        public_proxy_url.to_string()
-    );
+    debug!("Desktop configuration url {}", public_proxy_url.to_string());
     appstate.emit_event(ApiEvent {
         context,
         event: Box::new(ApiEventType::ClientConfigurationTokenAdded { user }),
@@ -1250,6 +1242,11 @@ pub(crate) async fn change_self_password(
     user.set_password(&data.new_password);
     user.save(&appstate.pool).await?;
 
+    let session_id = session.session.id;
+
+    user.logout_all_sessions_except(&appstate.pool, &session_id)
+        .await?;
+
     ldap_change_password(
         &mut user,
         &data.new_password,
@@ -1332,6 +1329,7 @@ pub(crate) async fn change_password(
 
         user.set_password(&data.new_password);
         user.save(&appstate.pool).await?;
+        user.logout_all_sessions(&appstate.pool).await?;
         ldap_change_password(
             &mut user,
             &data.new_password,

@@ -66,7 +66,7 @@ pub async fn get_settings(_admin: AdminRole, State(appstate): State<AppState>) -
             settings.main_logo_url = DEFAULT_MAIN_LOGO_URL.into();
         }
         if server_config().is_demo_mode {
-            settings.secret_key = None;
+            // secret_key is `#[serde(skip)]` upstream, so it never reaches the response.
             settings.license = None;
             settings.smtp.password = None;
             settings.smtp.oauth_client_secret = None;

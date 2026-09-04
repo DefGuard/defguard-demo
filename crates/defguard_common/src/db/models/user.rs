@@ -888,7 +888,7 @@ impl User<Id> {
             totp_enabled, email_mfa_enabled, totp_secret, email_mfa_secret, \
             mfa_method \"mfa_method: _\", recovery_codes, is_active, openid_sub, \
             from_ldap, ldap_pass_randomized, ldap_rdn, ldap_user_path, ldap_remote_enrollment_completed, enrollment_pending \
-            FROM \"user\" WHERE email ILIKE $1",
+            FROM \"user\" WHERE LOWER(email) = LOWER($1)",
             email
         )
         .fetch_optional(executor)
@@ -1170,6 +1170,18 @@ impl User<Id> {
         Ok(())
     }
 
+    pub async fn logout_all_sessions_except<'e, E>(
+        &self,
+        executor: E,
+        session_id: &str,
+    ) -> sqlx::Result<()>
+    where
+        E: PgExecutor<'e>,
+    {
+        Session::delete_all_for_user_except(executor, self.id, session_id).await?;
+        Ok(())
+    }
+
     pub async fn find_by_device_id<'e, E>(executor: E, device_id: Id) -> sqlx::Result<Option<Self>>
     where
         E: PgExecutor<'e>,
@@ -1345,6 +1357,48 @@ mod test {
         },
         secret::SecretStringWrapper,
     };
+
+    #[sqlx::test]
+    async fn test_find_by_email_is_exact_not_a_pattern(
+        _: PgPoolOptions,
+        options: PgConnectOptions,
+    ) {
+        let pool = setup_pool(options).await;
+
+        User::new(
+            "hpotter",
+            Some("pass123"),
+            "Potter",
+            "Harry",
+            "h.potter@hogwart.edu.uk",
+            None,
+        )
+        .save(&pool)
+        .await
+        .unwrap();
+
+        // Lookups stay case-insensitive.
+        assert!(
+            User::find_by_email(&pool, "H.Potter@Hogwart.Edu.UK")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // The argument is a value, not a `LIKE` pattern: callers pass externally
+        // supplied addresses, so wildcards must never match another user.
+        for pattern in [
+            "%",
+            "%@%",
+            "h.potter@hogwart.edu.u_",
+            "_.potter@hogwart.edu.uk",
+        ] {
+            assert!(
+                User::find_by_email(&pool, pattern).await.unwrap().is_none(),
+                "email lookup treated {pattern:?} as a pattern"
+            );
+        }
+    }
 
     #[sqlx::test]
     async fn test_mfa_code(_: PgPoolOptions, options: PgConnectOptions) {

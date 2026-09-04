@@ -1321,7 +1321,9 @@ pub async fn do_directory_sync(
                 // members of those groups. Only those users are considered for syncing (state
                 // updates and, when supported by the provider, prefetch/import of new users).
                 // When the filter is empty we pass None and consider everyone.
-                let allowed_emails = if !user_groups_filter.is_empty() {
+                let allowed_emails = if user_groups_filter.is_empty() {
+                    None
+                } else {
                     let groups = dir_sync.get_groups().await?;
                     // get_groups() may itself be limited by the membership sync group filter (directory_sync_group_match),
                     // so groups configured here must also be included there if that filter is in use.
@@ -1349,15 +1351,16 @@ pub async fn do_directory_sync(
                             }
                             Err(err) => {
                                 error!(
-                                    "Failed to get members of group '{}' for the user sync filter: {err}",
+                                    "Failed to get members of group '{}' for the user sync filter, \
+                                    aborting the sync to avoid acting on an incomplete list of \
+                                    allowed users: {err}",
                                     group.name
                                 );
+                                return Err(err);
                             }
                         }
                     }
                     Some(emails)
-                } else {
-                    None
                 };
 
                 sync_all_users_state(

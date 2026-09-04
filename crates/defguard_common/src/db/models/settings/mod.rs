@@ -549,7 +549,7 @@ impl Settings {
 
         // Check if gateway disconnect notifications can be enabled, since it requires SMTP to be
         // configured.
-        if self.gateway_disconnect_notifications_enabled && !self.smtp_configured() {
+        if self.gateway_disconnect_notifications_enabled && !self.smtp.is_configured() {
             warn!("Cannot enable gateway disconnect notifications. SMTP is not configured.");
             return Err(SettingsValidationError::CannotEnableGatewayNotifications);
         }
@@ -561,7 +561,7 @@ impl Settings {
         }
 
         // Check if LDAP remote enrollment can be enabled
-        if self.ldap_remote_enrollment_enabled && !self.smtp_configured() {
+        if self.ldap_remote_enrollment_enabled && !self.smtp.is_configured() {
             warn!("Cannot enable remote enrollment for LDAP. SMTP is not configured.");
             return Err(SettingsValidationError::CannotEnableLdapRemoteEnrollment);
         }
@@ -793,9 +793,6 @@ impl Settings {
     }
 
     /// Check if all required SMTP options are configured.
-    /// User & password can be empty for no-auth servers.
-    ///
-    /// Meant to be used to check if sending emails is enabled in current instance.
     #[must_use]
     pub fn smtp_configured(&self) -> bool {
         self.smtp.server.is_some()
@@ -803,6 +800,15 @@ impl Settings {
             && self.smtp.sender.is_some()
             && self.smtp.server != Some(String::new())
             && self.smtp.sender != Some(String::new())
+    }
+
+    #[must_use]
+    pub fn demo_locked_fields_differ(&self, other: &Self) -> bool {
+        self.demo_locked_fields() != other.demo_locked_fields()
+    }
+
+    fn demo_locked_fields(&self) -> impl PartialEq + '_ {
+        (&self.license, &self.defguard_url, &self.public_proxy_url)
     }
 
     /// Check if all required LDAP options are configured.

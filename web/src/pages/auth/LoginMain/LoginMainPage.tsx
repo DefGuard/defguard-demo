@@ -20,6 +20,7 @@ import { OIDCButton } from '../../../shared/defguard-ui/components/SSOButton/OID
 import { isPresent } from '../../../shared/defguard-ui/utils/isPresent';
 import { createZodIssue } from '../../../shared/defguard-ui/utils/zod';
 import { useAuth } from '../../../shared/hooks/useAuth';
+import { getSessionInfoQueryOptions } from '../../../shared/query';
 
 const isWebErrorCode = (value: string): value is WebErrorCode =>
   (Object.values(WebErrorCode) as string[]).includes(value);
@@ -59,6 +60,8 @@ export const LoginMainPage = () => {
     select: (resp) => resp.data,
     retry: false,
   });
+
+  const { data: sessionInfo } = useQuery(getSessionInfoQueryOptions);
 
   const form = useAppForm({
     defaultValues: defaults,
@@ -117,6 +120,23 @@ export const LoginMainPage = () => {
       <h1>{m.login_main_title()}</h1>
       <h2>{m.login_main_subtitle()}</h2>
       <SizedBox height={ThemeSize.Xl3} />
+      {isPresent(sessionInfo) && sessionInfo?.demo_mode && (
+        <>
+          <InfoBanner
+            variant="info"
+            text={m.login_main_demo_info()}
+            icon="info-outlined"
+          />
+          <SizedBox height={ThemeSize.Sm} />
+
+          <InfoBanner
+            variant="warning"
+            text={m.login_main_demo_reset_info()}
+            icon="info-outlined"
+          />
+          <SizedBox height={ThemeSpacing.Xl2} />
+        </>
+      )}
       {isPresent(authErrorMessage) && (
         <>
           <InfoBanner variant="warning" text={authErrorMessage} icon="info-outlined" />

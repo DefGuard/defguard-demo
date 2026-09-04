@@ -4,7 +4,10 @@ use std::{
     time::Duration,
 };
 
-use defguard_common::db::models::{Settings, User};
+use defguard_common::{
+    config::server_config,
+    db::models::{Settings, User},
+};
 use ldap3::{
     LdapConnAsync, LdapConnSettings, Mod, ResultEntry, Scope, SearchEntry,
     adapters::{Adapter, EntriesOnly, PagedResults},
@@ -35,6 +38,9 @@ impl LDAPConnection {
 
     /// Establishes an LDAP connection using the provided settings
     pub async fn create_with_settings(settings: Settings) -> Result<Self, LdapError> {
+        if server_config().is_demo_mode {
+            return Err(LdapError::Ldap("LDAP is disabled in demo mode".to_string()));
+        }
         let config = LDAPConfig::try_from(settings.clone())?;
         let url = settings.ldap_url.ok_or(LdapError::MissingSettings(
             "LDAP URL is required for LDAP configuration to work".to_owned(),

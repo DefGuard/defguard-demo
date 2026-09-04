@@ -562,6 +562,11 @@ pub async fn webauthn_finish(
     State(appstate): State<AppState>,
     Json(webauth_reg): Json<WebAuthnRegistration>,
 ) -> ApiResult {
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "Configuring MFA is disabled in demo mode",
+        ));
+    }
     info!(
         "Finishing WebAuthn registration for user {}",
         session.user.username
@@ -847,6 +852,11 @@ pub async fn totp_enable(
     State(appstate): State<AppState>,
     Json(data): Json<AuthCode>,
 ) -> ApiResult {
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "Configuring MFA is disabled in demo mode",
+        ));
+    }
     let mut user = session.user;
     debug!("Enabling TOTP for user {}", user.username);
     if user.verify_totp_code(&data.code) {
@@ -1051,7 +1061,7 @@ pub async fn totp_code(
 pub async fn email_mfa_init(session: SessionInfo, State(appstate): State<AppState>) -> ApiResult {
     // check if SMTP is configured
     let settings = Settings::get_current_settings();
-    if !settings.smtp_configured() {
+    if !settings.smtp.is_configured() {
         error!("Unable to start email MFA configuration. SMTP is not configured.");
         return Err(WebError::SmtpNotConfigured);
     }
@@ -1105,6 +1115,11 @@ pub async fn email_mfa_enable(
     State(appstate): State<AppState>,
     Json(data): Json<AuthCode>,
 ) -> ApiResult {
+    if server_config().is_demo_mode {
+        return Err(WebError::Forbidden(
+            "Configuring MFA is disabled in demo mode",
+        ));
+    }
     let mut user = session.user;
     debug!("Enabling email MFA for user {}", user.username);
     if user.verify_email_mfa_code(&data.code) {

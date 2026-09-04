@@ -22,6 +22,7 @@ import {
   subscribeOpenModal,
 } from '../../../hooks/modalControls/modalsSubjects';
 import type { ModalNameValue } from '../../../hooks/modalControls/modalTypes';
+import { useApp } from '../../../hooks/useApp';
 import {
   adminChangePasswordDefaultValues,
   adminChangePasswordSchema,
@@ -68,6 +69,7 @@ export const ChangePasswordModal = () => {
 };
 
 const ModalContent = ({ isAdmin, user }: { isAdmin: boolean; user: User }) => {
+  const demoMode = useApp((s) => s.appInfo.demo_mode);
   const formSchema = useMemo(() => {
     if (isAdmin) {
       return adminChangePasswordSchema;
@@ -118,6 +120,10 @@ const ModalContent = ({ isAdmin, user }: { isAdmin: boolean; user: User }) => {
           username: user.username,
         });
       } else {
+        if (demoMode) {
+          Snackbar.error(m.demo_mode_feature_disabled());
+          return;
+        }
         await mutateUser({
           new_password: value.password,
           old_password: value.current,

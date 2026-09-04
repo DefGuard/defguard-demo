@@ -1,4 +1,4 @@
-use defguard_common::db::Id;
+use defguard_common::{config::server_config, db::Id};
 use defguard_proto::enterprise::posture::{
     BoolCheck, DevicePostureData, Int32Check, StringCheck, UnavailableReason,
     bool_check::Result as BoolResult, int32_check::Result as Int32Result,
@@ -240,6 +240,12 @@ pub(crate) async fn validate_posture(
     let posture_ids = DevicePostureLocation::find_by_location(pool, location_id).await?;
     if posture_ids.is_empty() {
         debug!("No posture policies assigned to location {location_id} — passing device {pubkey}");
+        return Ok(PostureResult::Pass);
+    }
+
+    // In demo mode allow managing posture policies but never enforce them.
+    if server_config().is_demo_mode {
+        debug!("Demo mode enabled - skipping posture enforcement for device {pubkey}");
         return Ok(PostureResult::Pass);
     }
 

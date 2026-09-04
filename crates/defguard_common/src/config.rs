@@ -18,9 +18,7 @@ use crate::{VERSION, db::Id, rsa_jwk_thumbprint};
 pub static SERVER_CONFIG: OnceLock<DefGuardConfig> = OnceLock::new();
 
 pub fn server_config() -> &'static DefGuardConfig {
-    SERVER_CONFIG
-        .get()
-        .expect("Server configuration not set yet")
+    SERVER_CONFIG.get_or_init(DefGuardConfig::new_test_config)
 }
 
 #[derive(Clone, Debug, Parser, Serialize)]
@@ -201,6 +199,10 @@ pub struct DefGuardConfig {
     /// Set to 0 to disable rate limiting.
     #[arg(long, env = "DEFGUARD_RATELIMIT_BURST", default_value_t = 0)]
     pub rate_limit_burst: u32,
+
+    /// Run the instance in demo mode
+    #[arg(long = "demo-mode", env = "DEFGUARD_DEMO_MODE", default_value = "true")]
+    pub is_demo_mode: bool,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -377,6 +379,7 @@ impl DefGuardConfig {
             adopt_edge: None,
             rate_limit_per_second: 0,
             rate_limit_burst: 0,
+            is_demo_mode: false,
         };
 
         config

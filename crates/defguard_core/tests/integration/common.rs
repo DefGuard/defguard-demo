@@ -30,9 +30,25 @@ pub(crate) async fn init_config(
     custom_defguard_url: Option<&str>,
     pool: &PgPool,
 ) -> DefGuardConfig {
+    init_config_inner(custom_defguard_url, pool, false).await
+}
+
+pub(crate) async fn init_demo_config(
+    custom_defguard_url: Option<&str>,
+    pool: &PgPool,
+) -> DefGuardConfig {
+    init_config_inner(custom_defguard_url, pool, true).await
+}
+
+async fn init_config_inner(
+    custom_defguard_url: Option<&str>,
+    pool: &PgPool,
+    demo_mode: bool,
+) -> DefGuardConfig {
     let url = custom_defguard_url.unwrap_or("http://localhost:8000");
     let test_secret_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let config = DefGuardConfig::new_test_config();
+    let mut config = DefGuardConfig::new_test_config();
+    config.is_demo_mode = demo_mode;
     initialize_current_settings(pool)
         .await
         .expect("Could not initialize current settings in the database");

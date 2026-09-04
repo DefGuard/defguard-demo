@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
+use defguard_common::config::server_config;
 use sqlx::PgPool;
 use tokio::{sync::broadcast::Receiver, task::JoinSet, time::interval};
 use tokio_util::sync::CancellationToken;
@@ -34,7 +35,9 @@ pub async fn run_activity_log_stream_manager(
         let cancel_token = Arc::new(CancellationToken::new());
 
         // check if activity log streams can be started
-        if enterprise_features_enabled {
+        if server_config().is_demo_mode {
+            info!("Demo mode is enabled, not starting activity log streams");
+        } else if enterprise_features_enabled {
             info!("Starting all configured activity log streams");
             let streams = ActivityLogStream::all(&pool).await?;
             debug!("Found {} configured activity log streams", streams.len());

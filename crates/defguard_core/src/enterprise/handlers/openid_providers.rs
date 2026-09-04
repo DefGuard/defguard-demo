@@ -3,10 +3,13 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
-use defguard_common::db::models::{
-    Settings, WireguardNetwork,
-    settings::{OpenIdUsernameHandling, update_current_settings},
-    wireguard::LocationMfaMode,
+use defguard_common::{
+    config::server_config,
+    db::models::{
+        Settings, WireguardNetwork,
+        settings::{OpenIdUsernameHandling, update_current_settings},
+        wireguard::LocationMfaMode,
+    },
 };
 use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey};
 use serde_json::json;
@@ -82,6 +85,48 @@ pub(crate) async fn add_openid_provider(
         "User {} adding OpenID provider {}",
         session.user.username, provider_data.name
     );
+    if server_config().is_demo_mode {
+        let new_provider = OpenIdProvider::new(
+            provider_data.name,
+            provider_data.base_url,
+            provider_data.kind,
+            provider_data.client_id,
+            "SECRET".to_string(),
+            provider_data.display_name,
+            Some("PRIVATE_KEY".to_string()),
+            provider_data.google_service_account_email,
+            provider_data.admin_email,
+            provider_data.directory_sync_enabled,
+            provider_data.directory_sync_interval,
+            provider_data.directory_sync_user_behavior.into(),
+            provider_data.directory_sync_admin_behavior.into(),
+            provider_data.directory_sync_target.into(),
+            Some("PRIVATE_KEY".to_string()),
+            provider_data.okta_dirsync_client_id,
+            Vec::new(),
+            provider_data
+                .jumpcloud_api_key
+                .map(|_| "SECRET".to_string()),
+            provider_data.prefetch_users,
+            provider_data.disable_password_management,
+            None,
+        )
+        .upsert(&appstate.pool)
+        .await?;
+        info!(
+            "User {} added OpenID client {}",
+            session.user.username, new_provider.name
+        );
+        appstate.emit_event(ApiEvent {
+            context,
+            event: Box::new(ApiEventType::OpenIdProviderModified {
+                provider: new_provider,
+            }),
+        })?;
+
+        return Ok(ApiResponse::with_status(StatusCode::CREATED));
+    }
+
     let current_provider = OpenIdProvider::get_current(&appstate.pool).await?;
 
     // The key is sent from the frontend only when user explicitly changes it, as we never send it
@@ -366,6 +411,45 @@ pub(crate) async fn modify_openid_provider(
     );
     let mut transaction = appstate.pool.begin().await?;
     let provider = OpenIdProvider::find_by_name(&mut *transaction, &provider_data.name).await?;
+
+    if server_config().is_demo_mode
+        && let Some(mut provider) = provider
+    {
+        provider.base_url = provider_data.base_url;
+        provider.kind = provider_data.kind;
+        provider.client_id = provider_data.client_id;
+        provider.client_secret = "SECRET".to_string();
+        provider.display_name = provider_data.display_name;
+        provider.google_service_account_key = Some("PRIVATE_KEY".to_string());
+        provider.google_service_account_email = provider_data.google_service_account_email;
+        provider.admin_email = provider_data.admin_email;
+        provider.directory_sync_enabled = provider_data.directory_sync_enabled;
+        provider.directory_sync_interval = provider_data.directory_sync_interval;
+        provider.directory_sync_user_behavior = provider_data.directory_sync_user_behavior.into();
+        provider.directory_sync_admin_behavior = provider_data.directory_sync_admin_behavior.into();
+        provider.directory_sync_target = provider_data.directory_sync_target.into();
+        provider.okta_private_jwk = Some("PRIVATE_KEY".to_string());
+        provider.okta_dirsync_client_id = provider_data.okta_dirsync_client_id;
+        provider.directory_sync_group_match = Vec::new();
+        provider.jumpcloud_api_key = provider_data
+            .jumpcloud_api_key
+            .map(|_| "SECRET".to_string());
+        provider.prefetch_users = provider_data.prefetch_users;
+        provider.directory_sync_user_groups = None;
+        provider.save(&mut *transaction).await?;
+        transaction.commit().await?;
+
+        info!(
+            "User {} modified OpenID client {}",
+            session.user.username, provider.name
+        );
+        appstate.emit_event(ApiEvent {
+            context,
+            event: Box::new(ApiEventType::OpenIdProviderModified { provider }),
+        })?;
+
+        return Ok(ApiResponse::with_status(StatusCode::OK));
+    }
     if let Some(mut provider) = provider {
         let private_key = match &provider_data.google_service_account_key {
             Some(key) => {
@@ -571,6 +655,13 @@ pub(crate) async fn test_dirsync_connection(
         "User {} testing directory sync connection",
         session.user.username
     );
+
+    if server_config().is_demo_mode {
+        return Ok(ApiResponse::new(
+            json!({"message": "Demo connection successful", "success": true}),
+            StatusCode::OK,
+        ));
+    }
 
     if let Err(err) = test_directory_sync_connection(&appstate.pool).await {
         error!(
